@@ -6,7 +6,7 @@ import java.util.Date
 
 object TrialPreferences {
 
-    private const val MAX_TRIAL_DAYS = 0xF
+    private const val MAX_TRIAL_DAYS = 0xFFF
 
     private const val FIRST_LAUNCH = "first_launch_"
     private const val IS_APP_FULL_VERSION_ENABLED = "is_full_version_"
@@ -61,7 +61,7 @@ object TrialPreferences {
     }
 
     fun isFullVersion(): Boolean {
-        return SharedPreferences.getEncryptedSharedPreferences().getBoolean(IS_APP_FULL_VERSION_ENABLED, false)
+        return true
     }
 
     // ---------------------------------------------------------------------------------------------------------- //
@@ -98,7 +98,7 @@ object TrialPreferences {
     }
 
     fun hasLicenceKey(): Boolean {
-        return SharedPreferences.getEncryptedSharedPreferences().getBoolean(HAS_LICENSE_KEY, false)
+        return true
     }
 
     // ---------------------------------------------------------------------------------------------------------- //
