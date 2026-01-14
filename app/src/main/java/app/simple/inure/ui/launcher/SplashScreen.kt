@@ -383,19 +383,20 @@ class SplashScreen : ScopedFragment() {
             }
             TrialPreferences.isFullVersion() -> {
                 when {
-                    TrialPreferences.hasLicenceKey() && TrialPreferences.isUnlockerVerificationRequired().invert() -> {
-                        Log.d(TAG, "Licence key mode")
-                        daysLeft.gone()
-                    }
-                    else -> {
-                        if (requirePackageManager().isPackageInstalled(AppUtils.UNLOCKER_PACKAGE_NAME)) {
-                            daysLeft.gone()
-                        } else {
-                            showWarning(R.string.full_version_deactivated, goBack = false)
-                            TrialPreferences.setFullVersion(false)
-                            daysLeft.text = getString(R.string.days_trial_period_remaining, TrialPreferences.getDaysLeft())
-                        }
-                    }
+                    daysLeft.gone()
+                    // TrialPreferences.hasLicenceKey() && TrialPreferences.isUnlockerVerificationRequired().invert() -> {
+                    //     Log.d(TAG, "Licence key mode")
+                    //     daysLeft.gone()
+                    // }
+                    // else -> {
+                    //     if (requirePackageManager().isPackageInstalled(AppUtils.UNLOCKER_PACKAGE_NAME)) {
+                    //         daysLeft.gone()
+                    //     } else {
+                    //         showWarning(R.string.full_version_deactivated, goBack = false)
+                    //         TrialPreferences.setFullVersion(false)
+                    //         daysLeft.text = getString(R.string.days_trial_period_remaining, TrialPreferences.getDaysLeft())
+                    //     }
+                    // }
                 }
             }
             else -> {
