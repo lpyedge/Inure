@@ -373,37 +373,37 @@ class SplashScreen : ScopedFragment() {
     }
 
     private fun unlockStateChecker() {
-        when {
-            TrialPreferences.isTrialWithoutFull() -> {
-                if (TrialPreferences.isFullVersion()) {
-                    daysLeft.gone()
-                } else {
-                    daysLeft.text = getString(R.string.days_trial_period_remaining, TrialPreferences.getDaysLeft())
-                }
-            }
-            TrialPreferences.isFullVersion() -> {
-                when {
-                    daysLeft.gone()
-                    // TrialPreferences.hasLicenceKey() && TrialPreferences.isUnlockerVerificationRequired().invert() -> {
-                    //     Log.d(TAG, "Licence key mode")
-                    //     daysLeft.gone()
-                    // }
-                    // else -> {
-                    //     if (requirePackageManager().isPackageInstalled(AppUtils.UNLOCKER_PACKAGE_NAME)) {
-                    //         daysLeft.gone()
-                    //     } else {
-                    //         showWarning(R.string.full_version_deactivated, goBack = false)
-                    //         TrialPreferences.setFullVersion(false)
-                    //         daysLeft.text = getString(R.string.days_trial_period_remaining, TrialPreferences.getDaysLeft())
-                    //     }
-                    // }
-                }
-            }
-            else -> {
-                // Should always be 0
-                daysLeft.text = getString(R.string.days_trial_period_remaining, TrialPreferences.getDaysLeft())
-            }
-        }
+        daysLeft.gone()
+        // when {
+        //     TrialPreferences.isTrialWithoutFull() -> {
+        //         if (TrialPreferences.isFullVersion()) {
+        //             daysLeft.gone()
+        //         } else {
+        //             daysLeft.text = getString(R.string.days_trial_period_remaining, TrialPreferences.getDaysLeft())
+        //         }
+        //     }
+        //     TrialPreferences.isFullVersion() -> {                
+        //         when {
+        //             TrialPreferences.hasLicenceKey() && TrialPreferences.isUnlockerVerificationRequired().invert() -> {
+        //                 Log.d(TAG, "Licence key mode")
+        //                 daysLeft.gone()
+        //             }
+        //             else -> {
+        //                 if (requirePackageManager().isPackageInstalled(AppUtils.UNLOCKER_PACKAGE_NAME)) {
+        //                     daysLeft.gone()
+        //                 } else {
+        //                     showWarning(R.string.full_version_deactivated, goBack = false)
+        //                     TrialPreferences.setFullVersion(false)
+        //                     daysLeft.text = getString(R.string.days_trial_period_remaining, TrialPreferences.getDaysLeft())
+        //                 }
+        //             }
+        //         }
+        //     }
+        //     else -> {
+        //         // Should always be 0
+        //         daysLeft.text = getString(R.string.days_trial_period_remaining, TrialPreferences.getDaysLeft())
+        //     }
+        // }
     }
 
     private fun clearSearchStates() {
