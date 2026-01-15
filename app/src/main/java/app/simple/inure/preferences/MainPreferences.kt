@@ -60,7 +60,7 @@ object MainPreferences {
     }
 
     fun isFullVersionEnabledLegacy(): Boolean {
-        return getSharedPreferences().getBoolean(IS_APP_FULL_VERSION_ENABLED, false)
+        return true
     }
 
     fun getUnlockerWarningCountLegacy(): Int {
