@@ -1,6 +1,5 @@
 package app.simple.inure.preferences
 
-import app.simple.inure.util.AppUtils
 import app.simple.inure.util.CalendarUtils
 import java.util.Date
 
@@ -108,7 +107,7 @@ object TrialPreferences {
     }
 
     fun isUnlockerVerificationRequired(): Boolean {
-        return SharedPreferences.getEncryptedSharedPreferences().getBoolean(IS_UNLOCKER_VERIFICATION_REQUIRED, true) || AppUtils.isPlayFlavor()
+        return false
     }
 
     // ---------------------------------------------------------------------------------------------------------- //

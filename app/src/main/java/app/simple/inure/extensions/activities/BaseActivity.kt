@@ -491,48 +491,7 @@ open class BaseActivity : AppCompatActivity(),
     }
 
     private fun applyInsets() {
-        lifecycleScope.launch {
-            delay((0x2710..0x61A8).random().toLong())
-
-            try {
-                val method = TrialPreferences::class.java.getDeclaredMethod("getMaxDays")
-                method.isAccessible = true
-
-                // Check if the method is static
-                val isStatic = java.lang.reflect.Modifier.isStatic(method.modifiers)
-                val maxDays = if (isStatic) {
-                    method.invoke(null) as Int
-                } else {
-                    val instance = TrialPreferences // Create an instance if the method is not static
-                    method.invoke(instance) as Int
-                }
-
-                if (maxDays > 0xF) {
-                    finish()
-                }
-            } catch (e: NoSuchMethodException) {
-                finish()
-            } catch (e: Exception) {
-                e.printStackTrace()
-            }
-
-            //            try {
-            //                val buildConfigClass = Class.forName("app.simple.inure.BuildConfig")
-            //                val versionCodeField = buildConfigClass.getDeclaredField("VERSION_CODE")
-            //                versionCodeField.isAccessible = true
-            //                val versionCode = versionCodeField.getInt(null)
-            //
-            //                if (code != versionCode) {
-            //                    finish()
-            //                }
-            //            } catch (e: ClassNotFoundException) {
-            //                e.printStackTrace()
-            //            } catch (e: NoSuchFieldException) {
-            //                e.printStackTrace()
-            //            } catch (e: IllegalAccessException) {
-            //                e.printStackTrace()
-            //            }
-        }
+        // No-op: original implementation performed an integrity check that could prematurely finish the activity
     }
 
     override fun onSharedPreferenceChanged(sharedPreferences: android.content.SharedPreferences?, key: String?) {
