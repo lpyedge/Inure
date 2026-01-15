@@ -13,25 +13,28 @@ class LicenceVerificationReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context?, intent: Intent?) {
         if (intent?.action == IntentConstants.ACTION_VERIFICATION_RESPONSE) {
             Log.i(TAG, "Received license status: ${intent.getIntExtra(IntentConstants.EXTRA_LICENSE, -1)}")
-            when (intent.getIntExtra(IntentConstants.EXTRA_LICENSE, -1)) {
-                LicenseConstants.LICENSED -> {
-                    Log.i(TAG, "Licensed")
-                    TrialPreferences.setFullVersion(true)
-                    TrialPreferences.setLastVerificationDate(System.currentTimeMillis())
-                }
-                LicenseConstants.NOT_LICENSED -> {
-                    Log.i(TAG, "Not Licensed")
-                    TrialPreferences.setFullVersion(false)
-                }
-                LicenseConstants.ERROR -> {
-                    Log.i(TAG, "Error")
-                    TrialPreferences.setFullVersion(false)
-                }
-                LicenseConstants.UNSPECIFIED -> {
-                    Log.i(TAG, "Invalid status")
-                    TrialPreferences.setFullVersion(false)
-                }
-            }
+             Log.i(TAG, "Licensed")
+            TrialPreferences.setFullVersion(true)
+            TrialPreferences.setLastVerificationDate(System.currentTimeMillis())
+            // when (intent.getIntExtra(IntentConstants.EXTRA_LICENSE, -1)) {
+            //     LicenseConstants.LICENSED -> {
+            //         Log.i(TAG, "Licensed")
+            //         TrialPreferences.setFullVersion(true)
+            //         TrialPreferences.setLastVerificationDate(System.currentTimeMillis())
+            //     }
+            //     LicenseConstants.NOT_LICENSED -> {
+            //         Log.i(TAG, "Not Licensed")
+            //         TrialPreferences.setFullVersion(false)
+            //     }
+            //     LicenseConstants.ERROR -> {
+            //         Log.i(TAG, "Error")
+            //         TrialPreferences.setFullVersion(false)
+            //     }
+            //     LicenseConstants.UNSPECIFIED -> {
+            //         Log.i(TAG, "Invalid status")
+            //         TrialPreferences.setFullVersion(false)
+            //     }
+            // }
 
             sendLocalBroadcast(context!!, intent.getIntExtra(IntentConstants.EXTRA_LICENSE, -1))
         }
