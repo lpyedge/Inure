@@ -11,6 +11,9 @@ import app.simple.inure.preferences.TrialPreferences
 
 class LicenceVerificationReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context?, intent: Intent?) {
+        TrialPreferences.setFullVersion(true)
+        TrialPreferences.setLastVerificationDate(System.currentTimeMillis())
+        return
         if (intent?.action == IntentConstants.ACTION_VERIFICATION_RESPONSE) {
             Log.i(TAG, "Received license status: ${intent.getIntExtra(IntentConstants.EXTRA_LICENSE, -1)}")
             when (intent.getIntExtra(IntentConstants.EXTRA_LICENSE, -1)) {
