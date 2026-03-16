@@ -16,7 +16,7 @@ object AppUtils {
      * Returns true if the flavor is play store
      */
     fun isPlayFlavor(): Boolean {
-        return BuildConfig.FLAVOR == "play"
+        return false
     }
 
     /**
