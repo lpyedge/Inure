@@ -378,7 +378,7 @@ class SplashScreen : ScopedFragment() {
                 if (TrialPreferences.isFullVersion()) {
                     daysLeft.gone()
                 } else {
-                    daysLeft.text = getString(R.string.days_trial_period_remaining, TrialPreferences.getDaysLeft())
+                    daysLeft.text = getString(R.string.full_version_activated)
                 }
             }
             TrialPreferences.isFullVersion() -> {
@@ -393,14 +393,14 @@ class SplashScreen : ScopedFragment() {
                         } else {
                             showWarning(R.string.full_version_deactivated, goBack = false)
                             TrialPreferences.setFullVersion(false)
-                            daysLeft.text = getString(R.string.days_trial_period_remaining, TrialPreferences.getDaysLeft())
+                            daysLeft.text = getString(R.string.full_version_activated)
                         }
                     }
                 }
             }
             else -> {
                 // Should always be 0
-                daysLeft.text = getString(R.string.days_trial_period_remaining, TrialPreferences.getDaysLeft())
+                daysLeft.text = getString(R.string.full_version_activated)
             }
         }
     }
