@@ -29,12 +29,7 @@ object TrialPreferences {
     // ---------------------------------------------------------------------------------------------------------- //
 
     fun getDaysLeft(): Int {
-        return kotlin.runCatching {
-            MAX_TRIAL_DAYS - CalendarUtils.getDaysBetweenTwoDates(Date(getFirstLaunchDate()), CalendarUtils.getToday())
-                .coerceAtLeast(0).coerceAtMost(MAX_TRIAL_DAYS)
-        }.getOrElse {
-            -1
-        }
+        return 36500
     }
 
     fun getMaxDays(): Int {
@@ -48,21 +43,19 @@ object TrialPreferences {
     }
 
     fun isAppFullVersionEnabled(): Boolean {
-        return SharedPreferences.getEncryptedSharedPreferences().getBoolean(IS_APP_FULL_VERSION_ENABLED, false) ||
-                CalendarUtils.getDaysBetweenTwoDates(Date(getFirstLaunchDate()), CalendarUtils.getToday()) <= MAX_TRIAL_DAYS
+        return true
     }
 
     fun isWithinTrialPeriod(): Boolean {
-        return CalendarUtils.getDaysBetweenTwoDates(Date(getFirstLaunchDate()), CalendarUtils.getToday()) <= MAX_TRIAL_DAYS
+        return true
     }
 
     fun isTrialWithoutFull(): Boolean {
-        return CalendarUtils.getDaysBetweenTwoDates(Date(getFirstLaunchDate()), CalendarUtils.getToday()) <= MAX_TRIAL_DAYS
-                && !isAppFullVersionEnabled()
+        return false
     }
 
     fun isFullVersion(): Boolean {
-        return SharedPreferences.getEncryptedSharedPreferences().getBoolean(IS_APP_FULL_VERSION_ENABLED, false)
+        return true
     }
 
     // ---------------------------------------------------------------------------------------------------------- //
@@ -109,7 +102,7 @@ object TrialPreferences {
     }
 
     fun isUnlockerVerificationRequired(): Boolean {
-        return SharedPreferences.getEncryptedSharedPreferences().getBoolean(IS_UNLOCKER_VERIFICATION_REQUIRED, true) || AppUtils.isPlayFlavor()
+        return false
     }
 
     // ---------------------------------------------------------------------------------------------------------- //
