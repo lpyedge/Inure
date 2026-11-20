@@ -821,11 +821,9 @@ rig-proto 單元測試鎖定 upload/新拒絕碼/Done.note 的線格式。
 - **人/AI 幀無統一編號（R-15 輕量處置）**：人通道視頻幀與 AI
   Observation 幀是兩條管線，沒有共同幀號；關聯性由 observe
   採集前後的主文檔 loaderId 代次校驗保證（採集期間導航會在
-  觀察文本裡警告，見 R-14）。完整版方案（Observation 與
-  FrameMsg 同加 page_epoch + 採集時間戳欄位）已存檔於
-  `docs/REVIEW_REMEDIATION_2026-11-20.md`「待啟用方案存檔」，
-  LIU 2026-11-20 指示：出現跨通道對證/新鮮度/時間對齊類
-  問題時提醒他，可按存檔方案改一版實測。
+  觀察文本裡警告，見 R-14）。完整版跨通道幀號方案曾存檔於已移除的
+  评审文档，LIU 2026-11-20 指示：出現跨通道對證/新鮮度/時間對齊類
+  問題時提醒他，可重寫一版實測。
 - **多標籤的 AI 對象（R-24 口徑澄清）**：AI 通道只觀察/操作
   人當前活動標籤的頁面樹（快照按主會話圈定範圍）；用戶切換
   標籤後，舊幀的元素校驗必然拒絕後續動作，屬預期行為——
@@ -837,8 +835,8 @@ rig-proto 單元測試鎖定 upload/新拒絕碼/Done.note 的線格式。
 - CI 未設瀏覽器 E2E job（GPT review R-13）：集成測試目前靠提交前
   本地 local-gate 執行。
 - R02（DB 跨租戶約束）經 LIU 2026-11-19 裁定 **de-scope**：RIG 是
-  個人/受信環境、人工監督的工具，不做多租戶隔離；記錄見
-  review/STATUS.md 的 RIG-R02 條目。
+  個人/受信環境、人工監督的工具，不做多租戶隔離（评审记录随网关
+  文档一并归档，不在本仓库演进）。
 - **踩坑手冊**：本子項目兩晚踩過的坑（症狀/根因/解法/驗證）統一
   收在 `docs/PITFALLS.md`（LIU 2026-11-20 定版要求），新坑先落
   該冊再回頭改本節。
@@ -861,6 +859,7 @@ rig-proto 單元測試鎖定 upload/新拒絕碼/Done.note 的線格式。
 | `edge_internal_gate_and_dblclick` | 雙擊透傳（視頻/DOM 兩路 count=2 → 遠端 dblclick 計數遞增，判據走 DOM 快照——observe 判據會按 §7.1 遮蔽人手勢自鎖）；內部頁把關：切 chrome://settings 後只收內部頁狀態、無該頁快照 |
 | `edge_upload_action` | Upload 動作：正例（頁面 change 收到文件名:大小）、負例按碼斷言（not_file_input / file_not_found）、單選文件框多文件截斷（Done.note 註明、頁面只收首個） |
 | `edge_observe_modes_budget` | observe 全字段：mode=text/tree/tree_image 響應組成、budget_tokens 裁剪響應視圖且存儲幀不動（裁剪後點擊仍成）、subtree 子樹與不存在 id 回 400、include_offscreen 默認過濾視口外元素、since_frame 增量（基幀對齊、upsert 含新值、未知基幀回完整、text 模式不走增量） |
+| `edge_dom_sub_idempotent_and_cleanup` | D01/D02：同連接重複 dom-start 只訂閱一次；配對 stop 回零、多餘 stop 不倒扣；直接斷開（不發 dom-stop）名額照常回收（/health `dom_viewers` 斷言） |
 
 測試側約定（實測教訓，勿退回）：
 
@@ -950,3 +949,14 @@ rig-proto 單元測試鎖定 upload/新拒絕碼/Done.note 的線格式。
 | （本提交） | LIU 第四輪實測（Bilibili）三項：幀泵幀分類（screencast 視頻區幀貼回整頁合成、整頁 RGB 歸一化基準尺寸，RTC 編碼器重建 468→2 次/45s，PITFALLS §39）；鏡像 no-referrer（hdslb 縮略圖 3/35→31/36 載入，§40）；鏡像布局視口對齊遠端 + 等比縮放（進度條點擊偏差 −100~150px→+7px，§41）。驗證：local-gate 全綠、IT 11/11（59.0s），dbg56–63 探針（基線對照、幀尺寸普查、編碼器日誌、兩 DPR 點擊實測） |
 | （本提交） | LIU 第五輪實測兩項：無聲定因在觀看端狀態機——domStart 關影音後退出不恢復 + vid 静音無收斂點（§42）；修復 avWasOn/restoreAvAfterDom 三路徑恢復 + showDisplay 静音收斂。視頻仍跳：reportSize 改 900ms 安定滯後 + 幀泵視口對照重定基準（§43）。音頻鏈全程探針洗清（源頭 audioDec、monitor 電平、RTC ~300B/包、觀看端渲染電平皆實測非零；途中兩度被自家探針夾具誤導，§44）。驗證：local-gate 全綠、IT 11/11（59.9s），dbg64–68 探針（DOM 往返後電平 0.21、尺寸橫跳 8 次僅 1 次安定重建） |
 | （本提交） | LIU 第六輪：仍無聲——生產 /channels 實測 av:false 恒關（§42 的同會話恢復沒覆蓋「恢復代碼沒跑到」的情形：舊版緩存頁/DOM 期間關標籤；且觀看頁菜單無 AV 開關、用戶無從手動恢復，§45）。修復：pollAv 兜底自愈（視頻模式見 av 關且可用即開回，DOM 不搶）+ 觀看頁/腳本 no-store。視頻固定分辨率下偶爾小跳：本會話編碼器零重建（固定模式尺寸恒定），疑內容幀貼圖 rect/sf，幀泵加 rect 取樣診斷日誌待下輪取證。驗證：local-gate 全綠、IT 11/11（58.9s），dbg69 探針（外部強關 8s 內自愈、DOM 期間不搶、退出恢復） |
+| `94abd21` | 獨立審查批次 1（控制正確性）：接管闩鎖單臨界區原子化（C01）+ 舊 observe 不得解闩（C02，需接管後新句柄）+ 在途計數改 Drop guard 取消安全（A02）+ Done 攜本次刷新幀號、刷新失敗如實註明需重 observe（A01）。驗證：local-gate 全綠、exec 6/6（含風暴/舊代次/abort 回歸） |
+| `3d39ffb` | 獨立審查批次 2（連接生命週期）：DOM 訂閱同連接冪等守衛（D01，自動感知+前台共用一份）+ 釋放點收斂父作用域（D02，任一側先結束不丟清理）+ RTC DC 待發隊列有界（T01，4MB/512 幀/5s 駐留，超限整代次丟棄+請求重同步）。驗證：local-gate 全綠、新增 `edge_dom_sub_idempotent_and_cleanup` 真 WS 集成測試 |
+| `04d95c3` | 獨立審查批次 3（視頻 P1）：內容幀改貼乾淨整頁底圖（V02，舊位置殘影根除）+ rect 緩存 400ms TTL（V01）+ 唯一歸屬匹配（V04，多 video 近尺寸拒貼）+ `RIG_PUMP_FULL_ONLY` 整頁幀回退開關（待拍板#2）。驗證：local-gate 全綠、純函數單測（分類/唯一匹配/無殘影/越界裁剪） |
+| `2f35b6a` | 獨立審查批次 4（音視頻成本）：AV 意圖與 HLS 運行分離（M01，RTC 連通 grace 5s 後停 HLS、歸零起兜底）+ 音頻線程持有句柄並 join（M02，首幀未來即停不泄漏）+ /channels 與 /health 報 media_state/media_error（M03）。驗證：local-gate 全綠、M01 策略表單測 |
+| `301382a` | 獨立審查批次 5（產品體驗與觀測）：DOM 默認保留 RTC 聲音（U01，HLS-only 明示無聲；pollAv 按 av_wanted 決策；RTC 連通切流跟到 RTC）+ DC 分片重組有界（D03，16 條/8MB/10s 過期，會話換代清空）+ region 緩存頁代次隔離與上限（D04，雙端）+ 自適應連續 2 次+3s 間隔遲滯（U03）+ /health 補 pump/rtc/dom_viewers 計數、[pump] 改 30s 定期匯總、libav 日誌收斂 Warning（O01/S6）+ README 單人併發聲明（U02/S4）。驗證：local-gate 全綠、viewer.js 語法檢查、/channels 新字段真進程 curl 驗證 |
+
+## 14. 獨立審查整改（2026-11-20，輸入見 `plan/`）
+
+- 待拍板三項的處置（均取報告推薦值，負責人可推翻）：① DOM 默認保留 RTC 聲音（已實現；HLS-only 無獨立聲軌仍靜音並明示）；② reflow 頻發允許回退整頁幀（`RIG_PUMP_FULL_ONLY=1`，非常駐）；③ 保持單人受信口徑（README 已聲明，見 U02）。
+- 未做（需條件/另議）：V03 尺寸啟發式（高度疑似，未證實不動）；HLS 單 rendition（可選優化）；S5 HLS 音頻端到端探針、測試#4（observe_full 失敗注入）、#11（四路渲染全路徑）、#12（HLS 無首幀十次啟停）需 PulseAudio/真機環境（本機無聲卡未驗）；S7（WS 推送替代輪詢、真 shadow-DOM）列為後續；audio_rms 未接入健康（儀表缺口）。
+- 架構重寫不在本輪：狀態所有者拆分（ViewerConnection/MediaCoordinator/ExecControl）只做增量——本輪的 ConnSubs/DcPending/owned guard 即按此方向落地。
