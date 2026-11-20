@@ -478,6 +478,11 @@ impl HumanChannel {
                 let mut gate_vp_at = std::time::Instant::now() - std::time::Duration::from_secs(1);
                 // V01 rect 缓存取样时刻（TTL 过期强制重取，见下）
                 let mut gate_rects_at = std::time::Instant::now();
+                // O01：帧泵定期汇总（30s）：full/content/pasted/dropped/
+                // refetch 计数 + 最近一次 rect 取样。逐次打取样日志
+                // 会刷屏（视频页 TTL 到期即打），只留计数与最近几何。
+                let mut last_summary = std::time::Instant::now();
+                let mut last_rect_sample = String::new();
                 // A/B 与故障回退（审查待拍板#2）：只用整页帧，内容帧
                 // ack 后直接丢弃。RIG_PUMP_FULL_ONLY=1 开启（=0 关闭）。
                 let full_only = std::env::var("RIG_PUMP_FULL_ONLY")
@@ -498,7 +503,24 @@ impl HumanChannel {
                     {
                         Ok(Ok(ev)) => ev,
                         Ok(Err(_)) => break,
-                        Err(_) => continue,
+                        Err(_) => {
+                            // O01 定期汇总点（500ms 排水超时节拍）
+                            if last_summary.elapsed() >= std::time::Duration::from_secs(30) {
+                                last_summary = std::time::Instant::now();
+                                let m = crate::metrics::global();
+                                eprintln!(
+                                    "[pump] 汇总 full={} content={} pasted={} dropped={} refetch={} last_rect={}",
+                                    m.pump_full.load(std::sync::atomic::Ordering::Relaxed),
+                                    m.pump_content.load(std::sync::atomic::Ordering::Relaxed),
+                                    m.pump_pasted.load(std::sync::atomic::Ordering::Relaxed),
+                                    m.pump_dropped.load(std::sync::atomic::Ordering::Relaxed),
+                                    m.pump_rect_refetch
+                                        .load(std::sync::atomic::Ordering::Relaxed),
+                                    last_rect_sample,
+                                );
+                            }
+                            continue;
+                        }
                     };
                     let cur_view = view_session.lock().await.clone();
                     if ev.method != "Page.screencastFrame"
@@ -678,14 +700,10 @@ impl HumanChannel {
                                     crate::metrics::global()
                                         .pump_rect_refetch
                                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                    // 诊断（LIU 第六轮「固定分辨率仍偶尔
-                                    // 小跳」取证）：rect 取样不频繁（尺寸
-                                    // 切换/滚动/TTL 过期才重取），逐次留痕，
-                                    // 含内容帧自带 metadata 的 sf——若某类内容帧
-                                    // 的 sf≠1，rect 会被错缩放、贴图偏移
-                                    eprintln!(
-                                        "[pump] 内容帧 rect 取样 {w}x{h} sf={sf} rects={gate_rects:?}"
-                                    );
+                                    // O01：取样几何只记最近一次，30s 汇总
+                                    // 时输出（含自带 sf 口径，可辨错缩放）
+                                    last_rect_sample =
+                                        format!("{w}x{h} sf={sf} rects={gate_rects:?}");
                                     rect = find_unique_rect(&gate_rects, w, h);
                                 }
                             }

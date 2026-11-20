@@ -26,6 +26,10 @@ fn ff_init() {
 /// 线程在打开设备前必须先调——注册是进程级的，漏了会找不到输入格式。
 pub fn ensure_init() {
     ff_init();
+    // S6：libav 默认 Info 级会把 swscaler 像素格式提示等刷到 stderr
+    //（每帧级，淹没有效诊断行）。收敛到 Warning 及以上；编码失败等
+    // 照常可见，首条与累计另有 eprintln。
+    ff::util::log::set_level(ff::util::log::level::Level::Warning);
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

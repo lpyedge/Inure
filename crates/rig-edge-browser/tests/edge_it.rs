@@ -2568,3 +2568,92 @@ async fn edge_internal_gate_and_dblclick() {
     assert!(!saw_internal_snap, "内部页不应产出 DOM 快照（镜像空壳）");
     drop(proc);
 }
+
+/// D01/D02 回归（报告测试#5/#6）：同一连接重复 dom-start 只订阅一次
+/// （自动感知 + 前台显示共用一份）；发送侧先结束/直接断开不断开清理——
+/// 订阅释放只在父作用域，不泄漏名额、不倒扣。
+#[tokio::test]
+async fn edge_dom_sub_idempotent_and_cleanup() {
+    if std::env::var("RIG_EDGE_IT").is_err() {
+        eprintln!("跳过：未设置 RIG_EDGE_IT");
+        return;
+    }
+    let _serial = SERIAL.lock().await;
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let origin = format!("http://127.0.0.1:{port}");
+    serve(
+        listener,
+        vec![("/dom.html".to_string(), DOM_HTML.to_string())],
+    );
+    let edge_port = free_port();
+    let mut proc = spawn_edge(&[
+        "--listen".into(),
+        format!("127.0.0.1:{edge_port}"),
+        "--url".into(),
+        format!("{origin}/dom.html"),
+        "--human".into(),
+        "--width".into(),
+        "900".into(),
+        "--height".into(),
+        "700".into(),
+    ]);
+    wait_health(edge_port).await;
+    let _ = &mut proc;
+
+    async fn wait_viewers(edge_port: u16, want: u64, what: &str) {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            let v = http_json(edge_port, "GET", "/health", None).1["dom_viewers"]
+                .as_u64()
+                .unwrap_or(u64::MAX);
+            if v == want {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{what}：dom_viewers 应为 {want}，实际 {v}"
+            );
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+    }
+
+    use futures_util::SinkExt;
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{edge_port}/ws"))
+        .await
+        .expect("人通道 WS 应可连接");
+    wait_viewers(edge_port, 0, "初始").await;
+    // 重复 start 只订阅一次
+    for _ in 0..2 {
+        ws.send(tokio_tungstenite::tungstenite::Message::Text(
+            r#"{"type":"dom-start"}"#.into(),
+        ))
+        .await
+        .unwrap();
+    }
+    wait_viewers(edge_port, 1, "重复 dom-start").await;
+    // 配对 stop 回零；多余 stop 不倒扣
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        r#"{"type":"dom-stop"}"#.into(),
+    ))
+    .await
+    .unwrap();
+    wait_viewers(edge_port, 0, "配对 dom-stop").await;
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        r#"{"type":"dom-stop"}"#.into(),
+    ))
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    wait_viewers(edge_port, 0, "多余 dom-stop 不得倒扣").await;
+    // 直接断开（不发 dom-stop）：父作用域必须回收名额
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        r#"{"type":"dom-start"}"#.into(),
+    ))
+    .await
+    .unwrap();
+    wait_viewers(edge_port, 1, "重入").await;
+    drop(ws);
+    wait_viewers(edge_port, 0, "断开连接后名额应回收").await;
+    drop(proc);
+}

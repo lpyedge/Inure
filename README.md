@@ -30,3 +30,6 @@ source scripts/local-env.sh   # CARGO_TARGET_DIR=.temp/target 等
 
 评估数字必须来自实际运行，注明环境；历史结论见 `docs/EVAL_REPORT_2026-11-18.md` 等。
 网关/传输层相关代码已整仓移除（另有备份），本仓库只保留 Chromium 控制与 AI/人双通道。
+
+> 并发说明：当前按**单人受信工具**设计——多观看端并发时 `/channels` 等
+> 全局状态不保证相互独立（见审查 U02/S4）。未来多用户再引入连接级策略。

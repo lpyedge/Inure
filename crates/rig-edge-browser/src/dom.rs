@@ -436,6 +436,11 @@ impl DomChannel {
         self.msgs.subscribe()
     }
 
+    /// O01：当前 DOM 订阅计数（/health dom_viewers）
+    pub fn viewer_count(&self) -> usize {
+        self.viewers.load(Ordering::SeqCst)
+    }
+
     fn next_seq(&self) -> u64 {
         self.seq.fetch_add(1, Ordering::SeqCst) + 1
     }
@@ -521,8 +526,13 @@ impl DomChannel {
             if rslot.is_none() {
                 *rslot = Some(tokio::spawn(async move {
                     let mut tick = tokio::time::interval(Duration::from_millis(100));
-                    let mut state: std::collections::HashMap<i64, (String, std::time::Instant)> =
-                        std::collections::HashMap::new();
+                    // D04：region 缓存按（会话, 区域 id）隔离——导航/换文档后
+                    // 页内序列化器 id 从 1 重排，旧会话条目必须淘汰，不把
+                    // 旧页截图贴给新文档；总量设上限防堆积
+                    let mut state: std::collections::HashMap<
+                        (String, i64),
+                        (String, std::time::Instant),
+                    > = std::collections::HashMap::new();
                     loop {
                         tick.tick().await;
                         if !me_r.active.load(Ordering::SeqCst) {
@@ -605,7 +615,7 @@ impl DomChannel {
     async fn region_sweep(
         &self,
         session: &str,
-        state: &mut std::collections::HashMap<i64, (String, std::time::Instant)>,
+        state: &mut std::collections::HashMap<(String, i64), (String, std::time::Instant)>,
     ) {
         let Ok(v) = self
             .browser
@@ -629,7 +639,8 @@ impl DomChannel {
             }
             let sig = format!("{x},{y},{w},{h},{}", g("ct"));
             let playing = g("p") == 1;
-            let due = match state.get(&i) {
+            let key = (session.to_string(), i);
+            let due = match state.get(&key) {
                 None => true,
                 Some((ps, at)) => {
                     if k == "x" {
@@ -645,7 +656,13 @@ impl DomChannel {
                 continue;
             }
             if let Some(data) = self.browser.capture_region(session, x, y, w, h).await {
-                state.insert(i, (sig, std::time::Instant::now()));
+                state.insert(key, (sig, std::time::Instant::now()));
+                // D04：只保留当前会话条目（旧会话的 id 会重排复用），
+                // 总量过大时整清（下轮重建，短暂无图但不錯贴）
+                state.retain(|(s, _), _| s == session);
+                if state.len() > 2048 {
+                    state.clear();
+                }
                 self.broadcast(json!({"type": "dom-region", "i": i, "d": data}));
             }
         }

@@ -601,6 +601,9 @@ async fn health(State(app): State<Arc<App>>) -> Json<serde_json::Value> {
         "last_frame_age_ms": app.human.last_frame_age_ms(),
         "exec_in_flight": app.ai.exec_in_flight().await,
         "rtc_connected": app.rtc.connected_count(),
+        "rtc_want": app.rtc.want_count(),
+        "dc_pending_bytes": app.rtc.dc_pending_bytes(),
+        "dom_viewers": app.dom.viewer_count(),
         "media": {
             "wanted": app.media.wanted(),
             "running": app.media.running().await,

@@ -18,6 +18,8 @@ let avWasOn = false;
 /* AV 呈现路径（架构口径：WebRTC 优先、HLS 最终兜底）：
    avVia = 'rtc'（视频+Opus 音频走 RTC）| 'hls'（ffmpeg 合流）| null（待定） */
 let avVia = null, avWait = 0;
+/* U01：DOM 模式是否保留 RTC 声音（默认保留；HLS 无独立声轨，DOM 下静音） */
+let domAudio = true;
 ws.binaryType = 'arraybuffer';
 let frameSeq = 0;
 ws.onmessage = (ev) => {
@@ -93,13 +95,53 @@ window.__rig = { domStats: __domStats, rtcStop: () => rtcStop() };
    快照可达 1.6MB）发 dom-chunk 帧序列，拼回整条再走原处理；
    WS 不分片，同一入口无害 */
 const chunkBuf = new Map();
+/* D03 有界：残缺包 10s 过期回收、最多 16 个在途重组、总量 8MB；
+   跨 RTC 会话换代时 clear（见 rtcStop）。超限/过期一律丢弃并
+   请求全量快照，不拿半条拼。序号/数量/类型先校验，不信任远端。 */
+const CHUNK_MAX_N = 4096, CHUNK_MAX_ENTRIES = 16;
+const CHUNK_MAX_BYTES = 8 * 1024 * 1024, CHUNK_TTL_MS = 10000;
+let chunkBytes = 0;
+function chunkSweep(now) {
+  let expired = false;
+  for (const [id, b] of chunkBuf) {
+    if (now - b.t > CHUNK_TTL_MS) {
+      chunkBytes -= b.bytes; chunkBuf.delete(id); expired = true;
+    }
+  }
+  if (expired && domOn) send({type:'dom-resync'});
+}
 function domFeed(m) {
+  if (m.type === 'dom-snapshot') regionEpochCheck(m.url);
   if (m.type !== 'dom-chunk') { handleDomMessage(m); return; }
+  const now = Date.now();
+  chunkSweep(now);
+  const n = m.n, i = m.i;
+  if (!Number.isInteger(n) || n < 1 || n > CHUNK_MAX_N) return;
+  if (!Number.isInteger(i) || i < 0 || i >= n) return;
+  if (typeof m.data !== 'string') return;
   let b = chunkBuf.get(m.id);
-  if (!b) { b = { parts: new Array(m.n), got: 0 }; chunkBuf.set(m.id, b); }
-  if (b.parts[m.i] === undefined) { b.parts[m.i] = m.data; b.got++; }
-  if (b.got === m.n) {
-    chunkBuf.delete(m.id);
+  if (!b) {
+    if (chunkBuf.size >= CHUNK_MAX_ENTRIES) {
+      // 满了：丢最旧一个（Map 按插入序），并请求全量快照
+      const oldest = chunkBuf.keys().next().value;
+      const ob = chunkBuf.get(oldest);
+      chunkBytes -= ob.bytes; chunkBuf.delete(oldest);
+      if (domOn) send({type:'dom-resync'});
+    }
+    b = { parts: new Array(n), got: 0, bytes: 0, t: now };
+    chunkBuf.set(m.id, b);
+  }
+  if (b.parts[i] === undefined) {
+    b.parts[i] = m.data; b.got++;
+    b.bytes += m.data.length; chunkBytes += m.data.length;
+    if (chunkBytes > CHUNK_MAX_BYTES) {
+      chunkBuf.clear(); chunkBytes = 0;
+      if (domOn) send({type:'dom-resync'});
+      return;
+    }
+  }
+  if (b.got === n) {
+    chunkBytes -= b.bytes; chunkBuf.delete(m.id);
     try { handleDomMessage(JSON.parse(b.parts.join(''))); } catch (e) {}
   }
 }
@@ -115,7 +157,7 @@ function handleDomMessage(m) {
    占位块不在当前镜像里就只进缓存，等下次建节点时贴上） */
 function applyRegion(m) {
   const url = 'data:image/jpeg;base64,' + m.d;
-  regionCache.set(m.i, url);
+  regionPut(m.i, url);
   const doc = mir.contentDocument;
   if (!doc) return;
   const host = doc.querySelector('[data-rig-region="' + m.i + '"]');
@@ -478,13 +520,15 @@ function showDisplay() {
     mir.style.display = 'none'; dpill.style.display = 'none';
   }
   document.getElementById('domBtn').classList.toggle('on', domOn);
-  /* 静音态收敛到显示面：DOM 面显示 → 静音（视频轨在后台给
-     DOM 当传输，不出声）；视频面显示且影音在播（avVia 已定
-     型）→ 解静音。此前静音标志散落在 pollAv/domStart 的迁移
-     分支里，DOM→视频往返后 avVia 已定型、没有任何分支再触发
-     解静音，vid 恒停在 ontrack 的初始静音上（有声轨、无声、
-     标签页无喇叭图标——LIU 2026-11-20 实测无声定因） */
-  if (domOn) vid.muted = true;
+  /* 静音态收敛到显示面：DOM 面显示 → 只有 RTC 音频保留时不静音
+     （U01：RTC 音轨与画面解耦，DOM 藏画面仍可听声；HLS 音频封在
+     流里、无独立声轨，DOM 下仍静音并明示）；
+     视频面显示且影音在播（avVia 已定型）→ 解静音。此前静音标志
+     散落在 pollAv/domStart 的迁移分支里，DOM→视频往返后 avVia
+     已定型、没有任何分支再触发解静音，vid 恒停在 ontrack 的初始
+     静音上（有声轨、无声、标签页无喇叭图标——LIU 2026-11-20
+     实测无声定因） */
+  if (domOn) vid.muted = !(domAudio && avVia === 'rtc');
   else if (avVia) vid.muted = false;
   placeGhost();
   jdSend();
@@ -504,6 +548,9 @@ function rtcStop() {
   if (pc) { try { pc.close(); } catch (e) {} pc = null; }
   rtcOn = false;
   vid.srcObject = null;
+  /* D03：RTC 会话换代时清分片重组缓存——旧会话的残缺包不得
+     拼进新会话（可靠有序只在单会话内成立） */
+  chunkBuf.clear(); chunkBytes = 0;
   send({type:'rtc-stop'});
   showDisplay();
 }
@@ -532,7 +579,14 @@ function rtcStart() {
   pc.onconnectionstatechange = () => {
     if (!pc) return;
     if (pc.connectionState === 'connected') {
-      clearTimeout(rtcTimer); rtcOn = true; showDisplay();
+      clearTimeout(rtcTimer); rtcOn = true;
+      /* M01 联动：RTC 连通后边缘 grace 停 HLS——若当前播的是 HLS，
+         必须跟到 RTC 上，否则 HLS 停后 vid 无声无画 */
+      if (avVia === 'hls') {
+        vid.pause(); vid.removeAttribute('src'); vid.load();
+        avVia = 'rtc'; vid.muted = false;
+      }
+      showDisplay();
     } else if (pc.connectionState === 'disconnected') {
       /* 给 ICE 3 秒恢复窗；服务端已恢复 WS 帧，过期未恢复则切回 canvas */
       clearTimeout(rtcTimer);
@@ -562,8 +616,12 @@ function startHls() {
 async function pollAv() {
   try {
     const s = await (await fch('/channels')).json();
-    if (!s.av) domAvOffPending = false;
-    if (s.av && !avOn && !domOn) {
+    /* M01/M03/U01：意图（av_wanted）与实际运行（av）分离——RTC healthy
+       时 HLS 可以停着（av=false）但意图仍在。以下分支一律按意图决策，
+       不再把“兜底编码被策略停掉”误判成“用户关了影音”而拆台 */
+    const want = !!s.av_wanted;
+    if (!want) domAvOffPending = false;
+    if (want && !avOn && !domOn) {
       /* DOM 模式不再被影音抢占：DOM 与 RTC 本就共存（rig-dom
          数据通道跑在 RTC 上），旧逻辑「AV 来了退出 DOM」只剩
          误杀价值——6 秒保护窗一过，pollAv 会把用户好端端的
@@ -572,10 +630,10 @@ async function pollAv() {
       avWait = Date.now();
       if (rtcOn) { avVia = 'rtc'; vid.muted = false; showDisplay(); }
       else if (!pc) rtcStart();
-    } else if (s.av && avOn && !avVia) {
+    } else if (want && avOn && !avVia) {
       if (rtcOn) { avVia = 'rtc'; vid.muted = false; showDisplay(); }
       else if (Date.now() - avWait > 5000) startHls();
-    } else if (!s.av && avOn) {
+    } else if (!want && avOn) {
       avOn = false;
       if (avVia === 'hls') {
         vid.pause(); vid.removeAttribute('src'); vid.load();
@@ -585,7 +643,7 @@ async function pollAv() {
       avVia = null;
       showDisplay();
       if (!pc) rtcStart();
-    } else if (!s.av && !avOn && !domOn && !domAvOffPending && s.av_available) {
+    } else if (!want && !avOn && !domOn && !domAvOffPending && s.av_available) {
       /* 影音被关掉后无人恢复的兜底自愈：关 AV 只有 domStart
          一条路（菜单里根本没有 AV 开关），正常退出 DOM 时
          restoreAvAfterDom 会开回来；但旧版观看页、标签页在
@@ -687,6 +745,11 @@ let mirMap = new Map();
    → DOM 模式。用户手动切换（domBtn/退出）即锁定，锁定到
    下一次导航（快照 URL 变化）为止；右键菜单可关自动模式 */
 let modeAuto = true, modeLock = false, lastSnapUrl = '';
+/* U03 自适应迟滞：临界比例 + 单快照抖动曾导致视频/DOM 反复横跳
+   （伴随 AV 开关）。自动裁决需连续 2 次一致、且距上次自动切换
+   超过 3s 才执行；手动锁定仍是最高优先级 */
+let autoWant = null, autoStable = 0, lastAutoSwitch = 0;
+const AUTO_STABLE_N = 2, AUTO_MIN_INTERVAL_MS = 3000;
 function snapStats(tree, vw, vh) {
   let region = 0, video = 0, canvas = 0, interactive = 0;
   const walk = (n) => {
@@ -704,7 +767,10 @@ function snapStats(tree, vw, vh) {
 }
 function onSnapAuto(m) {
   if (m.url) {
-    if (lastSnapUrl && m.url !== lastSnapUrl) modeLock = false; /* 导航解锁 */
+    if (lastSnapUrl && m.url !== lastSnapUrl) {
+      modeLock = false; /* 导航解锁 */
+      autoWant = null; autoStable = 0; /* 导航清零迟滞计数 */
+    }
     lastSnapUrl = m.url;
   }
   if (!modeAuto || modeLock || !m.tree) return;
@@ -715,8 +781,18 @@ function onSnapAuto(m) {
      表单页靠交互密度被救回 DOM，视频页交互稀少维持视频 */
   const wantDom = !((st.video > 0.10 && st.interactive < 3) || st.region > 0.30 || st.canvas > 0.20);
   window.__rigAuto = { ...st, wantDom, url: m.url || '' };
-  if (wantDom && !domOn) { domStart(true); flashHint('自动模式：已切换到 DOM'); }
-  else if (!wantDom && domOn) { exitDomDisplay(); flashHint('自动模式：已切换到视频'); }
+  if (wantDom !== autoWant) { autoWant = wantDom; autoStable = 1; }
+  else autoStable++;
+  if (autoStable < AUTO_STABLE_N) return; /* 单次快照不翻转 */
+  if (Date.now() - lastAutoSwitch < AUTO_MIN_INTERVAL_MS) return;
+  if (wantDom && !domOn) {
+    lastAutoSwitch = Date.now();
+    domStart(true); flashHint('自动模式：已切换到 DOM');
+  }
+  else if (!wantDom && domOn) {
+    lastAutoSwitch = Date.now();
+    exitDomDisplay(); flashHint('自动模式：已切换到视频');
+  }
 }
 /* 只退显示、不停会话（感知会话留着等下一次导航快照再裁决） */
 /* 退出 DOM 时恢复进 DOM 前的影音开关（domStart 关掉的那次）：
@@ -750,18 +826,29 @@ function syncDomSub() {
 function domStart(auto) {
   if (!auto) modeLock = true; /* 手动进入 = 锁定到下次导航 */
   if (avOn) {
-    /* 影音与 DOM 互斥，但用户点了 DOM 即以 DOM 为准：关影音再进
-       （pollAv 反向同理，菜单开影音会退出 DOM）。旧实现静默拒绝，
-       且提示写在视频模式下不可见的 dbar 里——点了等于没反应
-       （2026-11-20 实测定位）。关之前记下开着，退出时恢复。 */
-    avWasOn = true;
-    fch('/channels', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({av:false})}).catch(() => {});
-    domAvOffPending = true;
-    setTimeout(() => { domAvOffPending = false; }, 6000);
-    avOn = false;
-    if (avVia === 'hls') { vid.pause(); vid.removeAttribute('src'); vid.load(); }
-    else if (avVia === 'rtc') { vid.muted = true; }
-    avVia = null;
+    if (avVia === 'rtc') {
+      /* U01：RTC 音频与画面解耦——DOM 只藏画面不掐声。不断边缘 AV
+         意图（钉住 av:true，RTC 连通时 HLS 本就不会起），退出 DOM
+         时无需恢复；vid 由 showDisplay 按 domAudio 规则收敛 */
+      domAudio = true;
+      fch('/channels', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({av:true})}).catch(() => {});
+    } else {
+      /* 影音与 DOM 互斥，但用户点了 DOM 即以 DOM 为准：关影音再进
+         （pollAv 反向同理，菜单开影音会退出 DOM）。旧实现静默拒绝，
+         且提示写在视频模式下不可见的 dbar 里——点了等于没反应
+         （2026-11-20 实测定位）。关之前记下开着，退出时恢复。
+         HLS 音频封在合流里、无独立声轨，DOM 下暂无声音（明示）。 */
+      avWasOn = true;
+      fch('/channels', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({av:false})}).catch(() => {});
+      domAvOffPending = true;
+      setTimeout(() => { domAvOffPending = false; }, 6000);
+      avOn = false;
+      if (avVia === 'hls') {
+        vid.pause(); vid.removeAttribute('src'); vid.load();
+        flashHint('HLS 兜底下 DOM 暂无声音（切视频模式听声）');
+      }
+      avVia = null;
+    }
   }
   /* 不停 RTC：它现在是 DOM 的优先传输（rig-dom 数据通道）；
      还没连就顺带拉起，数据先走 WS、通道开后无缝迁移 */
@@ -853,8 +940,28 @@ function domFallback(why) {
 }
 /* 区域子流占位块：跨源 iframe（序列化读不到内容）与 video 元素
    在镜像里只是盒子，边缘按 rect 截图串流（dom-region）贴图进来。
-   regionCache 跨快照重建保留最后一帧，建节点时直接贴上 */
+   regionCache 跨快照重建保留最后一帧，建节点时直接贴上。
+   D04：缓存按页面代次隔离——快照 URL 变化（导航/换文档，页内
+   序列化器 id 从 1 重排）即清空，不把旧页的图贴给新文档；
+   最多 128 项，防驻留图像堆积。条目自带代次，跨代一律不用。 */
 const regionCache = new Map();
+let regionEpoch = '';
+const REGION_CACHE_MAX = 128;
+function regionEpochCheck(url) {
+  const u = url || '';
+  if (u !== regionEpoch) { regionEpoch = u; regionCache.clear(); }
+}
+function regionPut(id, dataUrl) {
+  regionCache.set(id, { d: dataUrl, e: regionEpoch });
+  if (regionCache.size > REGION_CACHE_MAX) {
+    // 删最旧（Map 按插入序）
+    regionCache.delete(regionCache.keys().next().value);
+  }
+}
+function regionGet(id) {
+  const c = regionCache.get(id);
+  return (c && c.e === regionEpoch) ? c.d : undefined;
+}
 function regionBox(n, doc) {
   const el = doc.createElement('div');
   for (const k in (n.a || {})) {
@@ -878,7 +985,7 @@ function regionBox(n, doc) {
   img.setAttribute('data-rig-region-img', '1');
   const poster = n.a && n.a.poster;
   if (poster) { img.src = poster; img.style.display = 'block'; }
-  const cached = regionCache.get(n.i);
+  const cached = regionGet(n.i);
   if (cached) { img.src = cached; img.style.display = 'block'; }
   el.appendChild(img);
   return el;

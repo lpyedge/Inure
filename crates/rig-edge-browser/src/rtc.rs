@@ -75,6 +75,8 @@ pub struct RtcHub {
     connected: Arc<AtomicUsize>,
     /// HLS 策略回调（App 装配时注入；None = 无 HLS，如单测）
     hls_watch: std::sync::Mutex<Option<std::sync::Weak<crate::media::MediaPipeline>>>,
+    /// O01：DC 待发队列当前字节数（跨会话累加，供 /health 观测背压）
+    dc_pending_bytes: Arc<AtomicUsize>,
     /// 任一会话请求关键帧（PLI/新连通）即置位，feeder 消费后清零
     force_key: Arc<AtomicBool>,
     /// BWE 反馈的目标码率（多会话时后写者胜，量级正确即可）
@@ -116,6 +118,7 @@ impl RtcHub {
             aud_tx,
             want: Arc::new(AtomicUsize::new(0)),
             connected: Arc::new(AtomicUsize::new(0)),
+            dc_pending_bytes: Arc::new(AtomicUsize::new(0)),
             hls_watch: std::sync::Mutex::new(None),
             force_key: Arc::new(AtomicBool::new(false)),
             bitrate: Arc::new(AtomicU64::new(START_BITRATE)),
@@ -164,6 +167,16 @@ impl RtcHub {
 
     pub fn connected_count(&self) -> usize {
         self.connected.load(Ordering::SeqCst)
+    }
+
+    /// O01：想要媒体的会话数（feeder 需求计数，供 /health）
+    pub fn want_count(&self) -> usize {
+        self.want.load(Ordering::SeqCst)
+    }
+
+    /// O01：DC 待发队列字节数（供 /health 观测 SCTP 背压）
+    pub fn dc_pending_bytes(&self) -> usize {
+        self.dc_pending_bytes.load(Ordering::SeqCst)
     }
 
     /// RTC 连通数变化时的 HLS 联动（M01）。连通数 >0 → HLS 是多余的
@@ -593,6 +606,10 @@ impl DcPending {
     fn front(&self) -> Option<&str> {
         self.q.front().map(|(f, _)| f.as_str())
     }
+
+    fn bytes(&self) -> usize {
+        self.bytes
+    }
 }
 
 /// 旧代次丢弃后请求全量重同步（冷却内只记一次，防风暴）。
@@ -805,6 +822,9 @@ async fn run_session(
                         if dc_pending.push_msg(dc_chunk_frames(&text, &mut dc_chunk_id), now) {
                             request_resync(&out, &mut last_resync, now);
                         }
+                        // O01：背压 gauge
+                        hub.dc_pending_bytes
+                            .store(dc_pending.bytes(), Ordering::SeqCst);
                     }
                 }
             }
@@ -909,6 +929,9 @@ async fn run_session(
                         _ => break,
                     }
                 }
+                // O01：背压 gauge（排空后）
+                hub.dc_pending_bytes
+                    .store(dc_pending.bytes(), Ordering::SeqCst);
             }
         }
     }
