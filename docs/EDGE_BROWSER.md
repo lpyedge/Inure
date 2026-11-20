@@ -960,3 +960,4 @@ rig-proto 單元測試鎖定 upload/新拒絕碼/Done.note 的線格式。
 - 待拍板三項的處置（均取報告推薦值，負責人可推翻）：① DOM 默認保留 RTC 聲音（已實現；HLS-only 無獨立聲軌仍靜音並明示）；② reflow 頻發允許回退整頁幀（`RIG_PUMP_FULL_ONLY=1`，非常駐）；③ 保持單人受信口徑（README 已聲明，見 U02）。
 - 未做（需條件/另議）：V03 尺寸啟發式（高度疑似，未證實不動）；HLS 單 rendition（可選優化）；S5 HLS 音頻端到端探針、測試#4（observe_full 失敗注入）、#11（四路渲染全路徑）、#12（HLS 無首幀十次啟停）需 PulseAudio/真機環境（本機無聲卡未驗）；S7（WS 推送替代輪詢、真 shadow-DOM）列為後續；audio_rms 未接入健康（儀表缺口）。
 - 架構重寫不在本輪：狀態所有者拆分（ViewerConnection/MediaCoordinator/ExecControl）只做增量——本輪的 ConnSubs/DcPending/owned guard 即按此方向落地。
+| `0254b67` | 报告测试#4：ai.rs 内置可编排假 CDP（HTTP /json/version + WS 双端口，主会话事件在 setAutoAttach 后推，避 broadcast 竞态）——动作后刷新注入失败回归网（Done 必带校验帧+重观察附注）与 CDP 全挂干净拒绝；V03 帧分类加长宽比一致性（±5%）；HLS 单 rendition（`RIG_HLS_SINGLE=h264|hevc`，非法值显式报错，/channels 与 /health 暴露 `hls_renditions`，观看端按提供表选流）。验证：local-gate 全绿、单测 43/43、真进程 curl（`hls_renditions:["h264"]`） |
