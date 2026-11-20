@@ -360,12 +360,39 @@ impl Rendition {
     }
 }
 
-/// 双版本合流器组（同尺寸重建时整体替换）。
+/// 单路输出（编码器 + 合流器）。默认双版本（HEVC 主 + H.264 兜底）；
+/// `RIG_HLS_SINGLE=h264|hevc` 只建一路，省一路编码（M01 成本项）。
+/// 改后下次合流器重建（尺寸变化或重启管线）生效。
+fn single_rendition() -> Result<Option<&'static str>, String> {
+    let v = std::env::var("RIG_HLS_SINGLE").unwrap_or_default();
+    match v.to_lowercase().as_str() {
+        "" => Ok(None),
+        "hevc" | "h265" => Ok(Some("hevc")),
+        "h264" | "avc" => Ok(Some("h264")),
+        other => Err(format!(
+            "RIG_HLS_SINGLE 非法（{other}）：只接受 h264|hevc，不设则双版本"
+        )),
+    }
+}
+
+/// 供 /channels 与 /health 展示的输出版本表（与 Mux::build 同口径）
+pub fn offered_renditions() -> Vec<&'static str> {
+    match single_rendition() {
+        Ok(Some(one)) => vec![one],
+        _ => vec!["hevc", "h264"],
+    }
+}
+
+/// 一路 HLS 输出（编码器 + 合流器）。
+struct MuxOne {
+    enc: VideoEncoder,
+    r: Rendition,
+}
+
+/// 合流器组（同尺寸重建时整体替换）：一路或两路输出。
 struct Mux {
-    hevc_enc: VideoEncoder,
-    h264_enc: VideoEncoder,
-    hevc: Rendition,
-    h264: Rendition,
+    hevc: Option<MuxOne>,
+    h264: Option<MuxOne>,
     w: u32,
     h: u32,
 }
@@ -377,6 +404,7 @@ impl Mux {
         h: u32,
         aac_params: Option<&ff::codec::Parameters>,
     ) -> Result<Self, String> {
+        let only = single_rendition()?;
         let mk = |kind, bitrate| {
             VideoEncoder::new(
                 kind,
@@ -391,40 +419,45 @@ impl Mux {
             )
             .map_err(|e| format!("建编码器失败: {e}"))
         };
-        let hevc_enc = mk(CodecKind::Hevc, 1_500_000)?;
-        let h264_enc = mk(CodecKind::H264, 2_500_000)?;
         let audio = aac_params.map(|p| (ff::codec::Id::AAC, p.clone()));
-        let hevc = Rendition::build(
-            dir,
-            "hevc",
-            ff::codec::Id::HEVC,
-            hevc_enc.parameters(),
-            hevc_enc.time_base(),
-            audio.clone(),
-            true,
-        )?;
-        let h264 = Rendition::build(
-            dir,
-            "h264",
-            ff::codec::Id::H264,
-            h264_enc.parameters(),
-            h264_enc.time_base(),
-            audio,
-            false,
-        )?;
-        Ok(Self {
-            hevc_enc,
-            h264_enc,
-            hevc,
-            h264,
-            w,
-            h,
-        })
+        let mut hevc = None;
+        let mut h264 = None;
+        if only.map_or(true, |o| o == "hevc") {
+            let enc = mk(CodecKind::Hevc, 1_500_000)?;
+            let r = Rendition::build(
+                dir,
+                "hevc",
+                ff::codec::Id::HEVC,
+                enc.parameters(),
+                enc.time_base(),
+                audio.clone(),
+                true,
+            )?;
+            hevc = Some(MuxOne { enc, r });
+        }
+        if only.map_or(true, |o| o == "h264") {
+            let enc = mk(CodecKind::H264, 2_500_000)?;
+            let r = Rendition::build(
+                dir,
+                "h264",
+                ff::codec::Id::H264,
+                enc.parameters(),
+                enc.time_base(),
+                audio,
+                false,
+            )?;
+            h264 = Some(MuxOne { enc, r });
+        }
+        Ok(Self { hevc, h264, w, h })
     }
 
     fn close(self) {
-        self.hevc.close();
-        self.h264.close();
+        if let Some(one) = self.hevc {
+            one.r.close();
+        }
+        if let Some(one) = self.h264 {
+            one.r.close();
+        }
     }
 }
 
@@ -492,30 +525,24 @@ fn pipeline_main(human: Arc<HumanChannel>, dir: PathBuf, stop: Arc<AtomicBool>) 
             }
             if let Some(m) = mux.as_mut() {
                 let frame = crop_even(&rgb, w, h);
-                if let Ok(pkts) = m.hevc_enc.encode_raw(&frame, false) {
-                    for p in &pkts {
-                        m.hevc
-                            .write(p, m.hevc.v_idx, m.hevc_enc.time_base(), m.hevc.v_tb);
-                    }
-                }
-                if let Ok(pkts) = m.h264_enc.encode_raw(&frame, false) {
-                    for p in &pkts {
-                        m.h264
-                            .write(p, m.h264.v_idx, m.h264_enc.time_base(), m.h264.v_tb);
+                for one in m.hevc.as_mut().into_iter().chain(m.h264.as_mut()) {
+                    if let Ok(pkts) = one.enc.encode_raw(&frame, false) {
+                        let tb = one.enc.time_base();
+                        for p in &pkts {
+                            one.r.write(p, one.r.v_idx, tb, one.r.v_tb);
+                        }
                     }
                 }
             }
         }
-        // 音频：排空待写 packet（同一 packet 写两路）
+        // 音频：排空待写 packet（同一 packet 写各路）
         while let Ok(p) = audio_rx.try_recv() {
             if let Some(m) = mux.as_mut() {
-                if let (Some(idx), Some(tb)) = (m.hevc.a_idx, m.hevc.a_tb) {
-                    m.hevc
-                        .write(&p, idx, ff::Rational::new(1, AUDIO_RATE as i32), tb);
-                }
-                if let (Some(idx), Some(tb)) = (m.h264.a_idx, m.h264.a_tb) {
-                    m.h264
-                        .write(&p, idx, ff::Rational::new(1, AUDIO_RATE as i32), tb);
+                for one in m.hevc.as_mut().into_iter().chain(m.h264.as_mut()) {
+                    if let (Some(idx), Some(tb)) = (one.r.a_idx, one.r.a_tb) {
+                        one.r
+                            .write(&p, idx, ff::Rational::new(1, AUDIO_RATE as i32), tb);
+                    }
                 }
             }
         }
@@ -752,5 +779,43 @@ mod tests {
         assert!(!hls_should_run(true, 3));
         assert!(!hls_should_run(false, 0));
         assert!(!hls_should_run(false, 2));
+    }
+
+    /// RIG_HLS_SINGLE 取值口径
+    #[test]
+    fn single_rendition_parses() {
+        std::env::remove_var("RIG_HLS_SINGLE");
+        assert_eq!(single_rendition().unwrap(), None);
+        for (k, v) in [
+            ("hevc", "hevc"),
+            ("h265", "hevc"),
+            ("h264", "h264"),
+            ("avc", "h264"),
+        ] {
+            std::env::set_var("RIG_HLS_SINGLE", k);
+            assert_eq!(single_rendition().unwrap(), Some(v), "{k}");
+        }
+        std::env::set_var("RIG_HLS_SINGLE", "vp9");
+        assert!(single_rendition().is_err(), "非法值必须显式报错");
+        std::env::remove_var("RIG_HLS_SINGLE");
+        assert_eq!(offered_renditions(), vec!["hevc", "h264"]);
+    }
+
+    /// 单路构建只建一路编码器 + 一路输出目录（省一路编码）
+    #[test]
+    fn single_rendition_builds_one_output() {
+        crate::encode::ensure_init();
+        std::env::set_var("RIG_HLS_SINGLE", "h264");
+        let dir = std::env::temp_dir().join(format!("rig-test-single-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("h264")).unwrap();
+        let m = Mux::build(&dir, 64, 48, None).expect("单路构建应成功");
+        assert!(m.hevc.is_none(), "hevc 不应构建");
+        assert!(m.h264.is_some(), "h264 应构建");
+        m.close();
+        assert!(dir.join("h264/index.m3u8").exists(), "h264 播放列表应落盘");
+        assert!(!dir.join("hevc").exists(), "hevc 目录不应创建");
+        std::env::remove_var("RIG_HLS_SINGLE");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

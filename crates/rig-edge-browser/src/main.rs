@@ -237,6 +237,9 @@ struct ChannelState {
     media_state: String,
     /// M03 HLS 最近一次启动失败原因；正常时为 null
     media_error: Option<String>,
+    /// HLS 输出版本表（默认 ["hevc","h264"]；RIG_HLS_SINGLE 只留一路）。
+    /// 观看端按此表与自身解码能力选流
+    hls_renditions: Vec<String>,
 }
 
 async fn channel_state(app: &Arc<App>, av: bool) -> ChannelState {
@@ -260,6 +263,10 @@ async fn channel_state(app: &Arc<App>, av: bool) -> ChannelState {
         av_wanted: wanted,
         media_state,
         media_error,
+        hls_renditions: media::offered_renditions()
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
     }
 }
 
@@ -608,6 +615,7 @@ async fn health(State(app): State<Arc<App>>) -> Json<serde_json::Value> {
             "wanted": app.media.wanted(),
             "running": app.media.running().await,
             "error": app.media.state_summary().await.2,
+            "renditions": media::offered_renditions(),
         },
         "pump": {
             "full": m.pump_full.load(Ordering::Relaxed),

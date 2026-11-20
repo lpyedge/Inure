@@ -1129,3 +1129,215 @@ fn draw_marks(png: &[u8], obs: &Observation) -> Result<Vec<u8>, String> {
         .map_err(|e| format!("截圖编码失败: {e}"))?;
     Ok(out)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures_util::{SinkExt, StreamExt};
+    use std::sync::atomic::AtomicUsize;
+
+    /// 可编排的假 CDP 对端（报告测试#4 的失败注入能力）。
+    /// HTTP 端点只服务 /json/version（返回跨端口的 ws 地址）；
+    /// WS 端先推 attachedToTarget（page 会话 S1），之后按脚本应答。
+    /// `ax_fail_from`：第几次 Accessibility.getFullAXTree 开始报错
+    /// （usize::MAX = 永不失败）——成功路径与动作后刷新失败路径
+    /// 用同一个开关编排。
+    struct FakeCdp {
+        ax_calls: AtomicUsize,
+        ax_fail_from: usize,
+    }
+
+    impl FakeCdp {
+        /// 返回 (是否为注入错误, result 主体)
+        fn reply(&self, method: &str) -> (bool, serde_json::Value) {
+            match method {
+                "Browser.getVersion" => (
+                    false,
+                    serde_json::json!({
+                        "userAgent": "Mozilla/5.0 (X11; Linux x86_64) Chrome/120.0.0.0",
+                        "product": "Chrome/120.0.0.0",
+                    }),
+                ),
+                "Page.getLayoutMetrics" => (
+                    false,
+                    serde_json::json!({
+                        "cssVisualViewport": {
+                            "clientWidth": 1280.0,
+                            "clientHeight": 800.0,
+                            "pageX": 0.0,
+                            "pageY": 0.0,
+                        },
+                    }),
+                ),
+                "Runtime.evaluate" => (false, serde_json::json!({"result": {"value": 1.0}})),
+                "Page.getFrameTree" => (
+                    false,
+                    serde_json::json!({
+                        "frameTree": {"frame": {"id": "F1", "loaderId": "L1"}},
+                    }),
+                ),
+                "Accessibility.getFullAXTree" => {
+                    let n = self.ax_calls.fetch_add(1, Ordering::SeqCst) + 1;
+                    if n >= self.ax_fail_from {
+                        (true, serde_json::Value::Null)
+                    } else {
+                        (
+                            false,
+                            serde_json::json!({"nodes": [
+                                {"nodeId": "1", "role": {"value": "RootWebArea"},
+                                 "name": {"value": ""}, "childIds": ["2"]},
+                                {"nodeId": "2", "role": {"value": "button"},
+                                 "name": {"value": "B"}, "backendDOMNodeId": 7},
+                            ]}),
+                        )
+                    }
+                }
+                _ => (false, serde_json::json!({})),
+            }
+        }
+    }
+
+    /// 起一个假 CDP（HTTP + WS 双端口），返回供 attach 的 http base。
+    async fn spawn_fake_cdp(ax_fail_from: usize) -> String {
+        let fake = Arc::new(FakeCdp {
+            ax_calls: AtomicUsize::new(0),
+            ax_fail_from,
+        });
+        // WS 端
+        let ws_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let ws_port = ws_listener.local_addr().unwrap().port();
+        let fake2 = fake.clone();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = ws_listener.accept().await {
+                let fake = fake2.clone();
+                tokio::spawn(async move {
+                    let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await else {
+                        return;
+                    };
+                    // attach 的事件订阅在 connect 之后：握手完就推会丢
+                    // （broadcast 无历史）。等 setAutoAttach（装配序列
+                    // 末尾）之后再推 attachedToTarget，主会话必达。
+                    let mut attached_pushed = false;
+                    while let Some(Ok(msg)) = ws.next().await {
+                        let tokio_tungstenite::tungstenite::Message::Text(text) = msg else {
+                            continue;
+                        };
+                        let v: serde_json::Value =
+                            serde_json::from_str(text.as_str()).unwrap_or_default();
+                        let (Some(id), Some(method)) = (
+                            v.get("id").cloned(),
+                            v.get("method").and_then(|m| m.as_str()),
+                        ) else {
+                            continue;
+                        };
+                        let (is_err, body) = fake.reply(method);
+                        let resp = if is_err {
+                            serde_json::json!({"id": id, "error": {"message": "injected failure"}})
+                        } else {
+                            serde_json::json!({"id": id, "result": body})
+                        };
+                        let _ = ws
+                            .send(tokio_tungstenite::tungstenite::Message::Text(
+                                resp.to_string().into(),
+                            ))
+                            .await;
+                        if method == "Target.setAutoAttach" && !attached_pushed {
+                            attached_pushed = true;
+                            let _ = ws
+                                .send(tokio_tungstenite::tungstenite::Message::Text(
+                                    serde_json::json!({
+                                        "method": "Target.attachedToTarget",
+                                        "params": {
+                                            "sessionId": "S1",
+                                            "targetInfo": {"targetId": "T1", "type": "page"},
+                                        },
+                                    })
+                                    .to_string()
+                                    .into(),
+                                ))
+                                .await;
+                        }
+                    }
+                });
+            }
+        });
+        // HTTP 端：只认 /json/version
+        let http_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let http_port = http_listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt;
+            while let Ok((mut stream, _)) = http_listener.accept().await {
+                let body = serde_json::json!({
+                    "webSocketDebuggerUrl": format!("ws://127.0.0.1:{ws_port}/cdp"),
+                    "Browser": "FakeCDP/1",
+                })
+                .to_string();
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(resp.as_bytes()).await;
+            }
+        });
+        format!("http://127.0.0.1:{http_port}")
+    }
+
+    async fn attach_fake(ax_fail_from: usize) -> (Arc<Browser>, AiChannel) {
+        let base = spawn_fake_cdp(ax_fail_from).await;
+        let browser = Browser::attach(&base).await.expect("假 CDP 应能 attach");
+        let exec = Arc::new(ExecControl::default());
+        let ch = AiChannel::new(browser.clone(), vec![], exec);
+        (browser, ch)
+    }
+
+    fn click_point(frame_id: u64, x: f32, y: f32) -> ActionRequest {
+        ActionRequest {
+            request_id: "t4".to_string(),
+            frame_id,
+            lease: None,
+            action: Action::Click {
+                target: Target::Point { x, y },
+                button: MouseButton::Left,
+                count: 1,
+            },
+        }
+    }
+
+    /// 报告测试#4：动作后刷新失败时，Done 必须携带本次实际构建的
+    /// 帧号（动作前校验帧），绝不能是并发递增的全局计数器；且必须
+    /// 附注要求重新 observe。旧实现取全局计数器，本测试锁死修法。
+    #[tokio::test]
+    async fn act_done_frame_points_at_built_frame_not_counter() {
+        // 第 1/2 次 AX 成功（首帧观察 + 动作中复核），第 3 次（动作后
+        // 刷新）开始注入失败
+        let (_browser, ch) = attach_fake(3).await;
+        let (obs, _) = ch.observe().await.expect("首帧观察应建成");
+        let f1 = obs.frame_id;
+        match ch.act(click_point(f1, 10.0, 10.0)).await {
+            ActionResult::Done { frame_id, note } => {
+                assert_eq!(
+                    frame_id, f1,
+                    "Done 必须指向本次构建的校验帧，不能是全局计数"
+                );
+                let n = note.expect("刷新失败必须附注重观察说明");
+                assert!(
+                    n.contains("重新 observe"),
+                    "附注应要求重新 observe，实际: {n}"
+                );
+            }
+            other => panic!("动作后刷新失败应回 Done（副作用已执行），实际: {other:?}"),
+        }
+    }
+
+    /// CDP 全挂时动作干净拒绝：不 panic、不挂起、不返回野帧号。
+    /// （ax_fail_from=1：连首帧都建不成）
+    #[tokio::test]
+    async fn cdp_down_act_rejects_cleanly() {
+        let (_browser, ch) = attach_fake(1).await;
+        assert!(ch.observe().await.is_err(), "AX 全挂时观察应失败");
+        match ch.act(click_point(0, 10.0, 10.0)).await {
+            ActionResult::Rejected { .. } => {}
+            other => panic!("CDP 不可用时动作应干净拒绝，实际: {other:?}"),
+        }
+    }
+}

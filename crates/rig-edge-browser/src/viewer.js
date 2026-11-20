@@ -609,13 +609,18 @@ function startHls() {
   rtcStop();
   vid.muted = false;
   vid.style.display = 'block'; cv.style.display = 'none';
-  let hevcOk = window.MediaSource && MediaSource.isTypeSupported('video/mp4; codecs="hvc1.1.6.L93.B0, mp4a.40.2"');
+  /* 单 rendition 档（RIG_HLS_SINGLE）：只建了被提供的那路，
+     按提供表与自身解码能力选流，不再无条件试 hevc */
+  const offered = window.__rigHls || ['hevc', 'h264'];
+  const hevcOk = offered.includes('hevc') && window.MediaSource && MediaSource.isTypeSupported('video/mp4; codecs="hvc1.1.6.L93.B0, mp4a.40.2"');
   vid.src = (hevcOk ? '/stream/hevc/index.m3u8' : '/stream/h264/index.m3u8') + TQ;
   vid.play().catch(() => {});
 }
 async function pollAv() {
   try {
     const s = await (await fch('/channels')).json();
+    /* 单 rendition 档：HLS 输出版本表进全局，供 startHls 选流 */
+    if (Array.isArray(s.hls_renditions)) window.__rigHls = s.hls_renditions;
     /* M01/M03/U01：意图（av_wanted）与实际运行（av）分离——RTC healthy
        时 HLS 可以停着（av=false）但意图仍在。以下分支一律按意图决策，
        不再把“兜底编码被策略停掉”误判成“用户关了影音”而拆台 */

@@ -98,8 +98,19 @@ const RECT_TTL_MS: u64 = 400;
 /// V01/V02 帧泵纯函数（可无浏览器单测）：
 ///
 /// 帧分类：整页帧 = 尚未建基准，或宽高都达到基准 90%
+/// **且长宽比一致（V03）**：尺寸达标但比例差得多的是内容帧
+/// （如接近全屏的视频区），不能只看 90% 阈值就当整页。
+/// 同一视口的整页帧比例恒定，5% 容差只防整数取整抖动。
 fn classify_full(w: u32, h: u32, base: (u32, u32)) -> bool {
-    base.0 == 0 || (w * 10 >= base.0 * 9 && h * 10 >= base.1 * 9)
+    if base.0 == 0 {
+        return true;
+    }
+    if w * 10 < base.0 * 9 || h * 10 < base.1 * 9 {
+        return false;
+    }
+    let (bw, bh) = (base.0 as f64, base.1 as f64);
+    let (fw, fh) = (w as f64, h as f64);
+    (fw * bh - fh * bw).abs() <= 0.05 * fw * bh
 }
 
 /// V04：在缓存矩形里找与内容帧尺寸匹配的唯一者——0 个或多个都算
@@ -1741,7 +1752,7 @@ mod tests {
     }
 
     /// V01/分类：90% 阈值边界。1280x800 基准下 1152x720 算整页
-    /// （恰 90%），1151 宽不算——后者走缩型视口核对分支
+    /// （恰 90%，同比例）；1151 宽不算——后走缩型视口核对分支
     #[test]
     fn classify_full_uses_ninety_percent() {
         assert!(classify_full(1280, 800, (1280, 800)));
@@ -1749,6 +1760,16 @@ mod tests {
         assert!(!classify_full(1151, 720, (1280, 800)));
         assert!(!classify_full(803, 452, (1280, 800)));
         assert!(classify_full(803, 452, (0, 0)), "无基准时首帧即建基准");
+    }
+
+    /// V03：尺寸达标但长宽比差得多 → 内容帧。1200x700 落在
+    /// 1280x800 视口（1.714 vs 1.6）：宽高都在 90% 以上，
+    /// 旧实现误判整页；同比例 1200x750 仍算整页
+    #[test]
+    fn classify_full_rejects_off_aspect_content() {
+        assert!(classify_full(1200, 750, (1280, 800)));
+        assert!(!classify_full(1200, 700, (1280, 800)));
+        assert!(!classify_full(865, 487, (1280, 800)));
     }
 
     /// V04：唯一匹配才贴。单元素命中返回位置；多元素尺寸接近
