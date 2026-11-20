@@ -19,6 +19,7 @@
 //!   或会话结束自动回落 WS。DOM 控制消息（dom-start/resync/输入）
 //!   仍走 WS——信令面不动，seq 协议与传输无关、切换无缝。
 
+use std::collections::VecDeque;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -474,6 +475,93 @@ fn audio_capture_run(
 /// 可靠有序通道连发无压力。
 const DC_CHUNK_MAX: usize = 16 * 1024;
 
+/// T01 有界 DC 待发队列：按“整条旧代次”管理——超限时丢弃全部
+/// 旧帧并请求一次全量重同步，绝不丢单个分片（seq 连续性要求，
+/// 丢片段会让后续 seq 永远对不上）。
+/// 上限：总字节 4MB、总分片 512、队首驻留 5s。
+const DC_PENDING_MAX_BYTES: usize = 4 * 1024 * 1024;
+const DC_PENDING_MAX_FRAMES: usize = 512;
+const DC_PENDING_MAX_AGE: Duration = Duration::from_secs(5);
+/// 旧代次丢弃后重发 resync 请求的冷却（防慢消费者持续触发风暴）
+const DC_RESYNC_COOLDOWN: Duration = Duration::from_secs(5);
+
+struct DcPending {
+    q: VecDeque<(String, Instant)>,
+    bytes: usize,
+}
+
+impl DcPending {
+    fn new() -> Self {
+        DcPending {
+            q: VecDeque::new(),
+            bytes: 0,
+        }
+    }
+
+    /// 入队一条消息的分片。返回 true = 因超限丢弃了全部旧代次，
+    /// 调用方此时应请求一次全量重同步。
+    fn push_msg(&mut self, frames: Vec<String>, now: Instant) -> bool {
+        let incoming: usize = frames.iter().map(|f| f.len()).sum();
+        // 单条消息自身就超限：不入队（否则队永远排不空），直接重同步
+        if incoming > DC_PENDING_MAX_BYTES {
+            return true;
+        }
+        let mut dropped = false;
+        if self.bytes + incoming > DC_PENDING_MAX_BYTES
+            || self.q.len() + frames.len() > DC_PENDING_MAX_FRAMES
+        {
+            self.clear();
+            dropped = true;
+        }
+        for f in frames {
+            self.bytes += f.len();
+            self.q.push_back((f, now));
+        }
+        dropped
+    }
+
+    /// 队首驻留超时：整队视为旧代次，清空并要求重同步。
+    fn evict_stale(&mut self, now: Instant) -> bool {
+        let stale = self
+            .q
+            .front()
+            .is_some_and(|(_, t)| now.duration_since(*t) > DC_PENDING_MAX_AGE);
+        if stale {
+            self.clear();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn clear(&mut self) {
+        self.q.clear();
+        self.bytes = 0;
+    }
+
+    fn pop(&mut self) -> Option<String> {
+        self.q.pop_front().map(|(f, _)| {
+            self.bytes = self.bytes.saturating_sub(f.len());
+            f
+        })
+    }
+
+    fn front(&self) -> Option<&str> {
+        self.q.front().map(|(f, _)| f.as_str())
+    }
+}
+
+/// 旧代次丢弃后请求全量重同步（冷却内只记一次，防风暴）。
+/// 观看端收到后回发 dom-resync，边缘重拍快照（见 viewer.js）。
+fn request_resync(out: &mpsc::Sender<String>, last: &mut Option<Instant>, now: Instant) {
+    if last.is_some_and(|t| now.duration_since(t) < DC_RESYNC_COOLDOWN) {
+        return;
+    }
+    *last = Some(now);
+    let _ = out.try_send(json!({"type": "dom-resync-needed"}).to_string());
+    eprintln!("[rtc] DC 待发队列超限：丢弃旧代次，已请求全量重同步");
+}
+
 /// 把一条 DOM 消息编码为 DC 发送帧序列：不超限原样单帧；超限切成
 /// {"type":"dom-chunk","id":N,"i":k,"n":总,"data":片段} 连发，
 /// 片段按 UTF-8 字符边界切、serde 负责转义，观看端拼接后整体解析。
@@ -585,7 +673,8 @@ async fn run_session(
     let mut dc_chunk_id: u64 = 0;
     // DC 待发帧队列：Channel::write 在 SCTP 发送窗不足时返回
     // Ok(false) 拒绝（不排队），必须由会话自己留队重试
-    let mut dc_pending: std::collections::VecDeque<String> = std::collections::VecDeque::new();
+    let mut dc_pending = DcPending::new();
+    let mut last_resync: Option<Instant> = None;
     let Some((offer, pending)) = change.apply() else {
         return Err("生成 offer 失败".into());
     };
@@ -664,11 +753,11 @@ async fn run_session(
                 // 不足时 write 会拒绝，必须留队重试，不能在此直发）
                 if dc_open {
                     if let Ok(text) = d {
-                        // 浏览器 SCTP 单条消息上限（Chrome 256KB）远小于
-                        // 真实页面快照（维基实测 1.6MB）：整条直发会被
-                        // 对端静默丢弃、只剩小差分能过（2026-11-20 实
-                        // 测）——超限消息先应用层分片，观看端重组
-                        dc_pending.extend(dc_chunk_frames(&text, &mut dc_chunk_id));
+                        // T01：入队即做有界检查，旧代次整体丢弃 + 请求重同步
+                        let now = Instant::now();
+                        if dc_pending.push_msg(dc_chunk_frames(&text, &mut dc_chunk_id), now) {
+                            request_resync(&out, &mut last_resync, now);
+                        }
                     }
                 }
             }
@@ -745,6 +834,10 @@ async fn run_session(
         // 被静默丢光（快照永远拼不齐，2026-11-20 实测）
         if dc_open {
             if let Some(cid) = dom_cid {
+                // T01：队首驻留超时说明消费端已跟不上，整队视为旧代次
+                if dc_pending.evict_stale(Instant::now()) {
+                    request_resync(&out, &mut last_resync, Instant::now());
+                }
                 while let Some(front) = dc_pending.front() {
                     let accepted = match rtc.channel(cid) {
                         Some(mut ch) => ch.write(false, front.as_bytes()),
@@ -752,7 +845,7 @@ async fn run_session(
                     };
                     match accepted {
                         Ok(true) => {
-                            dc_pending.pop_front();
+                            dc_pending.pop();
                         }
                         _ => break,
                     }
@@ -916,6 +1009,67 @@ mod chunk_tests {
             joined.push_str(v["data"].as_str().unwrap());
         }
         assert_eq!(joined, text);
+    }
+}
+
+#[cfg(test)]
+mod pending_tests {
+    use super::*;
+
+    fn mb(n: usize) -> String {
+        "x".repeat(n * 1024 * 1024)
+    }
+
+    /// T01/测试#7：背压下 1MB 快照反复推送，队列内存受上限控制——
+    /// 超限时丢弃全部旧代次（返回 true 触发重同步），内存回到一条量级
+    #[test]
+    fn repeated_snapshots_stay_bounded() {
+        let mut q = DcPending::new();
+        let t = Instant::now();
+        // 4MB 上限：前 4 条 1MB 入队不触发（边界：bytes==MAX 不算超限）
+        for _ in 0..4 {
+            assert!(!q.push_msg(vec![mb(1)], t), "4MB 以内不得丢弃");
+        }
+        assert_eq!(q.bytes, 4 * 1024 * 1024);
+        // 第 5 条触发旧代次整体丢弃，只剩新来的 1MB
+        assert!(q.push_msg(vec![mb(1)], t), "超限必须丢弃旧代次");
+        assert_eq!(q.bytes, 1024 * 1024, "丢弃后只剩新代次");
+        assert_eq!(q.q.len(), 1);
+    }
+
+    /// 单条消息自身超限：不入队，直接要求重同步
+    #[test]
+    fn single_oversize_message_is_rejected() {
+        let mut q = DcPending::new();
+        let t = Instant::now();
+        assert!(q.push_msg(vec![mb(5)], t));
+        assert_eq!(q.bytes, 0, "超大单条不得入队");
+        assert!(q.q.is_empty());
+    }
+
+    /// 队首驻留超时：整队视为旧代次；未超时不误杀
+    #[test]
+    fn stale_head_evicts_whole_queue() {
+        let mut q = DcPending::new();
+        let t0 = Instant::now();
+        q.push_msg(vec!["a".to_string(), "b".to_string()], t0);
+        assert!(!q.evict_stale(t0 + DC_PENDING_MAX_AGE - Duration::from_secs(1)));
+        assert_eq!(q.q.len(), 2);
+        assert!(q.evict_stale(t0 + DC_PENDING_MAX_AGE + Duration::from_secs(1)));
+        assert!(q.q.is_empty());
+        assert_eq!(q.bytes, 0);
+    }
+
+    /// pop 正确扣字节账；front 只读不消耗
+    #[test]
+    fn pop_accounts_bytes() {
+        let mut q = DcPending::new();
+        let t = Instant::now();
+        q.push_msg(vec!["ab".to_string(), "cdef".to_string()], t);
+        assert_eq!(q.bytes, 6);
+        assert_eq!(q.front(), Some("ab"));
+        assert_eq!(q.pop().as_deref(), Some("ab"));
+        assert_eq!(q.bytes, 4);
     }
 }
 

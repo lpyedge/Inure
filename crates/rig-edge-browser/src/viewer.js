@@ -79,6 +79,8 @@ ws.onmessage = (ev) => {
   }
   if (m.type === 'ghost') showGhost(m);
   if (m.type === 'ghost-off') hideGhost();
+  /* T01：边缘 DC 待发队列丢弃旧代次后请求重同步，观看端回发 dom-resync */
+  if (m.type === 'dom-resync-needed') send({type:'dom-resync'});
   if (m.type === 'chrome-state') applyChromeState(m);
 };
 /* DOM 消息统一入口：WS 文本与 rig-dom 数据通道两条腿共用
@@ -367,7 +369,8 @@ function openCtx(cx, cy, hit) {
   add('全选', () => sendKeyChord('a', 'KeyA'));
   add('自动模式：' + (modeAuto ? '开' : '关'), () => {
     modeAuto = !modeAuto;
-    if (modeAuto) { modeLock = false; send({type:'dom-start'}); flashHint('自动模式已开'); }
+    wantDomAuto = modeAuto; syncDomSub();
+    if (modeAuto) { modeLock = false; flashHint('自动模式已开'); }
     else flashHint('自动模式已关');
   });
   /* 导航走 chrome 命令（双模式同一路；旧实现 DOM 模式走 nav
@@ -727,13 +730,22 @@ function restoreAvAfterDom() {
 function exitDomDisplay() {
   if (!domOn) return;
   domOn = false;
-  mirFocusId = 0; mirFocusSel = null; mirFocusSig = null;
+  wantDomShow = false; syncDomSub(); /* 自动感知订阅保留，见 syncDomSub */  mirFocusId = 0; mirFocusSel = null; mirFocusSig = null;
   domAvOffPending = false;
   hideGhost();
   clearTimeout(domTimer);
   restoreAvAfterDom();
   showDisplay();
   reportSize();
+}
+/* D01：DOM 订阅由“想要方”与“已订阅”两层状态收敛——后台自动感知
+   与前台显示共用一份订阅，重复进入只发一次 START，一方退出而
+   另一方仍需要时不发 STOP。服务端同连接二次幂等兜底。 */
+let domSub = false, wantDomShow = false, wantDomAuto = false;
+function syncDomSub() {
+  const want = wantDomShow || wantDomAuto;
+  if (want && !domSub) { domSub = true; send({type:'dom-start'}); }
+  else if (!want && domSub) { domSub = false; send({type:'dom-stop'}); }
 }
 function domStart(auto) {
   if (!auto) modeLock = true; /* 手动进入 = 锁定到下次导航 */
@@ -755,7 +767,7 @@ function domStart(auto) {
      还没连就顺带拉起，数据先走 WS、通道开后无缝迁移 */
   if (!pc) rtcStart();
   domOn = true; domSeq = 0; mirMap = new Map();
-  send({type:'dom-start'});
+  wantDomShow = true; syncDomSub();
   showDisplay();
   reportSize();
   setPill('等待快照…');
@@ -770,7 +782,7 @@ function domStop(silent) {
   domAvOffPending = false;
   hideGhost();
   clearTimeout(domTimer);
-  send({type:'dom-stop'});
+  wantDomShow = false; syncDomSub();
   restoreAvAfterDom();
   showDisplay();
   reportSize();
@@ -1352,6 +1364,6 @@ if (new URLSearchParams(location.search).get('dom') === '1') {
 }
 /* F-08：自动模式默认起感知会话（快照到达后由 onSnapAuto 裁决
    显示模式；视频页保持视频、表单/文章页自动进 DOM） */
-ws.addEventListener('open', () => { if (modeAuto) send({type:'dom-start'}); });
+ws.addEventListener('open', () => { if (modeAuto && !wantDomAuto) { wantDomAuto = true; syncDomSub(); } });
 pollAv();
 ime.focus();

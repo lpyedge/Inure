@@ -856,6 +856,52 @@ fn frame_message(f: &human::FrameMsg) -> Message {
     Message::Binary(buf.into())
 }
 
+/// D01/D02：单连接订阅记账——`acquire_*`/`release_*` 各自幂等，
+/// 重复 start/stop 不改变远端计数；真正的释放只发生在父作用域
+/// （`ws_session` 尾部），任一侧任务先结束（含 abort）都不丢清理。
+#[derive(Debug, Default)]
+struct ConnSubs {
+    dom_held: bool,
+    jpeg_held: bool,
+}
+
+impl ConnSubs {
+    fn new() -> Self {
+        // JPEG 需求连接建立即持有（视频模式默认）；DOM 按需进入
+        ConnSubs {
+            dom_held: false,
+            jpeg_held: true,
+        }
+    }
+    /// 进入 DOM：未持有才返回 true（调用方据此调一次 viewer_start）
+    fn acquire_dom(&mut self) -> bool {
+        if self.dom_held {
+            false
+        } else {
+            self.dom_held = true;
+            true
+        }
+    }
+    /// 退出 DOM：持有才返回 true（调用方据此调一次 viewer_stop）
+    fn release_dom(&mut self) -> bool {
+        if self.dom_held {
+            self.dom_held = false;
+            true
+        } else {
+            false
+        }
+    }
+    /// 释放 JPEG 需求：持有才返回 true（调用方据此调一次 demand_add(-1)）
+    fn release_jpeg(&mut self) -> bool {
+        if self.jpeg_held {
+            self.jpeg_held = false;
+            true
+        } else {
+            false
+        }
+    }
+}
+
 async fn ws_session(app: Arc<App>, socket: WebSocket, remote: std::net::SocketAddr) {
     let (mut sink, mut stream) = socket.split();
     // hello：告知 CSS 视口尺寸，观看端据此换算输入坐标
@@ -878,6 +924,10 @@ async fn ws_session(app: Arc<App>, socket: WebSocket, remote: std::net::SocketAd
     let mut notices = app.human.subscribe_notices();
     let mut dom_msgs = app.dom.subscribe();
     let app2 = app.clone();
+    // D01/D02：本连接的订阅记账（跨两个任务共享，释放只在父作用域）。
+    // JPEG 需求连接建立即持有，见 ConnSubs::new。
+    let subs = Arc::new(std::sync::Mutex::new(ConnSubs::new()));
+    let subs2 = subs.clone();
     // 本连接的 transport 模式：RTC 连通后置 true，发送侧停发 WS 帧
     // （广播照常接收只丢弃）；RTC 断开/关闭自动恢复 WS 帧
     let rtc_active = Arc::new(AtomicBool::new(false));
@@ -978,8 +1028,7 @@ async fn ws_session(app: Arc<App>, socket: WebSocket, remote: std::net::SocketAd
         let mut rtc_session: Option<rtc::SessionHandle> = None;
         // F-03：本连接的 JPEG 需求记账——默认持有（视频模式），
         // 观看端切到 RTC/DOM 时发 jpeg-demand{on:false} 释放，
-        // 连接结束时兜底释放
-        let mut jpeg_held = true;
+        // 连接结束时父作用域兜底释放（D02）
         app2.human.jpeg_demand_add(1);
         // R-10：收包按帧型分发——Ping/Pong/Binary 不结束会话
         // （此前 while let 只认 Text，任意保活帧都会拆连接）
@@ -996,12 +1045,20 @@ async fn ws_session(app: Arc<App>, socket: WebSocket, remote: std::net::SocketAd
             match v.get("type").and_then(|t| t.as_str()) {
                 Some("jpeg-demand") => {
                     let on = v.get("on").and_then(|b| b.as_bool()).unwrap_or(true);
-                    if on && !jpeg_held {
-                        app2.human.jpeg_demand_add(1);
-                        jpeg_held = true;
-                    } else if !on && jpeg_held {
-                        app2.human.jpeg_demand_add(-1);
-                        jpeg_held = false;
+                    // D01：同一连接重复开关只记一次账
+                    let op = {
+                        let mut s = subs2.lock().unwrap();
+                        if on && !s.jpeg_held {
+                            s.jpeg_held = true;
+                            1
+                        } else if !on && s.release_jpeg() {
+                            -1
+                        } else {
+                            0
+                        }
+                    };
+                    if op != 0 {
+                        app2.human.jpeg_demand_add(op);
                     }
                 }
                 Some("rtc-start") => {
@@ -1037,11 +1094,19 @@ async fn ws_session(app: Arc<App>, socket: WebSocket, remote: std::net::SocketAd
                 }
                 Some("dom-start") => {
                     dom_active.store(true, Ordering::SeqCst);
-                    app2.dom.viewer_start().await;
+                    // D01：同一连接重复 dom-start 只订阅一次（自动感知+
+                    // 前台显示共用一份订阅，不重复发 START）
+                    let start = subs2.lock().unwrap().acquire_dom();
+                    if start {
+                        app2.dom.viewer_start().await;
+                    }
                 }
                 Some("dom-stop") => {
                     dom_active.store(false, Ordering::SeqCst);
-                    app2.dom.viewer_stop().await;
+                    let stop = subs2.lock().unwrap().release_dom();
+                    if stop {
+                        app2.dom.viewer_stop().await;
+                    }
                 }
                 Some("dom-resync") => {
                     app2.dom.resync().await;
@@ -1060,20 +1125,32 @@ async fn ws_session(app: Arc<App>, socket: WebSocket, remote: std::net::SocketAd
                 }
             }
         }
-        // 连接断开时若本连接还占着 DOM 名额，补一次退出：关标签
-        // 页/崩溃不会发 dom-stop，名额泄漏后，后来者的 dom-start
-        // 会被当成「后来者」而不再启动页内观察者，增量静默死亡
-        if dom_active.load(Ordering::SeqCst) {
-            app2.dom.viewer_stop().await;
-        }
-        // F-03 记账兜底释放
-        if jpeg_held {
-            app2.human.jpeg_demand_add(-1);
-        }
+        // D02：本任务尾部不再做释放——发送侧先结束时本任务会被 abort，
+        // 尾部代码跑不到。释放统一由父作用域做（见 select 之后）。
     });
     tokio::select! {
-        _ = &mut send_task => { recv_task.abort(); }
-        _ = &mut recv_task => { send_task.abort(); }
+        _ = &mut send_task => {
+            recv_task.abort();
+            let _ = recv_task.await;
+        }
+        _ = &mut recv_task => {
+            send_task.abort();
+            let _ = send_task.await;
+        }
+    }
+    // D02 唯一释放点：任一侧先结束（含 abort），订阅都在这里释放一次。
+    // 连接断开时（关标签页/崩溃不会发 dom-stop）名额同样回收，否则
+    // 后来者的 dom-start 会被当成「后来者」而不再启动页内观察者。
+    // 守卫只在同步段持有（MutexGuard 不跨 await，保证 future Send）。
+    let (stop_dom, drop_jpeg) = {
+        let mut s = subs.lock().unwrap();
+        (s.release_dom(), s.release_jpeg())
+    };
+    if stop_dom {
+        app.dom.viewer_stop().await;
+    }
+    if drop_jpeg {
+        app.human.jpeg_demand_add(-1);
     }
 }
 
@@ -1330,6 +1407,7 @@ fn percent_decode(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::percent_decode;
+    use super::ConnSubs;
 
     #[test]
     fn percent_decode_round_trips() {
@@ -1340,5 +1418,28 @@ mod tests {
         assert_eq!(percent_decode("100%"), "100%");
         assert_eq!(percent_decode("%zz"), "%zz");
         assert_eq!(percent_decode("a+b"), "a+b");
+    }
+
+    /// D01：同一连接重复 start/stop 只记一次账——`dom-start,
+    /// dom-start,dom-stop,close` 计数恰好回零，不多扣不少补。
+    #[test]
+    fn conn_subs_dom_is_idempotent_per_connection() {
+        let mut s = ConnSubs::new();
+        // 自动感知 + 前台显示两次进入：只有第一次真正订阅
+        assert!(s.acquire_dom());
+        assert!(!s.acquire_dom());
+        // 显示退出但感知仍在：由调用方按“是否还有需求”决定；
+        // 守卫只保证配对——一次 release 后再次 release 不再扣
+        assert!(s.release_dom());
+        assert!(!s.release_dom());
+        assert!(!s.release_dom());
+    }
+
+    /// D02：连接建立即持有 JPEG，释放恰好一次；重复释放不倒扣。
+    #[test]
+    fn conn_subs_jpeg_released_exactly_once() {
+        let mut s = ConnSubs::new();
+        assert!(s.release_jpeg());
+        assert!(!s.release_jpeg());
     }
 }
