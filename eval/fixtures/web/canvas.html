@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="zh"><head><meta charset="utf-8"><title>Canvas 界面</title>
+<style>body{font:16px sans-serif;margin:20px}canvas{border:1px solid #888}</style></head>
+<body>
+<p>下面是 canvas 绘制的界面，没有无障碍树。当前计数：<span id="count">0</span></p>
+<canvas id="c" width="400" height="200"></canvas>
+<script>
+const c = document.getElementById('c'), g = c.getContext('2d');
+const btn = {x: 140, y: 80, w: 120, h: 40};
+g.fillStyle = '#2a6'; g.fillRect(btn.x, btn.y, btn.w, btn.h);
+g.fillStyle = '#fff'; g.font = '18px sans-serif'; g.fillText('提交', btn.x + 40, btn.y + 26);
+let n = 0;
+c.addEventListener('click', e => {
+  const r = c.getBoundingClientRect(), x = e.clientX - r.left, y = e.clientY - r.top;
+  if (x >= btn.x && x < btn.x + btn.w && y >= btn.y && y < btn.y + btn.h) {
+    n += 1; document.getElementById('count').textContent = String(n);
+  }
+});
+</script>
+</body></html>

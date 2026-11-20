@@ -1,0 +1,10 @@
+id = "web-canvas-01"
+scenario = "web"
+fixture = "canvas.html"
+goal = "点击 canvas 里的“提交”按钮一次。"
+tags = ["no-semantics", "canvas", "pixels"]
+
+[success]
+kind = "dom_text"
+selector = "#count"
+contains = "1"

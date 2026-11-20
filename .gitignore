@@ -1,0 +1,9 @@
+/target
+.env
+.DS_Store
+
+# Python 缓存
+__pycache__/
+*.pyc
+.pytest_cache/
+.temp/

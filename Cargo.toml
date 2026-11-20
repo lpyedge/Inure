@@ -1,0 +1,16 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/rig-proto",
+    "crates/rig-edge-browser",
+    "crates/rig-eval",
+]
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+license = "UNLICENSED"
+publish = false
+
+[workspace.dependencies]
+rig-proto = { path = "crates/rig-proto" }

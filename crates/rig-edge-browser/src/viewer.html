@@ -1,0 +1,194 @@
+<!DOCTYPE html>
+<html lang="zh"><head><meta charset="utf-8"><title>rig-edge-browser</title>
+<style>
+  /* ── 浏览器 chrome（第五期：观看页原生 DOM）────────────────
+     造型语言参考 Chrome × Edge：标签条（圆角标签、活动标签与
+     导航行同底衔接）、胶囊地址栏（悬停加深、聚焦描边高亮）、
+     圆形/圆角图标按钮、卡片式下拉菜单与查找条。颜色走 CSS
+     变量，浅色为 Chrome 经典灰白，深色跟随系统偏好 */
+  :root {
+    --strip-bg:#dee1e6; --nav-bg:#ffffff; --fg:#202124; --muted:#5f6368;
+    --hover:#e9ebee; --press:#d8dbdf; --omni-bg:#f1f3f4; --omni-hover:#e8eaed;
+    --border:#d5d8dc; --accent:#1a73e8; --card:#ffffff;
+    --shadow:0 4px 18px rgba(0,0,0,.20), 0 0 0 1px rgba(0,0,0,.06);
+    --tab-hover:#ccd1d8;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --strip-bg:#202124; --nav-bg:#35363a; --fg:#e8eaed; --muted:#9aa0a6;
+      --hover:#43464a; --press:#4d5054; --omni-bg:#28292c; --omni-hover:#303135;
+      --border:#494c50; --accent:#8ab4f8; --card:#2d2e30;
+      --shadow:0 4px 18px rgba(0,0,0,.5), 0 0 0 1px rgba(255,255,255,.08);
+      --tab-hover:#2d2e30;
+    }
+  }
+  html, body { margin:0; height:100%; overflow:hidden; }
+  body { display:flex; flex-direction:column; background:#000;
+         font-family:system-ui, "Segoe UI", sans-serif; }
+  /* ── 头部 ── */
+  #hdr { position:relative; flex:none; user-select:none; -webkit-user-select:none; }
+  #tabstrip { display:flex; align-items:flex-end; gap:4px; padding:6px 8px 0;
+              background:var(--strip-bg); min-height:34px; box-sizing:border-box; }
+  .tab { display:flex; align-items:center; gap:7px; height:34px; padding:0 8px 0 12px;
+         min-width:0; flex:0 1 190px; border-radius:10px 10px 0 0; cursor:default;
+         color:var(--muted); font-size:12.5px; position:relative; }
+  .tab:hover { background:var(--tab-hover); }
+  .tab.active { background:var(--nav-bg); color:var(--fg);
+                box-shadow:0 0 8px rgba(0,0,0,.10); }
+  .tab .fav { flex:none; width:16px; height:16px; display:flex; align-items:center;
+              justify-content:center; color:var(--muted); }
+  .tab.active .fav { color:var(--muted); }
+  .tab .fav svg { width:14px; height:14px; }
+  .tab .spin { width:12px; height:12px; border-radius:50%; flex:none;
+               border:2px solid var(--press); border-top-color:var(--accent);
+               animation:rigspin .7s linear infinite; }
+  @keyframes rigspin { to { transform:rotate(360deg); } }
+  .tab .ttl { flex:1; min-width:0; white-space:nowrap; overflow:hidden;
+              text-overflow:ellipsis; }
+  .tab .cls { flex:none; width:18px; height:18px; border:0; border-radius:50%;
+              background:transparent; color:var(--muted); cursor:pointer;
+              display:flex; align-items:center; justify-content:center;
+              padding:0; opacity:0; }
+  .tab:hover .cls, .tab.active .cls { opacity:1; }
+  .tab .cls:hover { background:var(--press); color:var(--fg); }
+  .tab .cls svg { width:11px; height:11px; }
+  .hbtn { flex:none; width:32px; height:32px; border:0; border-radius:8px;
+          background:transparent; color:var(--muted); cursor:pointer;
+          display:flex; align-items:center; justify-content:center; padding:0; }
+  .hbtn:hover { background:var(--hover); color:var(--fg); }
+  .hbtn:active { background:var(--press); }
+  .hbtn:disabled { opacity:.38; pointer-events:none; }
+  .hbtn svg { width:18px; height:18px; }
+  #newTabBtn { border-radius:50%; margin-bottom:2px; width:28px; height:28px; }
+  #navbar { display:flex; align-items:center; gap:2px; height:46px; padding:0 8px;
+            background:var(--nav-bg); border-bottom:1px solid var(--border);
+            box-sizing:border-box; }
+  #omni { flex:1; display:flex; align-items:center; gap:7px; height:34px;
+          padding:0 8px 0 12px; margin:0 6px; border-radius:999px;
+          background:var(--omni-bg); border:1.5px solid transparent;
+          box-sizing:border-box; transition:background .12s, border-color .12s; }
+  #omni:hover { background:var(--omni-hover); }
+  #omni:focus-within { background:var(--nav-bg); border-color:var(--accent); }
+  #omniIcon { flex:none; display:flex; color:var(--muted); }
+  #omniIcon svg { width:14px; height:14px; }
+  #addr { flex:1; min-width:0; border:0; outline:0; background:transparent;
+          color:var(--fg); font-size:13.5px; font-family:inherit; padding:0; }
+  #domBtn { flex:none; height:26px; padding:0 11px; border-radius:999px; margin-right:2px;
+            border:1px solid var(--border); background:transparent; color:var(--muted);
+            cursor:pointer; font-size:12px; font-family:inherit; }
+  #domBtn:hover { background:var(--hover); color:var(--fg); }
+  #domBtn.on { background:var(--accent); border-color:var(--accent); color:#fff; }
+  #loadbar { height:2px; background:transparent; overflow:hidden; }
+  #loadbar i { display:block; height:100%; width:35%; background:var(--accent);
+               border-radius:2px; opacity:0; }
+  #loadbar.go i { opacity:1; animation:rigload 1.15s ease-in-out infinite; }
+  @keyframes rigload { 0% { transform:translateX(-110%);} 100% { transform:translateX(310%);} }
+  /* 查找条：Chrome 式右上浮动卡片 */
+  #findbar { position:absolute; top:calc(100% + 6px); right:12px; z-index:30;
+             display:none; align-items:center; gap:2px; padding:5px 6px;
+             background:var(--card); border-radius:10px; box-shadow:var(--shadow); }
+  #findbar.open { display:flex; }
+  #findInput { width:190px; border:0; outline:0; background:transparent;
+               color:var(--fg); font-size:13px; font-family:inherit; padding:4px 6px; }
+  #findInfo { color:var(--muted); font-size:12px; min-width:34px; text-align:center;
+              white-space:nowrap; }
+  #findbar .hbtn { width:28px; height:28px; }
+  #findbar .hbtn svg { width:15px; height:15px; }
+  /* 主菜单：Edge 式圆角卡片 */
+  #menu { position:absolute; top:calc(100% + 4px); right:8px; z-index:31; display:none;
+          min-width:248px; padding:6px; background:var(--card); border-radius:12px;
+          box-shadow:var(--shadow); color:var(--fg); }
+  #menu.open { display:block; }
+  #menu button { display:flex; align-items:center; width:100%; box-sizing:border-box;
+                 padding:7px 10px; border:0; border-radius:7px; background:transparent;
+                 color:inherit; font:13px/1.3 inherit; cursor:pointer; text-align:left; }
+  #menu button:hover { background:var(--hover); }
+  #menu .ck { flex:none; width:18px; color:var(--accent); font-size:12px; }
+  #menu .sc { margin-left:auto; padding-left:22px; color:var(--muted); font-size:12px; }
+  #menu hr { border:0; border-top:1px solid var(--border); margin:5px 8px; }
+  /* ── 舞台 ── */
+  #stage { position:relative; flex:1; display:flex; align-items:center;
+           justify-content:center; background:#000; min-height:0; }
+  canvas, video { max-width:100%; max-height:100%; background:#000; }
+  /* 透明 textarea 覆盖层：承接页面区全部输入——只有可编辑元素能挂住
+     输入法组字、粘贴与复制事件（noVNC 同款做法）；画布只负责显示。
+     第五期起覆盖层只盖舞台区（头部是原生 DOM，各管各的焦点） */
+  #ime { position:absolute; inset:0; width:100%; height:100%; opacity:0.01;
+         border:0; padding:0; resize:none; outline:none; overflow:hidden;
+         /* 覆盖层是 textarea 会让光标恒为 I 型选字形态，与远端页面
+            内容无关；远端观看惯例用默认箭头 */
+         cursor:default; }
+  #prompt { position:fixed; left:50%; top:18%; transform:translateX(-50%);
+            background:#1c1c1e; color:#eee; border:1px solid #555; border-radius:10px;
+            padding:16px 20px; font-family:system-ui; font-size:15px; display:none; z-index:10;
+            box-shadow:0 8px 30px rgba(0,0,0,.6); text-align:center; }
+  #prompt button { margin:10px 6px 0; padding:6px 22px; border-radius:6px; border:1px solid #666;
+                   background:#2c2c2e; color:#eee; font-size:15px; cursor:pointer; }
+  #mir { border:0; background:#fff; transform-origin:0 0; }
+  /* AI 幽灵指针（第五期起全模式观看端 overlay：边缘经 WS 下发
+     页面坐标，本页按当前显示面映射后叠加呈现） */
+  #fbRing { position:fixed; z-index:6; pointer-events:none; display:none;
+            width:22px; height:22px; margin:-11px 0 0 -11px; border-radius:50%;
+            border:2px solid rgba(80,160,255,.9); background:rgba(80,160,255,.18); }
+  #fbRect { position:fixed; z-index:6; pointer-events:none; display:none;
+            border:1px solid rgba(80,160,255,.8); background:rgba(80,160,255,.12); }
+  #ghost { position:fixed; z-index:5; pointer-events:none; display:none; }
+  #gdot { width:14px; height:14px; margin:-7px 0 0 -7px; border-radius:50%;
+          border:2px solid #ff5252; background:rgba(255,82,82,.25); }
+  #ghost.pulse #gdot { background:rgba(255,82,82,.55); }
+  #glabel { margin:8px 0 0 10px; padding:2px 8px; border-radius:6px; white-space:nowrap;
+            background:rgba(20,20,22,.85); color:#ffd9d9; font:12px system-ui; }
+  .gtrail { position:fixed; z-index:5; pointer-events:none; width:6px; height:6px;
+            margin:-3px 0 0 -3px; border-radius:50%; background:rgba(255,82,82,.5);
+            display:none; }
+  /* DOM 状态浮丸（等待快照/回落原因） */
+  #dpill { position:absolute; top:12px; left:50%; transform:translateX(-50%); z-index:8;
+           display:none; padding:5px 14px; border-radius:12px;
+           background:rgba(36,36,38,.9); color:#9ab; font-size:12px; pointer-events:none; }
+  #prompt button.yes { background:#7a1f1f; border-color:#a33; }
+  #ctxMenu { position:fixed; z-index:40; min-width:168px; padding:4px; background:#f4f4f6;
+             border:1px solid #c9c9ce; border-radius:8px; box-shadow:0 8px 28px rgba(0,0,0,.28);
+             font:13px/1.4 sans-serif; }
+  #ctxMenu button { display:block; width:100%; text-align:left; padding:6px 10px; border:0;
+                    background:transparent; border-radius:5px; cursor:pointer; color:#1c1c1e; font:inherit; }
+  #ctxMenu button:hover { background:#0a64d8; color:#fff; }
+  #copyBox { position:fixed; z-index:41; left:50%; top:16%; transform:translateX(-50%);
+             width:min(480px,86vw); display:none; padding:12px; background:#f4f4f6; color:#1c1c1e;
+             border:1px solid #c9c9ce; border-radius:8px; box-shadow:0 8px 28px rgba(0,0,0,.3);
+             font:13px/1.5 sans-serif; }
+  #copyBox textarea { box-sizing:border-box; background:#fff; color:#1c1c1e; border:1px solid #c9c9ce; border-radius:4px; }
+  #hintToast { position:fixed; z-index:42; left:50%; bottom:28px; transform:translateX(-50%); display:none;
+               padding:6px 16px; border-radius:12px; background:rgba(36,36,38,.92); color:#e8e8ea;
+               font:12px/1.5 sans-serif; pointer-events:none; }
+  @media (prefers-color-scheme: dark) {
+    #ctxMenu { background:#2c2c2e; border-color:#48484a; }
+    #ctxMenu button { color:#f2f2f7; }
+    #copyBox { background:#2c2c2e; color:#f2f2f7; border-color:#48484a; }
+    #copyBox textarea { background:#1c1c1e; color:#f2f2f7; border-color:#48484a; }
+  }
+</style></head><body>
+<header id="hdr">
+  <div id="tabstrip"><div id="tabs" style="display:contents"></div>
+    <button id="newTabBtn" class="hbtn" title="新建标签页"></button></div>
+  <div id="navbar">
+    <button id="backBtn" class="hbtn" title="后退"></button>
+    <button id="fwdBtn" class="hbtn" title="前进"></button>
+    <button id="reloadBtn" class="hbtn" title="重新加载"></button>
+    <div id="omni"><span id="omniIcon"></span><input id="addr" type="text" spellcheck="false" autocomplete="off" placeholder="输入网址或搜索"></div>
+    <button id="domBtn" title="DOM 镜像模式（低带宽）">DOM</button>
+    <button id="menuBtn" class="hbtn" title="菜单"></button>
+  </div>
+  <div id="loadbar"><i></i></div>
+  <div id="findbar">
+    <input id="findInput" type="text" spellcheck="false" placeholder="在页面中查找">
+    <span id="findInfo"></span>
+    <button id="findPrev" class="hbtn" title="上一个（Shift+Enter）"></button>
+    <button id="findNext" class="hbtn" title="下一个（Enter）"></button>
+    <button id="findClose" class="hbtn" title="关闭（Esc）"></button>
+  </div>
+  <div id="menu"></div>
+</header>
+<div id="stage"><canvas id="cv" width="1280" height="800"></canvas><video id="vid" style="display:none" autoplay playsinline></video><iframe id="mir" sandbox="allow-same-origin" style="display:none"></iframe><textarea id="ime" autocomplete="off"></textarea><div id="ghost"><div id="gdot"></div><div id="glabel"></div></div><div id="fbRing"></div><div id="fbRect"></div><div id="dpill"></div></div>
+<div id="prompt"><div>AI 正在执行操作，是否强制接管？</div>
+<button class="yes" id="pYes">强制接管</button><button id="pNo">继续等待</button></div>
+<script src="/viewer.js"></script></body></html>

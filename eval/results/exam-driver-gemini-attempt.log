@@ -1,0 +1,23 @@
+18:13:04 exam_driver 启动：等待免费额度响应…
+18:13:08 探测成功，开始考试
+18:13:08 RUN mode=screenshot_baseline task=web-login-01 runs=1
+18:16:29   runner 退出码 1: RuntimeError(f"HTTP {e.code} from Gemini API: {body}") from e
+RuntimeError: HTTP 503 from Gemini API: {
+  "error": {
+    "code": 503,
+    "message": "This model is currently experiencing high demand. Spikes in demand are usually temporary. Please try again later.",
+    "status": "UNAVAILABLE"
+  }
+}
+
+18:16:29 RUN mode=ab_snapshot task=web-login-01 runs=1
+18:19:45   runner 退出码 1: RuntimeError(f"HTTP {e.code} from Gemini API: {body}") from e
+RuntimeError: HTTP 503 from Gemini API: {
+  "error": {
+    "code": 503,
+    "message": "This model is currently experiencing high demand. Spikes in demand are usually temporary. Please try again later.",
+    "status": "UNAVAILABLE"
+  }
+}
+
+18:19:45 冒烟未全通，停止全量（额度可能再次拥塞），已完成部分保留在结果文件中

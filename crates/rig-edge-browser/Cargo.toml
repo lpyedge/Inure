@@ -1,0 +1,42 @@
+[package]
+name = "rig-edge-browser"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "rig-edge-browser"
+path = "src/main.rs"
+
+[dependencies]
+rig-proto = { workspace = true }
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = { version = "0.26", features = ["connect"] }
+futures-util = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+axum = { version = "0.8", features = ["ws"] }
+# TLS 服务（--tls-cert/--tls-key）：axum-server 的 rustls 后端；
+# rcgen 供缺证书时按监听地址生成自签名证书（LIU 2026-11-20 定：
+# 局域网观看页走 HTTPS 拿安全上下文，剪贴板走标准路径）。
+axum-server = { version = "0.7", features = ["tls-rustls"] }
+rcgen = "0.13"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+base64 = "0.22"
+# 进程内编码层（Phase 1a；LIU 2026-11-19 定案弃 stdio ffmpeg 子进程）：Rust 直调
+# libavcodec + hw_frames_ctx 运行时协商硬编、无则软编回落，RTC 与 HLS 两路共用。
+# 运行时依赖系统 libavcodec/libavformat/libavutil/libswscale/libavdevice（需 -dev 包）。
+# ffmpeg-sys-next 供 hw device/frames 上下文 FFI（ffmpeg-next 安全 API 未覆盖该面）。
+ffmpeg-next = "8"
+ffmpeg-sys-next = "8"
+# WebRTC 栈（Phase 1b）：纯 Rust Sans-IO 实现，边缘作 offerer + ICE-lite
+# 向观看端推 H.264 单向视频；比 webrtc-rs 轻、无原生库依赖（默认 aws-lc-rs）。
+str0m = "0.25"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
+serde_json = "1"
+tokio-tungstenite = { version = "0.26", features = ["connect"] }
+futures-util = "0.3"

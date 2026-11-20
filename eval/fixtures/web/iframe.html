@@ -1,0 +1,6 @@
+<!doctype html>
+<html lang="zh"><head><meta charset="utf-8"><title>嵌套 iframe</title></head>
+<body>
+<h1>外层页面</h1>
+<iframe id="inner" title="内层表单" width="420" height="160" srcdoc="<label>备注 <input id='note'></label> <button id='save' onclick='document.getElementById(&quot;result&quot;).textContent = &quot;已保存: &quot; + document.getElementById(&quot;note&quot;).value'>保存</button><p id='result'></p>"></iframe>
+</body></html>

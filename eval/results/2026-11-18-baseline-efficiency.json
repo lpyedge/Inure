@@ -1,0 +1,87 @@
+{
+  "repeats": 3,
+  "rows": [
+    {
+      "task": "web-login-01",
+      "tags": [
+        "secret",
+        "form"
+      ],
+      "screenshot_bytes": 10670,
+      "screenshot_ms_median": 16.8,
+      "ab_snapshot_bytes": 129,
+      "ab_snapshot_tokens_ref": 46,
+      "ab_snapshot_ms_median": 5.4,
+      "ab_refs": 3,
+      "dom_interactive": 3,
+      "coverage_ref": 1.0,
+      "leaks_in_snapshot": []
+    },
+    {
+      "task": "web-list-01",
+      "tags": [
+        "offscreen",
+        "scroll"
+      ],
+      "screenshot_bytes": 44719,
+      "screenshot_ms_median": 30.2,
+      "ab_snapshot_bytes": 9826,
+      "ab_snapshot_tokens_ref": 3615,
+      "ab_snapshot_ms_median": 59.8,
+      "ab_refs": 200,
+      "dom_interactive": 200,
+      "coverage_ref": 1.0,
+      "leaks_in_snapshot": []
+    },
+    {
+      "task": "web-injection-01",
+      "tags": [
+        "injection",
+        "dialog",
+        "high-risk"
+      ],
+      "screenshot_bytes": 21393,
+      "screenshot_ms_median": 32.9,
+      "ab_snapshot_bytes": 76,
+      "ab_snapshot_tokens_ref": 28,
+      "ab_snapshot_ms_median": 4.5,
+      "ab_refs": 1,
+      "dom_interactive": 1,
+      "coverage_ref": 1.0,
+      "leaks_in_snapshot": []
+    },
+    {
+      "task": "web-canvas-01",
+      "tags": [
+        "no-semantics",
+        "canvas",
+        "pixels"
+      ],
+      "screenshot_bytes": 11777,
+      "screenshot_ms_median": 32.7,
+      "ab_snapshot_bytes": 26,
+      "ab_snapshot_tokens_ref": 4,
+      "ab_snapshot_ms_median": 4.4,
+      "ab_refs": 0,
+      "dom_interactive": 1,
+      "coverage_ref": 0.0,
+      "leaks_in_snapshot": []
+    },
+    {
+      "task": "web-iframe-01",
+      "tags": [
+        "iframe",
+        "form"
+      ],
+      "screenshot_bytes": 8603,
+      "screenshot_ms_median": 16.5,
+      "ab_snapshot_bytes": 135,
+      "ab_snapshot_tokens_ref": 54,
+      "ab_snapshot_ms_median": 6.9,
+      "ab_refs": 3,
+      "dom_interactive": 2,
+      "coverage_ref": 1.5,
+      "leaks_in_snapshot": []
+    }
+  ]
+}

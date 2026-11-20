@@ -1,0 +1,18 @@
+id = "web-login-01"
+scenario = "web"
+fixture = "login.html"
+# goal 是模型输入：只描述任务，不含任何秘密值。凭据在 [credentials] 中，
+# 只供可信执行器按引用注入（见 docs/EVAL.md 与 rig-eval::task 的模型输入校验）。
+goal = "使用可信执行器提供的凭据（引用 user / pass）登录。"
+secrets = ["hunter2"]
+tags = ["secret", "form"]
+
+# 可信侧凭据（执行器专用，永不进入模型输入、Observation 或日志）。
+[credentials]
+user = "alice"
+pass = "hunter2"
+
+[success]
+kind = "dom_text"
+selector = "#welcome"
+contains = "欢迎 alice"

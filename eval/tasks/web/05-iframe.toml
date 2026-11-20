@@ -1,0 +1,11 @@
+id = "web-iframe-01"
+scenario = "web"
+fixture = "iframe.html"
+goal = "在内层表单的“备注”里填入“你好”，然后点击“保存”。"
+tags = ["iframe", "form"]
+
+[success]
+kind = "dom_text"
+selector = "#result"
+contains = "已保存: 你好"
+frame = "#inner"
