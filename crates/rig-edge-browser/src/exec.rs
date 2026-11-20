@@ -9,6 +9,10 @@
 //! 遮蔽与接管的动作分发在 human.rs，中断检查在 ai.rs。
 
 use std::collections::VecDeque;
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc,
+};
 use std::time::{Duration, Instant};
 
 use tokio::sync::Mutex;
@@ -41,9 +45,6 @@ struct Inner {
     state: ExecState,
     /// 代次：begin/request_abort 都递增；保持窗任务只在代次未变时回待命
     generation: u64,
-    /// 在途 AI call 数（GPT review R-02）：保持窗只由最后一个
-    /// 结束的 call 触发，单个 call 先结束不得提前回待命
-    active: usize,
     /// 取消代次（GPT review R-01）：request_abort 递增；每个 call
     /// 在 begin 时领取当时的代次，代次不符即已被接管取消。新 call
     /// 领取新代次，永不复活旧 call 的取消状态
@@ -59,14 +60,47 @@ struct Inner {
     pulse_at: Option<Instant>,
 }
 
-/// 一个 AI call 的执行句柄：携带它领取的取消代次
-#[derive(Clone, Copy, Debug)]
+/// 一个 AI call 的执行句柄：携带它领取的取消代次与开始代次。
+/// 非 Copy 的 owned guard：显式 `end()` 未跑到（任务被 abort/panic）
+/// 就由 Drop 归还在途计数，保证取消安全（A02）。`end()` 接管句柄
+/// 的所有权，正常结束的句柄 Drop 时不再重复归还。
 pub struct ExecHandle {
+    ctl: Arc<ExecControl>,
     epoch: u64,
+    gen: u64,
+    done: bool,
+}
+
+impl std::fmt::Debug for ExecHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ExecHandle")
+            .field("epoch", &self.epoch)
+            .field("gen", &self.gen)
+            .field("done", &self.done)
+            .finish()
+    }
+}
+
+impl Drop for ExecHandle {
+    fn drop(&mut self) {
+        if self.done {
+            return;
+        }
+        // 取消路径：显式 end() 没跑到，在途计数必须归还，否则
+        // /health.exec_in_flight 虚高、保持窗不回 Idle（A02）
+        let prev = self.ctl.active.fetch_sub(1, Ordering::SeqCst);
+        if prev == 1 {
+            // 最后一个在途 call 随取消离开：排一次保持窗回待命
+            self.ctl.spawn_holdover(self.gen);
+        }
+    }
 }
 
 pub struct ExecControl {
     inner: Mutex<Inner>,
+    /// 在途 AI call 数（同步原子计数）：保持窗只由最后一个
+    /// 结束的 call 触发；放原子里是为了 Drop（同步上下文）也能归还
+    active: AtomicUsize,
     holdover: Duration,
 }
 
@@ -82,7 +116,6 @@ impl ExecControl {
             inner: Mutex::new(Inner {
                 state: ExecState::Idle,
                 generation: 0,
-                active: 0,
                 cancel_epoch: 0,
                 latched: false,
                 x: 0.0,
@@ -92,48 +125,56 @@ impl ExecControl {
                 trail: VecDeque::new(),
                 pulse_at: None,
             }),
+            active: AtomicUsize::new(0),
             holdover,
         }
     }
 
-    async fn begin_inner(&self) -> ExecHandle {
-        let mut g = self.inner.lock().await;
+    /// 单次临界区内完成全部开始记账（C01）：调用方不得在
+    /// 闩锁检查与计数递增之间 park——本函数持有锁期间无 await。
+    fn start_call(self: &Arc<Self>, g: &mut Inner) -> ExecHandle {
         g.state = ExecState::Executing;
         g.generation += 1;
-        g.active += 1;
+        self.active.fetch_add(1, Ordering::SeqCst);
         ExecHandle {
+            ctl: self.clone(),
             epoch: g.cancel_epoch,
+            gen: g.generation,
+            done: false,
         }
     }
 
     /// observe 开始：永不被闩锁拦（它是接管后的恢复路径）
-    pub async fn begin_observe(self: &std::sync::Arc<Self>) -> ExecHandle {
-        self.begin_inner().await
+    pub async fn begin_observe(self: &Arc<Self>) -> ExecHandle {
+        let mut g = self.inner.lock().await;
+        self.start_call(&mut g)
     }
 
-    /// act 开始：接管闩锁未解时返回 None（调用方直接回 Aborted）
-    pub async fn begin_act(self: &std::sync::Arc<Self>) -> Option<ExecHandle> {
-        if self.inner.lock().await.latched {
+    /// act 开始：接管闩锁未解时返回 None（调用方直接回 Aborted）。
+    /// 检查与记账在同一把锁内完成，接管无法插进中间（C01）。
+    pub async fn begin_act(self: &Arc<Self>) -> Option<ExecHandle> {
+        let mut g = self.inner.lock().await;
+        if g.latched {
             return None;
         }
-        Some(self.begin_inner().await)
+        Some(self.start_call(&mut g))
     }
 
-    /// 一个 AI call 结束：在途计数归零时才启动保持窗回待命
-    pub async fn end(self: &std::sync::Arc<Self>, _h: &ExecHandle) {
-        let gen = {
-            let mut g = self.inner.lock().await;
-            g.active = g.active.saturating_sub(1);
-            if g.active > 0 {
-                return;
-            }
-            g.generation
+    /// 排一次保持窗回待命（同步上下文可用：Drop 里也能调）。
+    /// 无运行时（如解释器关闭期）则跳过，不 panic。
+    fn spawn_holdover(self: &Arc<Self>, gen: u64) {
+        let Ok(rt) = tokio::runtime::Handle::try_current() else {
+            return;
         };
         let me = self.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(me.holdover).await;
+        let holdover = self.holdover;
+        rt.spawn(async move {
+            tokio::time::sleep(holdover).await;
             let mut g = me.inner.lock().await;
-            if g.generation == gen && g.active == 0 && g.state == ExecState::Executing {
+            if g.generation == gen
+                && me.active.load(Ordering::SeqCst) == 0
+                && g.state == ExecState::Executing
+            {
                 g.state = ExecState::Idle;
                 g.has_pos = false;
                 g.trail.clear();
@@ -142,9 +183,23 @@ impl ExecControl {
         });
     }
 
-    /// 一次 observe 成功完成：解除接管闩锁
-    pub async fn note_observed(&self) {
-        self.inner.lock().await.latched = false;
+    /// 一个 AI call 结束：接管句柄所有权，正常结束只记一次账；
+    /// 在途计数归零时启动保持窗回待命。任务被取消时由 Drop 兜底。
+    pub async fn end(self: &Arc<Self>, mut h: ExecHandle) {
+        h.done = true;
+        let prev = self.active.fetch_sub(1, Ordering::SeqCst);
+        if prev == 1 {
+            self.spawn_holdover(h.gen);
+        }
+    }
+
+    /// 一次 observe 成功完成：只有接管之后新开始的 observe 才能
+    /// 解除闩锁；接管前在途的旧 observe 即使成功返回也不得解锁（C02）。
+    pub async fn note_observed(&self, h: &ExecHandle) {
+        let mut g = self.inner.lock().await;
+        if h.epoch == g.cancel_epoch {
+            g.latched = false;
+        }
     }
 
     /// 强制接管：立即回待命、递增取消代次（在途 call 全部作废）、
@@ -162,7 +217,7 @@ impl ExecControl {
 
     /// 当前在途 call 数（R-19 可观测：/health 的 exec_in_flight）
     pub async fn in_flight(&self) -> usize {
-        self.inner.lock().await.active
+        self.active.load(Ordering::SeqCst)
     }
 
     pub async fn state(&self) -> ExecState {
@@ -240,7 +295,6 @@ impl ExecControl {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
 
     fn ctl() -> Arc<ExecControl> {
         Arc::new(ExecControl::with_holdover(Duration::from_millis(60)))
@@ -253,14 +307,14 @@ mod tests {
         let c = ctl();
         let a = c.begin_observe().await;
         let b = c.begin_act().await.expect("未闩锁应放行");
-        c.end(&a).await;
+        c.end(a).await;
         tokio::time::sleep(Duration::from_millis(150)).await;
         assert_eq!(
             c.state().await,
             ExecState::Executing,
             "B 仍在途时不得提前回待命"
         );
-        c.end(&b).await;
+        c.end(b).await;
         tokio::time::sleep(Duration::from_millis(150)).await;
         assert_eq!(c.state().await, ExecState::Idle, "全部结束后应回待命");
     }
@@ -276,17 +330,102 @@ mod tests {
         let b = c.begin_observe().await;
         assert!(c.aborted(&a).await, "新 observe 不得复活旧 call 的取消");
         assert!(!c.aborted(&b).await, "新 call 本身未被取消");
+        c.end(a).await;
+        c.end(b).await;
     }
 
-    /// 闩锁：接管后 act 被拒；observe 成功（note_observed）后放行
+    /// 闩锁：接管后 act 被拒；接管后新 observe 成功后放行
     #[tokio::test]
-    async fn latch_blocks_act_until_observe() {
+    async fn latch_blocks_act_until_fresh_observe() {
         let c = ctl();
         c.request_abort().await;
         assert!(c.begin_act().await.is_none(), "闩锁中 act 应被拒");
         let o = c.begin_observe().await;
-        c.note_observed().await;
-        c.end(&o).await;
-        assert!(c.begin_act().await.is_some(), "observe 后 act 应放行");
+        c.note_observed(&o).await;
+        c.end(o).await;
+        assert!(c.begin_act().await.is_some(), "新 observe 后 act 应放行");
+    }
+
+    /// C02 回归：接管前在途的旧 observe 成功返回也不得解闩；
+    /// 只有接管之后新开始的 observe 才能解锁。
+    /// 交错：observe 先开始 → 接管 → 旧 observe 成功 → 新 act 仍拒 →
+    /// 新 observe 成功 → 新 act 放行。
+    #[tokio::test]
+    async fn stale_observe_must_not_unlatch() {
+        let c = ctl();
+        let old = c.begin_observe().await;
+        c.request_abort().await;
+        c.note_observed(&old).await;
+        assert!(c.begin_act().await.is_none(), "旧 observe 不得解除接管闩锁");
+        let fresh = c.begin_observe().await;
+        assert!(c.aborted(&old).await, "旧句柄代次早于接管，应报已取消");
+        assert!(!c.aborted(&fresh).await, "接管后新 call 未被取消");
+        c.note_observed(&fresh).await;
+        c.end(fresh).await;
+        assert!(c.begin_act().await.is_some(), "新 observe 后应放行");
+        c.end(old).await;
+        assert_eq!(c.in_flight().await, 0);
+    }
+
+    /// C01 回归：begin_act 的检查与记账是同一临界区，接管插不进
+    /// 中间。风暴后最终闩锁成立，此后 begin 全拒，且此前领取的
+    /// 全部句柄都属于旧代次（无一带着新代次混过去）。
+    #[tokio::test]
+    async fn takeover_storm_never_leaks_fresh_epoch() {
+        let c = ctl();
+        let mut tasks = Vec::new();
+        for _ in 0..32 {
+            let c2 = c.clone();
+            tasks.push(tokio::spawn(async move {
+                let mut got = Vec::new();
+                for _ in 0..50 {
+                    if let Some(h) = c2.begin_act().await {
+                        got.push(h);
+                    }
+                    tokio::task::yield_now().await;
+                }
+                got
+            }));
+        }
+        for _ in 0..8 {
+            c.request_abort().await;
+            tokio::task::yield_now().await;
+        }
+        let mut handles = Vec::new();
+        for t in tasks {
+            handles.extend(t.await.unwrap());
+        }
+        // 最终 abort 之后无 observe，闩锁必成立
+        c.request_abort().await;
+        assert!(c.begin_act().await.is_none(), "最终闩锁后应全拒");
+        for h in &handles {
+            assert!(c.aborted(h).await, "风暴中领取的句柄必须全部属于旧代次");
+        }
+        for h in handles {
+            c.end(h).await;
+        }
+        assert_eq!(c.in_flight().await, 0);
+    }
+
+    /// A02 回归：在途任务被 abort（显式 end 没跑到）时，Drop 必须
+    /// 归还在途计数，不靠调用方收尾。
+    #[tokio::test]
+    async fn aborted_task_returns_in_flight_to_zero() {
+        let c = ctl();
+        let c2 = c.clone();
+        let t = tokio::spawn(async move {
+            let _h = c2.begin_observe().await;
+            std::future::pending::<()>().await;
+        });
+        while c.in_flight().await == 0 {
+            tokio::task::yield_now().await;
+        }
+        t.abort();
+        let _ = t.await;
+        assert_eq!(
+            c.in_flight().await,
+            0,
+            "被 abort 的 call 必须经 Drop 归还在途计数"
+        );
     }
 }

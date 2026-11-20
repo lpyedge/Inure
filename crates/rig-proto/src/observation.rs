@@ -791,7 +791,9 @@ pub enum AbortReason {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "result", rename_all = "snake_case")]
 pub enum ActionResult {
-    /// 已执行；`frame_id` 是动作之后的最新帧。
+    /// 已执行；`frame_id` 正常是动作之后的最新帧——即本次动作后
+    /// 刷新成功构建的那一帧。若动作后刷新失败，则为动作前校验帧，
+    /// 此时 `note` 必含“需重新 observe”说明，调用方不得当作新帧用。
     Done {
         frame_id: FrameId,
         /// 执行附注（如 Upload 目标是单选文件框、多余文件被截断），

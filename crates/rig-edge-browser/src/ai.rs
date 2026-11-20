@@ -159,10 +159,11 @@ impl AiChannel {
         crate::metrics::global().observe.record(t0.elapsed());
         if r.is_ok() {
             // observe 成功 = 客户端已按接管后的新现实重新同步，
-            // 解除接管闩锁（R-01 配套口径）
-            self.exec.note_observed().await;
+            // 解除接管闩锁（R-01 配套口径）。只有本次 observe 领取的
+            // 句柄才能解闩：接管前在途旧 observe 的成功返回不算（C02）。
+            self.exec.note_observed(&h).await;
         }
-        self.exec.end(&h).await;
+        self.exec.end(h).await;
         r
     }
 
@@ -272,7 +273,7 @@ impl AiChannel {
             };
         };
         let r = self.act_dedup(req, &h).await;
-        self.exec.end(&h).await;
+        self.exec.end(h).await;
         crate::metrics::global().act.record(t0.elapsed());
         r
     }
@@ -446,11 +447,28 @@ impl AiChannel {
         }
         match exec {
             Ok(note) => {
-                // 动作后刷新帧，Done 携带新帧号
-                let _ = self.observe_full().await;
-                ActionResult::Done {
-                    frame_id: self.frame.load(Ordering::SeqCst),
-                    note,
+                // 动作后刷新帧，Done 携带本次刷新成功构建的帧号（A01）：
+                // 并发 observe 递增的全局帧计数不得冒充本次结果。
+                match self.observe_full().await {
+                    Ok((obs, _, _)) => ActionResult::Done {
+                        frame_id: obs.frame_id,
+                        note,
+                    },
+                    Err(e) => {
+                        // 副作用已执行，不能伪装成 Rejected。用旧契约字段
+                        // 如实说明：所带帧号是动作前校验帧（非动作后帧），
+                        // 调用方必须重新 observe（A01）。
+                        let refresh_note = format!(
+                            "动作已执行；动作后刷新失败（{e}），frame_id 为动作前校验帧，需重新 observe"
+                        );
+                        ActionResult::Done {
+                            frame_id: current.frame_id,
+                            note: Some(match note {
+                                Some(n) => format!("{n}；{refresh_note}"),
+                                None => refresh_note,
+                            }),
+                        }
+                    }
                 }
             }
             Err(ExecErr::Aborted) => ActionResult::Aborted {
