@@ -62,7 +62,7 @@ struct App {
     browser: Arc<Browser>,
     ai: AiChannel,
     human: Arc<HumanChannel>,
-    media: media::MediaPipeline,
+    media: Arc<media::MediaPipeline>,
     /// WebRTC 主路 hub（Phase 1b）：共享编码 feeder + 会话工厂
     rtc: Arc<rtc::RtcHub>,
     dom: Arc<dom::DomChannel>,
@@ -230,15 +230,36 @@ struct ChannelState {
     av_available: bool,
     /// 人通道启动失败原因（R-11）；正常时为 null
     human_error: Option<String>,
+    /// M01 用户 AV 意图（要不要 AV）：RTC healthy 时 HLS 可以不跑，
+    /// 意图保留、连通数归零即兜底启动
+    av_wanted: bool,
+    /// M03 HLS 运行态：running / idle / failed（供排障，不抛异常）
+    media_state: String,
+    /// M03 HLS 最近一次启动失败原因；正常时为 null
+    media_error: Option<String>,
 }
 
-fn channel_state(app: &Arc<App>, av: bool) -> ChannelState {
+async fn channel_state(app: &Arc<App>, av: bool) -> ChannelState {
+    // M03：wanted/running/error 一次取齐，避免并发下“running
+    // 与 error 对不上”
+    let (wanted, running, media_error) = app.media.state_summary().await;
+    let media_state = if running {
+        "running"
+    } else if media_error.is_some() {
+        "failed"
+    } else {
+        "idle"
+    }
+    .to_string();
     ChannelState {
         ai: app.gate_ai.load(Ordering::SeqCst),
         human: app.gate_human.load(Ordering::SeqCst),
         av,
         av_available: app.av_capable,
         human_error: app.human_error.lock().unwrap().clone(),
+        av_wanted: wanted,
+        media_state,
+        media_error,
     }
 }
 
@@ -393,7 +414,7 @@ async fn main() {
     let app = Arc::new(App {
         ai: AiChannel::new(browser.clone(), origins, exec.clone()),
         exec,
-        media: media::MediaPipeline::new(human.clone()),
+        media: Arc::new(media::MediaPipeline::new(human.clone())),
         rtc: rtc::RtcHub::new(human.clone(), stun),
         dom: dom::DomChannel::new(browser.clone(), human.clone()),
         listen_ip,
@@ -406,6 +427,8 @@ async fn main() {
         token,
     });
     app.human.set_gate_display(ai_default, human_default).await;
+    // M01：RTC 连通数变化自动联动 HLS（连通 grace 后停、归零起兜底）
+    app.rtc.set_hls_policy(&app.media);
     if human_default {
         if let Err(e) = app.human.start().await {
             // R-11：启动失败如实降级——gate 不报已启用，错误可查
@@ -415,9 +438,10 @@ async fn main() {
             app.human.set_gate_display(ai_default, false).await;
         }
         if av_default && av_capable {
-            if let Err(e) = app.media.start().await {
-                eprintln!("音视频合流启动失败: {e}");
-            }
+            // M01：--av 只记用户意图；RTC 无连通才起 HLS，不 blind 启动
+            app.media
+                .apply_wanted(true, app.rtc.connected_count())
+                .await;
         }
     }
 
@@ -576,6 +600,19 @@ async fn health(State(app): State<Arc<App>>) -> Json<serde_json::Value> {
         "cdp_connected": cdp_connected,
         "last_frame_age_ms": app.human.last_frame_age_ms(),
         "exec_in_flight": app.ai.exec_in_flight().await,
+        "rtc_connected": app.rtc.connected_count(),
+        "media": {
+            "wanted": app.media.wanted(),
+            "running": app.media.running().await,
+            "error": app.media.state_summary().await.2,
+        },
+        "pump": {
+            "full": m.pump_full.load(Ordering::Relaxed),
+            "content": m.pump_content.load(Ordering::Relaxed),
+            "pasted": m.pump_pasted.load(Ordering::Relaxed),
+            "dropped": m.pump_dropped.load(Ordering::Relaxed),
+            "rect_refetch": m.pump_rect_refetch.load(Ordering::Relaxed),
+        },
         "frames": {
             "sent": m.frames_sent.load(Ordering::Relaxed),
             "skipped": m.frames_skipped.load(Ordering::Relaxed),
@@ -614,7 +651,7 @@ async fn ready(State(app): State<Arc<App>>) -> (axum::http::StatusCode, Json<ser
 
 async fn get_channels(State(app): State<Arc<App>>) -> Json<ChannelState> {
     let av = app.media.running().await;
-    Json(channel_state(&app, av))
+    Json(channel_state(&app, av).await)
 }
 
 /// 应用通道开关（HTTP /channels 与观看端菜单共用同一逻辑），
@@ -635,7 +672,11 @@ async fn apply_gate_flags(app: &Arc<App>, ai: Option<bool>, human: Option<bool>)
                 }
             }
         } else if !h && cur {
-            app.media.stop().await;
+            // M01：关人通道同时清除 AV 意图，否则 RTC 断开会把 HLS
+            // 又拉起来（人通道都没了，兜底无意义）
+            app.media
+                .apply_wanted(false, app.rtc.connected_count())
+                .await;
             let _ = app.human.stop().await;
             app.gate_human.store(false, Ordering::SeqCst);
         }
@@ -657,14 +698,20 @@ async fn set_channels(
 ) -> Json<ChannelState> {
     apply_gate_flags(&app, set.ai, set.human).await;
     if let Some(av) = set.av {
+        // M01：用户意图与实际运行分离——RTC healthy 时 HLS 默认不跑，
+        // 只在连通数归零时兜底；M03：失败原因进 ChannelState，不再吞掉
         if av && app.av_capable && app.gate_human.load(Ordering::SeqCst) {
-            let _ = app.media.start().await;
+            app.media
+                .apply_wanted(true, app.rtc.connected_count())
+                .await;
         } else if !av {
-            app.media.stop().await;
+            app.media
+                .apply_wanted(false, app.rtc.connected_count())
+                .await;
         }
     }
     let av = app.media.running().await;
-    Json(channel_state(&app, av))
+    Json(channel_state(&app, av).await)
 }
 
 /// 观看端「打印」菜单的产物取回（打印一次取一次，取后清空）

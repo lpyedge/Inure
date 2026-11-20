@@ -12,6 +12,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use ffmpeg_next as ff;
 use ffmpeg_sys_next as sys;
@@ -111,6 +112,10 @@ pub async fn ensure_virtual_sink() -> bool {
         .unwrap_or(false)
 }
 
+/// M01：RTC 连通后停 HLS 前的 grace——短暂抖动不断流，5s 后
+/// 仍连通才停，避免频繁起停。
+pub const HLS_RTC_GRACE: Duration = Duration::from_secs(5);
+
 struct PipelineInner {
     dir: PathBuf,
     stop: Arc<AtomicBool>,
@@ -121,6 +126,12 @@ struct PipelineInner {
 pub struct MediaPipeline {
     inner: Mutex<Option<PipelineInner>>,
     human: Arc<HumanChannel>,
+    /// M01 用户意图（要不要 AV）与实际运行分离：RTC healthy 时
+    /// HLS 默认不跑，只在连通数归零时兜底
+    wanted: AtomicBool,
+    /// M03 最近一次启动失败的原因（成功即清）：/channels 与 /health
+    /// 如实回报，不再吞掉 start() 错误
+    last_error: std::sync::Mutex<Option<String>>,
 }
 
 impl MediaPipeline {
@@ -128,6 +139,8 @@ impl MediaPipeline {
         Self {
             inner: Mutex::new(None),
             human,
+            wanted: AtomicBool::new(false),
+            last_error: std::sync::Mutex::new(None),
         }
     }
 
@@ -170,12 +183,69 @@ impl MediaPipeline {
         if let Some(inner) = self.inner.lock().await.take() {
             inner.stop.store(true, Ordering::SeqCst);
             let handle = inner.handle;
-            let _ = tokio::task::spawn_blocking(move || {
-                let _ = handle.join();
-            })
+            // M02：合流线程退出前已 join 音频线程；这里再给整个管线
+            // 10s 上限——Pulse 阻塞读极端不归时不把 /channels 挂死，
+            // detached 的线程靠 stop 标记在下个包到达时退出
+            let _ = tokio::time::timeout(
+                Duration::from_secs(10),
+                tokio::task::spawn_blocking(move || {
+                    let _ = handle.join();
+                }),
+            )
             .await;
             let _ = tokio::fs::remove_dir_all(&inner.dir).await;
         }
+    }
+
+    /// M01 用户意图入口：要 AV → 记下意图，无 RTC 连通才起 HLS；
+    /// 不要 AV → 记下意图并停 HLS。调用方传入当前 RTC 连通数。
+    pub async fn apply_wanted(&self, av: bool, rtc_connected: usize) {
+        self.wanted.store(av, Ordering::SeqCst);
+        if av {
+            self.start_for_fallback(rtc_connected).await;
+        } else {
+            self.stop().await;
+        }
+    }
+
+    /// M01：RTC 归零后的兜底启动——用户要 AV 且确无连通才起。
+    pub async fn start_for_fallback(&self, rtc_connected: usize) {
+        if !hls_should_run(self.wanted.load(Ordering::SeqCst), rtc_connected) {
+            return;
+        }
+        self.start_or_record().await;
+    }
+
+    /// M01：RTC 连通后的多余编码清理——用户要 AV 也停 HLS
+    /// （RTC 音视频双轨独立于 HLS，不受影响）。
+    pub async fn stop_for_rtc(&self) {
+        if self.wanted.load(Ordering::SeqCst) && self.running().await {
+            eprintln!("[media] RTC 已连通：停 HLS 兜底编码（用户 AV 意图保留）");
+            self.stop().await;
+        }
+    }
+
+    async fn start_or_record(&self) {
+        match self.start().await {
+            Ok(()) => *self.last_error.lock().unwrap() = None,
+            Err(e) => {
+                eprintln!("[media] HLS 启动失败: {e}");
+                *self.last_error.lock().unwrap() = Some(e);
+            }
+        }
+    }
+
+    pub fn wanted(&self) -> bool {
+        self.wanted.load(Ordering::SeqCst)
+    }
+
+    /// 运行态 + 最近启动错误（M03：给 /channels 与 /health）
+    pub async fn state_summary(&self) -> (bool, bool, Option<String>) {
+        (
+            self.wanted(),
+            self.running().await,
+            self.last_error.lock().unwrap().clone(),
+        )
     }
 
     /// 读一个 HLS 文件：rendition ∈ {hevc, h264}，name 为平坦文件名。
@@ -365,6 +435,8 @@ fn pipeline_main(human: Arc<HumanChannel>, dir: PathBuf, stop: Arc<AtomicBool>) 
     // 但样本计数与发送等合流线程建好首个合流器组（≈首帧时刻）才开始——
     // 否则音频时间轴比视频早一截，首段里对位的是页面发声前的静音。
     let audio_go = Arc::new(AtomicBool::new(false));
+    // M02：音频线程句柄——退出前 join，不再 detached
+    let mut audio_handle: Option<std::thread::JoinHandle<()>>;
     // 有界队列（R-20）：合流线程卡住时音频包不得无界积压——
     // 满时丢新包（音频是实时流，短暂缺帧好过内存膨胀）
     let (audio_tx, audio_rx) = std::sync::mpsc::sync_channel::<ff::Packet>(64);
@@ -373,9 +445,14 @@ fn pipeline_main(human: Arc<HumanChannel>, dir: PathBuf, stop: Arc<AtomicBool>) 
     {
         let holder = aac_params_holder.clone();
         let go = audio_go.clone();
-        std::thread::Builder::new()
+        let audio_stop = stop.clone();
+        // M02：持有音频线程句柄，合流线程退出前显式 join——旧代码
+        // 直接 .spawn(...).ok() 丢掉句柄，首帧未来即停时音频线程
+        // 因 go 恒 false 永远不产包、靠“tx 断开”退出的路径走不到，
+        // 无限监听 Pulse 不退出（反复启停泄漏线程与设备句柄）
+        audio_handle = std::thread::Builder::new()
             .name("rig-media-audio".into())
-            .spawn(move || audio_main(audio_tx, holder, go))
+            .spawn(move || audio_main(audio_tx, holder, go, audio_stop))
             .ok();
     }
     // 等音频编码器参数就绪（最多 ~2s）；超时按无音频继续
@@ -452,6 +529,18 @@ fn pipeline_main(human: Arc<HumanChannel>, dir: PathBuf, stop: Arc<AtomicBool>) 
     if let Some(m) = mux.take() {
         m.close();
     }
+    // M02：合流线程退出前回收音频线程。音频循环每包检查 stop，
+    // 首帧未来即停也能退出；Pulse 阻塞读极端不归时 join 可能等到
+    // 下一个包——stop() 侧另有 10s 上限兜底
+    if let Some(h) = audio_handle.take() {
+        let _ = h.join();
+    }
+}
+
+/// M01 纯策略：用户要 AV 且无 RTC 连通 → HLS 才该跑。
+/// RTC healthy 时 HLS 默认不跑（省一路 H.264 + 一路 AAC 编码）。
+fn hls_should_run(wanted: bool, rtc_connected: usize) -> bool {
+    wanted && rtc_connected == 0
 }
 
 /// yuv420 编码要求偶数尺寸：奇数边向下取偶（帧泵存 RGB 时已
@@ -515,6 +604,7 @@ fn audio_main(
     tx: std::sync::mpsc::SyncSender<ff::Packet>,
     params_holder: Arc<std::sync::Mutex<Option<ff::codec::Parameters>>>,
     go: Arc<AtomicBool>,
+    stop: Arc<AtomicBool>,
 ) {
     // avdevice 注册是进程级 Once，但音频线程可能先于任何编码器构造运行
     crate::encode::ensure_init();
@@ -573,6 +663,11 @@ fn audio_main(
         let mut acc_r: Vec<f32> = Vec::new();
         let mut sample_pts: i64 = 0;
         for (stream, packet) in input.packets() {
+            // M02：首帧未来即停时 go 恒 false——旧代码只靠“tx 断开”
+            // 退出，不产包就永远不退；每包检查 stop 即可退出
+            if stop.load(Ordering::SeqCst) {
+                return Ok(());
+            }
             if stream.index() != a_idx {
                 continue;
             }
@@ -642,5 +737,20 @@ fn audio_main(
     };
     if let Err(e) = run(&tx, &params_holder, &go) {
         eprintln!("[media] 音频轨不可用: {e}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// M01 策略表：只有“用户要 AV 且零 RTC 连通”才跑 HLS
+    #[test]
+    fn hls_runs_only_as_fallback() {
+        assert!(hls_should_run(true, 0));
+        assert!(!hls_should_run(true, 1));
+        assert!(!hls_should_run(true, 3));
+        assert!(!hls_should_run(false, 0));
+        assert!(!hls_should_run(false, 2));
     }
 }

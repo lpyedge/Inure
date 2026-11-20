@@ -70,6 +70,11 @@ pub struct RtcHub {
     aud_tx: broadcast::Sender<Arc<AudPkt>>,
     /// 想要媒体的会话数；归零时 feeder 释放编码器、不再编码
     want: Arc<AtomicUsize>,
+    /// 已 ICE 连通的会话数（M01：HLS 兜底只在归零且用户要 AV 时跑；
+    /// RTC healthy 时默认停 HLS，不三路并行编码）
+    connected: Arc<AtomicUsize>,
+    /// HLS 策略回调（App 装配时注入；None = 无 HLS，如单测）
+    hls_watch: std::sync::Mutex<Option<std::sync::Weak<crate::media::MediaPipeline>>>,
     /// 任一会话请求关键帧（PLI/新连通）即置位，feeder 消费后清零
     force_key: Arc<AtomicBool>,
     /// BWE 反馈的目标码率（多会话时后写者胜，量级正确即可）
@@ -110,6 +115,8 @@ impl RtcHub {
             au_tx,
             aud_tx,
             want: Arc::new(AtomicUsize::new(0)),
+            connected: Arc::new(AtomicUsize::new(0)),
+            hls_watch: std::sync::Mutex::new(None),
             force_key: Arc::new(AtomicBool::new(false)),
             bitrate: Arc::new(AtomicU64::new(START_BITRATE)),
             feeder: std::sync::Mutex::new(None),
@@ -149,10 +156,47 @@ impl RtcHub {
         }
     }
 
-    /// 为一条观看连接开 RTC 会话：offer 经 out 推给观看端，answer/candidate
-    /// 由 main.rs 经返回的 handle 喂回。handle 被 drop 即会话终止。
+    /// App 装配时注入 HLS 策略：RTC 连通数变化时自动启停兜底编码，
+    /// 把“用户要 AV”（wanted）与“HLS 是否真在跑”（running）分开（M01）
+    pub fn set_hls_policy(&self, media: &Arc<crate::media::MediaPipeline>) {
+        *self.hls_watch.lock().unwrap() = Some(Arc::downgrade(media));
+    }
+
+    pub fn connected_count(&self) -> usize {
+        self.connected.load(Ordering::SeqCst)
+    }
+
+    /// RTC 连通数变化时的 HLS 联动（M01）。连通数 >0 → HLS 是多余的
+    /// 并行编码，grace 后停掉（防抖动频繁起停）；归零 → 若用户要 AV
+    /// 立刻起 HLS 兜底。无 HLS（单测）时只记数。
+    fn on_rtc_count_changed(self: &Arc<Self>) {
+        let media = self
+            .hls_watch
+            .lock()
+            .unwrap()
+            .clone()
+            .and_then(|w| w.upgrade());
+        let Some(media) = media else { return };
+        let hub = self.clone();
+        if hub.connected_count() > 0 {
+            // grace：短暂抖动不断 HLS，5s 后仍连通才停
+            tokio::spawn(async move {
+                tokio::time::sleep(crate::media::HLS_RTC_GRACE).await;
+                if hub.connected_count() > 0 {
+                    media.stop_for_rtc().await;
+                }
+            });
+        } else {
+            let hub2 = hub.clone();
+            tokio::spawn(async move {
+                media.start_for_fallback(hub2.connected_count()).await;
+            });
+        }
+    }
     /// active 是该连接的 transport 标志：RTC 连通置 true（main.rs 停发
     /// 该连接的 WS 帧），断开/关闭置 false（恢复 WS 帧）。
+    /// 为一条观看连接开 RTC 会话：offer 经 out 推给观看端，answer/candidate
+    /// 由 main.rs 经返回的 handle 喂回。handle 被 drop 即会话终止。
     pub async fn start_session(
         self: &Arc<Self>,
         out: mpsc::Sender<String>,
@@ -695,6 +739,9 @@ async fn run_session(
     let mut aud_rx = hub.aud_tx.subscribe();
     let mut buf = vec![0u8; 2048];
     let mut deadline = Instant::now() + Duration::from_millis(50);
+    // M01：本会话是否处于 ICE 连通（hub 连通计数的增减据此配对，
+    // 驱动 HLS 兜底的启停）
+    let mut connected_here = false;
     'session: loop {
         tokio::select! {
             r = socket.recv_from(&mut buf) => {
@@ -777,6 +824,12 @@ async fn run_session(
                     ) => {
                         active.store(true, Ordering::SeqCst);
                         hub.force_key.store(true, Ordering::SeqCst);
+                        // M01：首个连通会话把 HLS 兜底停掉（grace 防抖）
+                        if !connected_here {
+                            connected_here = true;
+                            hub.connected.fetch_add(1, Ordering::SeqCst);
+                            hub.on_rtc_count_changed();
+                        }
                         let _ = out.try_send(
                             json!({"type": "rtc-state", "state": "connected"}).to_string(),
                         );
@@ -786,6 +839,12 @@ async fn run_session(
                     // Disconnected 只切回 WS 帧兜底，会话保留待恢复
                     Event::IceConnectionStateChange(IceConnectionState::Disconnected) => {
                         active.store(false, Ordering::SeqCst);
+                        // M01：连通数归零 → 若用户要 AV 立刻起 HLS 兜底
+                        if connected_here {
+                            connected_here = false;
+                            hub.connected.fetch_sub(1, Ordering::SeqCst);
+                            hub.on_rtc_count_changed();
+                        }
                         let _ = out.try_send(
                             json!({"type": "rtc-state", "state": "disconnected"}).to_string(),
                         );
@@ -855,6 +914,11 @@ async fn run_session(
     }
     active.store(false, Ordering::SeqCst);
     dom_open.store(false, Ordering::SeqCst);
+    // M01：连通中结束的会话同样减数（归零则 HLS 兜底接管）
+    if connected_here {
+        hub.connected.fetch_sub(1, Ordering::SeqCst);
+        hub.on_rtc_count_changed();
+    }
     let _ = out.try_send(json!({"type": "rtc-state", "state": "closed"}).to_string());
     Ok(())
 }
