@@ -120,6 +120,16 @@ pub struct Metrics {
     pub frames_skipped: AtomicU64,
     /// 已广播的帧数
     pub frames_sent: AtomicU64,
+    /// 帧泵：整页帧数
+    pub pump_full: AtomicU64,
+    /// 帧泵：内容帧数
+    pub pump_content: AtomicU64,
+    /// 帧泵：内容帧成功贴图数
+    pub pump_pasted: AtomicU64,
+    /// 帧泵：内容帧丢弃数（无唯一矩形/无干净底图/回退模式）
+    pub pump_dropped: AtomicU64,
+    /// 帧泵：rect 几何重取次数
+    pub pump_rect_refetch: AtomicU64,
     pub last_observe: Mutex<Option<LastObserve>>,
 }
 
@@ -134,6 +144,11 @@ impl Metrics {
             quads: Latency::new(),
             frames_skipped: AtomicU64::new(0),
             frames_sent: AtomicU64::new(0),
+            pump_full: AtomicU64::new(0),
+            pump_content: AtomicU64::new(0),
+            pump_pasted: AtomicU64::new(0),
+            pump_dropped: AtomicU64::new(0),
+            pump_rect_refetch: AtomicU64::new(0),
             last_observe: Mutex::new(None),
         }
     }

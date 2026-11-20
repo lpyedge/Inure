@@ -49,6 +49,10 @@ pub struct HumanChannel {
     /// 传递（F-04）：RTC feeder 每帧取用不再整帧克隆（1280×800
     /// 一帧 3MB，30fps 下曾是 ~90MB/s 的无谓拷贝）
     last_rgb: LastRgbSlot,
+    /// 最近一张真正的整页帧 RGB（V02 干净底图），见上
+    full_base: LastRgbSlot,
+    /// 最近一张真正的整页帧 RGB（V02 干净底图）：只由整页路径更新，
+    /// 内容帧贴图一律以它为底、不在上次合成结果上叠加，避免旧位置残影
     /// 合成帧序号：每次 last_rgb 更新即递增，编码层据此判断画面是否变化
     rgb_seq: Arc<std::sync::atomic::AtomicU64>,
     /// 最近的原始页面帧（JPEG 字节）：chrome 状态变化时重合成用
@@ -86,6 +90,59 @@ fn btn_name(btn: u8) -> &'static str {
     }
 }
 
+/// 内容帧 rect 缓存有效期（V01）：无滚动的 reflow 会移动/改变元素，
+/// 超期必须重取几何，不能按旧 rect 贴（P1 主因）。200–500ms 按审查
+/// 建议取 400ms：reflow 当帧可能仍错位，但旧位置残影不再跨帧累积。
+const RECT_TTL_MS: u64 = 400;
+
+/// V01/V02 帧泵纯函数（可无浏览器单测）：
+///
+/// 帧分类：整页帧 = 尚未建基准，或宽高都达到基准 90%
+fn classify_full(w: u32, h: u32, base: (u32, u32)) -> bool {
+    base.0 == 0 || (w * 10 >= base.0 * 9 && h * 10 >= base.1 * 9)
+}
+
+/// V04：在缓存矩形里找与内容帧尺寸匹配的唯一者——0 个或多个都算
+/// 无法可靠归属（多 video/canvas 尺寸接近会贴错元素），返回 None，
+/// 调用方丢弃内容帧等整页帧，不错贴。
+fn find_unique_rect(rects: &[(u32, u32, u32, u32)], w: u32, h: u32) -> Option<(u32, u32)> {
+    let mut hit = None;
+    for r in rects {
+        if (r.2 as i64 - w as i64).abs() <= 3 && (r.3 as i64 - h as i64).abs() <= 3 {
+            if hit.is_some() {
+                return None;
+            }
+            hit = Some((r.0, r.1));
+        }
+    }
+    hit
+}
+
+/// V02：在干净整页底图上贴内容块（越界裁剪），返回合成帧。
+/// 禁止在上次合成结果上叠加——那是旧位置残影的根因。
+fn compose_on_clean(
+    base: &image::RgbImage,
+    rgb: &image::RgbImage,
+    rx: u32,
+    ry: u32,
+) -> image::RgbImage {
+    let (tw, th) = (base.width(), base.height());
+    let mut canvas = base.clone();
+    if rx < tw && ry < th {
+        let pw = rgb.width().min(tw - rx);
+        let ph = rgb.height().min(th - ry);
+        if pw > 0 && ph > 0 {
+            if pw == rgb.width() && ph == rgb.height() {
+                image::imageops::overlay(&mut canvas, rgb, rx as i64, ry as i64);
+            } else {
+                let piece = image::imageops::crop_imm(rgb, 0, 0, pw, ph).to_image();
+                image::imageops::overlay(&mut canvas, &piece, rx as i64, ry as i64);
+            }
+        }
+    }
+    canvas
+}
+
 impl HumanChannel {
     pub fn new(browser: Arc<Browser>, exec: Arc<ExecControl>) -> HumanChannel {
         let (frames, _) = broadcast::channel(8);
@@ -100,6 +157,7 @@ impl HumanChannel {
             last_size: Arc::new(Mutex::new((0, 0))),
             last_frame: Arc::new(Mutex::new(None)),
             last_rgb: Arc::new(std::sync::Mutex::new(None)),
+            full_base: Arc::new(std::sync::Mutex::new(None)),
             rgb_seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             last_raw: Arc::new(Mutex::new(None)),
             pump: Mutex::new(None),
@@ -399,6 +457,7 @@ impl HumanChannel {
             let last_size = self.last_size.clone();
             let last_frame = self.last_frame.clone();
             let last_rgb = self.last_rgb.clone();
+            let full_base = self.full_base.clone();
             let rgb_seq = self.rgb_seq.clone();
             let last_raw = self.last_raw.clone();
             let view_session = self.view_session.clone();
@@ -417,6 +476,16 @@ impl HumanChannel {
                 // 内不重复 eval）
                 let mut gate_vp = (0u32, 0u32);
                 let mut gate_vp_at = std::time::Instant::now() - std::time::Duration::from_secs(1);
+                // V01 rect 缓存取样时刻（TTL 过期强制重取，见下）
+                let mut gate_rects_at = std::time::Instant::now();
+                // A/B 与故障回退（审查待拍板#2）：只用整页帧，内容帧
+                // ack 后直接丢弃。RIG_PUMP_FULL_ONLY=1 开启（=0 关闭）。
+                let full_only = std::env::var("RIG_PUMP_FULL_ONLY")
+                    .map(|v| v != "0")
+                    .unwrap_or(false);
+                if full_only {
+                    eprintln!("[pump] RIG_PUMP_FULL_ONLY=1：内容帧全部丢弃，只用整页帧");
+                }
                 loop {
                     if !flag.load(Ordering::SeqCst) {
                         break;
@@ -527,8 +596,7 @@ impl HumanChannel {
                             .and_then(Value::as_f64)
                             .unwrap_or(0.0) as i64,
                     );
-                    let mut is_full = gate_full.0 == 0
-                        || (w * 10 >= gate_full.0 * 9 && h * 10 >= gate_full.1 * 9);
+                    let mut is_full = classify_full(w, h, gate_full);
                     if !is_full && w > 0 && h > 0 {
                         // 小于基准 90% 的帧也可能是视口变小后的整页
                         // 帧（观看端窗口缩小）：与内容帧的区分只能问
@@ -560,7 +628,17 @@ impl HumanChannel {
                         }
                     }
                     if !is_full && w > 0 && h > 0 {
-                        // 内容帧：贴回合成（找不到匹配矩形/尚无
+                        crate::metrics::global()
+                            .pump_content
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        // A/B 与故障回退：只用整页帧
+                        if full_only {
+                            crate::metrics::global()
+                                .pump_dropped
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            continue;
+                        }
+                        // 内容帧：贴回合成（找不到唯一匹配矩形/尚无
                         // 整页底图时丢弃，整页帧随后就到）
                         if let Some(mut rgb) = decode_jpeg_rgb(&raw) {
                             let (ew, eh) = (rgb.width() & !1, rgb.height() & !1);
@@ -568,14 +646,14 @@ impl HumanChannel {
                                 rgb = image::imageops::crop_imm(&rgb, 0, 0, ew, eh).to_image();
                             }
                             let mut rect = None;
-                            if gate_rects_for == (w, h) {
-                                rect = gate_rects
-                                    .iter()
-                                    .find(|r| {
-                                        (r.2 as i64 - w as i64).abs() <= 3
-                                            && (r.3 as i64 - h as i64).abs() <= 3
-                                    })
-                                    .copied();
+                            // V01：缓存只在 TTL 内可信——元素在无滚动的
+                            // reflow 中移动/改尺寸时缓存不自知，过期必须
+                            // 重取几何，不能按旧 rect 贴（P1 主因之首）
+                            if gate_rects_for == (w, h)
+                                && gate_rects_at.elapsed()
+                                    <= std::time::Duration::from_millis(RECT_TTL_MS)
+                            {
+                                rect = find_unique_rect(&gate_rects, w, h);
                             }
                             if rect.is_none() {
                                 let expr = "(() => { const out = []; for (const el of document.querySelectorAll('video,canvas')) { const r = el.getBoundingClientRect(); if (r.width > 1 && r.height > 1) out.push([r.x, r.y, r.width, r.height]); } return out; })()";
@@ -596,54 +674,50 @@ impl HumanChannel {
                                         })
                                         .collect();
                                     gate_rects_for = (w, h);
+                                    gate_rects_at = std::time::Instant::now();
+                                    crate::metrics::global()
+                                        .pump_rect_refetch
+                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                     // 诊断（LIU 第六轮「固定分辨率仍偶尔
                                     // 小跳」取证）：rect 取样不频繁（尺寸
-                                    // 切换/滚动才重取），逐次留痕，含内容
-                                    // 帧自带 metadata 的 sf——若某类内容帧
+                                    // 切换/滚动/TTL 过期才重取），逐次留痕，
+                                    // 含内容帧自带 metadata 的 sf——若某类内容帧
                                     // 的 sf≠1，rect 会被错缩放、贴图偏移
                                     eprintln!(
                                         "[pump] 内容帧 rect 取样 {w}x{h} sf={sf} rects={gate_rects:?}"
                                     );
-                                    rect = gate_rects
-                                        .iter()
-                                        .find(|r| {
-                                            (r.2 as i64 - w as i64).abs() <= 3
-                                                && (r.3 as i64 - h as i64).abs() <= 3
-                                        })
-                                        .copied();
+                                    rect = find_unique_rect(&gate_rects, w, h);
                                 }
                             }
-                            if let Some((rx, ry, _, _)) = rect {
-                                let base = last_rgb.lock().unwrap().clone();
-                                if let Some((base, _)) = base {
-                                    let (tw, th) = (gate_full.0 & !1, gate_full.1 & !1);
-                                    if base.width() == tw
-                                        && base.height() == th
-                                        && rx < tw
-                                        && ry < th
+                            if let Some((rx, ry)) = rect {
+                                // V02：在干净整页底图上贴，不在上次合成结果
+                                // 上叠加——旧位置残影的根因。底图缺失/尺寸
+                                // 不对就丢弃，等新基准（整页帧随后就到）。
+                                let base = full_base.lock().unwrap().clone();
+                                match base {
+                                    Some((base, _))
+                                        if base.width() == (gate_full.0 & !1)
+                                            && base.height() == (gate_full.1 & !1)
+                                            && gate_full.0 > 0 =>
                                     {
-                                        let mut canvas = (*base).clone();
-                                        let pw = rgb.width().min(tw - rx);
-                                        let ph = rgb.height().min(th - ry);
-                                        let piece;
-                                        let piece_ref = if pw == rgb.width() && ph == rgb.height() {
-                                            &rgb
-                                        } else {
-                                            piece = image::imageops::crop_imm(&rgb, 0, 0, pw, ph)
-                                                .to_image();
-                                            &piece
-                                        };
-                                        image::imageops::overlay(
-                                            &mut canvas,
-                                            piece_ref,
-                                            rx as i64,
-                                            ry as i64,
-                                        );
+                                        let canvas = compose_on_clean(&base, &rgb, rx, ry);
                                         *last_rgb.lock().unwrap() =
                                             Some((Arc::new(canvas), std::time::Instant::now()));
                                         rgb_seq.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                                        crate::metrics::global()
+                                            .pump_pasted
+                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    }
+                                    _ => {
+                                        crate::metrics::global()
+                                            .pump_dropped
+                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                     }
                                 }
+                            } else {
+                                crate::metrics::global()
+                                    .pump_dropped
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             }
                         }
                         continue;
@@ -671,6 +745,9 @@ impl HumanChannel {
                     // 实现靠同步循环重合成的副产物喂 last_frame，
                     // 第五期删合成后必须在这里显式保住）。
                     if w > 0 && h > 0 {
+                        crate::metrics::global()
+                            .pump_full
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         let msg = FrameMsg {
                             jpeg: (*raw).clone(),
                             width: w,
@@ -706,6 +783,8 @@ impl HumanChannel {
                         }
                         *last_rgb.lock().unwrap() =
                             Some((Arc::new(rgb), std::time::Instant::now()));
+                        // V02 干净底图：只由整页路径更新
+                        *full_base.lock().unwrap() = last_rgb.lock().unwrap().clone();
                         rgb_seq.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     }
                 }
@@ -1641,5 +1720,75 @@ mod tests {
         let (mr, mg, _mb) = (sr / n, sg / n, sb / n);
         assert!(mr > 150, "全帧 R 均值过低: {mr}");
         assert!(mg <= mr + 15, "全帧带绿偏: R 均值 {mr} / G 均值 {mg}");
+    }
+
+    /// V01/分类：90% 阈值边界。1280x800 基准下 1152x720 算整页
+    /// （恰 90%），1151 宽不算——后者走缩型视口核对分支
+    #[test]
+    fn classify_full_uses_ninety_percent() {
+        assert!(classify_full(1280, 800, (1280, 800)));
+        assert!(classify_full(1152, 720, (1280, 800)));
+        assert!(!classify_full(1151, 720, (1280, 800)));
+        assert!(!classify_full(803, 452, (1280, 800)));
+        assert!(classify_full(803, 452, (0, 0)), "无基准时首帧即建基准");
+    }
+
+    /// V04：唯一匹配才贴。单元素命中返回位置；多元素尺寸接近
+    /// （0 个之外，多个也）返回 None——宁可丢帧不错贴
+    #[test]
+    fn rect_match_requires_unique_identity() {
+        let rects = vec![(41, 168, 803, 452)];
+        assert_eq!(find_unique_rect(&rects, 803, 452), Some((41, 168)));
+        assert_eq!(find_unique_rect(&rects, 865, 487), None);
+        // 生产样本：同一会话三个几何——每个尺寸独立命中自己的 rect
+        let rects = vec![
+            (295, 172, 865, 487),
+            (41, 168, 803, 452),
+            (34, 168, 818, 460),
+        ];
+        assert_eq!(find_unique_rect(&rects, 865, 487), Some((295, 172)));
+        assert_eq!(find_unique_rect(&rects, 818, 460), Some((34, 168)));
+        // 两个元素尺寸差 ≤3px：身份无法区分，拒绝贴图
+        let ambiguous = vec![(41, 168, 803, 452), (300, 200, 805, 453)];
+        assert_eq!(find_unique_rect(&ambiguous, 803, 452), None);
+    }
+
+    /// V02/测试#10：干净底图合成不留残影。视频块先在 A 处、再在
+    /// B 处——旧实现在上次合成结果上叠加，A 处残留；新实现每次以
+    /// 整页底图重起，A 处恢复底色
+    #[test]
+    fn paste_on_clean_base_leaves_no_ghost() {
+        use image::RgbImage;
+        // 8x8 灰底（整页），2x2 红块（视频内容）
+        let base = RgbImage::from_pixel(8, 8, image::Rgb([200, 200, 200]));
+        let red = RgbImage::from_pixel(2, 2, image::Rgb([255, 0, 0]));
+        // 旧行为模拟：在上次合成结果上叠加
+        let mut dirty = base.clone();
+        image::imageops::overlay(&mut dirty, &red, 1, 1);
+        image::imageops::overlay(&mut dirty, &red, 5, 5);
+        assert_eq!(dirty.get_pixel(1, 1).0, [255, 0, 0], "旧行为 A 处残留");
+        // 新行为：两次都在干净底图上合成
+        let show_a = compose_on_clean(&base, &red, 1, 1);
+        assert_eq!(show_a.get_pixel(1, 1).0, [255, 0, 0]);
+        let show_b = compose_on_clean(&base, &red, 5, 5);
+        assert_eq!(show_b.get_pixel(5, 5).0, [255, 0, 0]);
+        assert_eq!(
+            show_b.get_pixel(1, 1).0,
+            [200, 200, 200],
+            "B 帧的 A 处必须是干净底色、无残影"
+        );
+    }
+
+    /// 越界内容块裁剪不 panic、不写坏底图
+    #[test]
+    fn paste_clips_at_edges() {
+        use image::RgbImage;
+        let base = RgbImage::from_pixel(8, 8, image::Rgb([200, 200, 200]));
+        let red = RgbImage::from_pixel(4, 4, image::Rgb([255, 0, 0]));
+        let out = compose_on_clean(&base, &red, 6, 6);
+        assert_eq!(out.get_pixel(7, 7).0, [255, 0, 0]);
+        assert_eq!(out.get_pixel(0, 0).0, [200, 200, 200]);
+        let out = compose_on_clean(&base, &red, 99, 99);
+        assert_eq!(out.get_pixel(0, 0).0, [200, 200, 200]);
     }
 }
