@@ -403,10 +403,37 @@ async fn build_nodes(
     if passthrough {
         return children;
     }
-    let role = normalize_role(&ax_str(node.get("role").unwrap()));
     let id = pre_id.unwrap();
+    let dom_attrs = backend.and_then(|b| sd.dom.get(&b)).map(|(_, a, _)| a);
+    // 几何（会话本地坐标 + 帧偏移）：批量表优先，未覆盖
+    // （无布局盒的节点）回落逐节点 quads（R-16）
+    let quad = match backend {
+        Some(b) => match sd.geom.get(&b) {
+            Some(g) => Some(*g),
+            None => browser.quads(&sd.session, b).await.ok().flatten(),
+        },
+        None => None,
+    };
+    let mut el = element_core(id, node, dom_attrs, quad, sd.offset, vw, vh);
+    el.children = children;
+    vec![el]
+}
 
-    let mut el = Element::new(id, role.clone(), Origin::A11y);
+/// 单个 AX 节点 → Element（不含子节点）。整页构建与动作前的单元素
+/// 快速复核共用这一份转换：两条路径必须算出同一个元素，规则
+/// 一旦分叉就会误拒或误放。`quad` 是会话本地坐标包围盒，`offset`
+/// 是该会话的帧偏移，`(vw, vh)` 是视口。
+pub(crate) fn element_core(
+    id: String,
+    node: &Value,
+    dom_attrs: Option<&HashMap<String, String>>,
+    quad: Option<[f32; 4]>,
+    offset: (f32, f32),
+    vw: f32,
+    vh: f32,
+) -> Element {
+    let role = normalize_role(&ax_str(node.get("role").unwrap_or(&Value::Null)));
+    let mut el = Element::new(id, role, Origin::A11y);
     let name = ax_str(node.get("name").unwrap_or(&Value::Null));
     if !name.is_empty() {
         el.name = Some(name);
@@ -442,7 +469,7 @@ async fn build_nodes(
         }
     }
     // 敏感判定走 DOM 属性（AX 不直接给密码标志）
-    if let Some((_, attrs, _)) = backend.and_then(|b| sd.dom.get(&b)) {
+    if let Some(attrs) = dom_attrs {
         let ty = attrs
             .get("type")
             .map(|s| s.to_lowercase())
@@ -457,20 +484,12 @@ async fn build_nodes(
             states.push(ElementState::Sensitive);
         }
     }
-    // 几何（会话本地坐标 + 帧偏移）：批量表优先，未覆盖
-    // （无布局盒的节点）回落逐节点 quads（R-16）
-    if let Some(q) = match backend {
-        Some(b) => match sd.geom.get(&b) {
-            Some(g) => Some(*g),
-            None => browser.quads(&sd.session, b).await.ok().flatten(),
-        },
-        None => None,
-    } {
+    if let Some(q) = quad {
         let b = [
-            q[0] + sd.offset.0,
-            q[1] + sd.offset.1,
-            q[2] + sd.offset.0,
-            q[3] + sd.offset.1,
+            q[0] + offset.0,
+            q[1] + offset.1,
+            q[2] + offset.0,
+            q[3] + offset.1,
         ];
         el.bbox = Some(rig_proto::observation::BBox(b));
         if b[2] <= 0.0 || b[3] <= 0.0 || b[0] >= vw || b[1] >= vh {
@@ -478,8 +497,14 @@ async fn build_nodes(
         }
     }
     el.states = states;
-    el.children = children;
-    vec![el]
+    // 脱敏补强与整页路径的 scrub 同口径：敏感元素清值、清掩码名
+    if el.has(ElementState::Password) || el.has(ElementState::Sensitive) {
+        el.value = None;
+        if el.name.as_deref().map(is_mask_like).unwrap_or(false) {
+            el.name = None;
+        }
+    }
+    el
 }
 
 /// 确定性剪枝：无名、无值、不可交互的 generic 壳折叠（子节点上提）。

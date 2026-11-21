@@ -306,6 +306,44 @@
 - 解法：pollAv 加兜底自愈分支——视频模式（非 DOM、无待落定关 AV 窗口）下见到 `av:false` 且 `av_available` 就 POST 开回去，2 秒轮询内收敛；DOM 模式由 domOn/domAvOffPending 两道闸守住、不与互斥打架。dbg69 实测：外部强关后 8 秒内自愈且音频流量恢复满速；DOM 期间保持关；退出后恢复。同时观看页与脚本响应加 `Cache-Control: no-store`（此前无任何缓存头），杜绝旧版观看页被浏览器缓存续命。
 - 教训：**跨端持久状态的开关，恢复不能只依赖发起方同会话的善后**：任何一端都可能中途消失。守恒式做法是让状态的巡检者（这里是 pollAv）带一个「应然状态」的兜底纠正，并先确认用户侧到底有没有手动恢复的入口——没有入口的卡死态就是设计缺陷，不是个案。
 
+### 46. 整改批次引入的三处回归与一处竞态（2026-11-20 实机复核）
+
+- **自动模式迟滞数快照 → 静态页永不切 DOM**：U03 要求「连续 2 次一致」才切换，但 DOM 快照只在页面变化时推送，静态文章/表单页只有 1 次快照，自动切 DOM 永不发生。改为按**裁决持续时间**（3s）+ 定时器复核；每页首次裁决立即生效，每次导航最多自动切 2 次（B 站/YouTube 的广告、播放器重排让面积判据在阈值附近来回穿越，不封顶就是反复切、画面忽大忽小）。教训：迟滞别数事件个数，事件源可能只发一次。
+- **V04「歧义即丢弃」过严**：首页两个同尺寸预览视频（310×174）使内容帧 11 个丢 10 个，视频只靠整页帧更新。改为同尺寸多候选时按「内容块与干净底图同位置的像素相似度」裁决（最优 <0.8×次优才采纳，否则仍丢弃不错贴）。本地双 `captureStream` 视频页实测：88 个内容帧 87 贴 1 丢。
+- **`pollAv` 先于 WS `open` 触发 `rtcStart` → offer 永不来**：`send` 在 ws 未就绪时静默丢弃 `rtc-start`，但 `pc` 已建，ws `open` 回调里的 `rtcStart` 因 `pc` 已存在直接返回，8s 后落 HLS（间歇性，取决于 fetch 与 WS 握手谁先到）。`rtcStart` 现要求 ws 已就绪；实测全新加载 4/4 连通。
+- **取消静音后被自动播放策略暂停**：RTC/HLS 切换时 `vid.muted=false` 而页面尚无用户手势，浏览器把 `vid` 暂停（画面冻在末帧）；点击也不会自动恢复。加 `pointerdown/keydown` 手势恢复播放。
+- **页面开新标签后观看画面冻结（`window.open` / `target=_blank`，B 站点视频卡片即如此）——两层独立原因**：
+  (1) 新标签抢走前台，观看标签变后台，Chrome 对后台页不再出 screencast 帧（`last_frame_age_ms` 持续增长、帧计数不动）。帧泵的标签巡检现在：自拉起的浏览器里，发现新标签、或标签多于 1 个且帧数停滞时，至多每 3s `Target.activateTarget` 把观看标签切回前台（挂靠用户自己的浏览器不做，免得反复抢前台）。
+  (2) 观看标签重新可见后，Chrome 出的整页帧尺寸变小（实测 900×700 → 900×557）；整页基准只增不减，`classify_full` 判其为内容帧，又归属不上任何 video/canvas 矩形，**100% 被丢弃**（`/health` 里 `pump.content == pump.dropped` 且 `pasted` 为 0），画面冻结。现在连续 8 帧同尺寸、都归属不上矩形、且不小于基准一半，就重定整页基准。
+  排查线索：`/health.last_frame_age_ms` 异常大；`pump.dropped` 持续增长而 `pasted`/`full` 不动；`/screenshot.png`（直接 CDP）与观看页不一致。独立开一个自己的 screencast 会话能区分「Chrome 不出帧」与「边缘帧泵卡住」。
+  回归网：`edge_popup_keeps_view_frames`（`RIG_EDGE_IT=1`）；禁用重定基准则该测试失败。
+- **新标签永远停在 about:blank，要手动刷新才加载**：自动附加（`Target.setAutoAttach` flatten）的 `window.open`/`target=_blank` 新标签，在调试器会话里不放行就不开始首次导航——即使 `waitForDebuggerOnStart=false`（裸 Chrome 对照：只做浏览器级 autoAttach，`window.open('https://example.com')` 得到 url 为空的标签；补 `Runtime.runIfWaitingForDebugger` 即正常）。`attachedToTarget` 里对 page 会话放行。
+- **新标签不跟随**：观看标签开出新标签后，观看画面留在旧标签（还被我们强行切回前台），用户永远看不到新页。现在帧泵巡检按 `targetInfo.openerId` 识别「观看标签自己开出来的」新标签，`switch_view` 跟过去（挂靠模式也跟——是页面自己开的）；`switch_view` 末尾截一张小图强制一次合成帧，否则已在前台的静态新页不会出任何 screencast 帧（观看端是旧画面）。回归网 `edge_popup_keeps_view_frames` 断言新标签加载出 `/other.html` 且为 active。
+- **YouTube 手动切 DOM 8s 后自动回视频（「快照超时」）**：快照 5.5MB（内联 CSS 4.7MB），超过 RTC 数据通道待发队列 4MB 的**单条上限**，`push_msg` 直接拒收并请求重同步，永远送不到；WS 路径正常。上限提到 16MB / 1280 分片（观看端重组上限同步到 16MB）。排查线索：直连 WS 订阅 `dom-start` 看 `dom-snapshot` 条目大小；观看端有 delta 无 snapshot、`domResyncBusy` 恒为 true。
+- **视频变大变小——远端视口与观看端舞台失同步**：观看端的 `resize` 上报只在窗口 resize 事件触发，且按「已发送」去重。(1) 舞台尺寸变化但无窗口事件（头部/标签栏重排，实测 636→632）永远不报；(2) 边缘处理 resize 时 `view()` 瞬时失败会静默丢弃，观看端却认为已生效。结果远端视口卡在旧尺寸，视频按比例缩小显示（实测流 900×712 显示在 1280×632 舞台里变 799×632，且持续不恢复）。现在观看端每 3s 核对：舞台变了走 `reportSize`，没变就重报一次；边缘只在 `innerWidth/Height` 真不一致时才 `setDeviceMetricsOverride`。实测把边缘视口改成 900×712 后 5s 内恢复到 1280×632。注意：自己用另一个 CDP 会话做 `setDeviceMetricsOverride` 来模拟丢失不可靠（两会话的模拟覆盖互相压制），要用另一个 WS 发 `resize`。
+- 另已封顶自动模式切换次数（见上）。本机 YouTube/MDN/B 站首页的帧尺寸与贴图位置实测恒定，未见合成帧尺寸交替；若仍出现，带上 `/health` 的 `pump`、`last_frame_age_ms` 与日志里的 `[pump] 汇总`/`编码器就绪` 行。
+- **多个观看端共用一个边缘视口会互相抢尺寸**：边缘只有一个远端视口（Auto 分辨率跟随「最后一次 resize」），两个观看页（另一个标签、另一台设备、没关的旧页）各报各的尺寸，视口与 RTC 编码器就在两个尺寸间反复切换（实测日志里 `编码器就绪` 在 1910x772 与 1280x712 交替）。尺寸心跳因此只让「可见且有焦点」的观看端发。测试时请只留一个观看页。
+- **改尺寸后约 3s 内视频被拉伸/缩小显示**：resize 防抖 900ms + 边缘设视口 + RTC 编码器按新尺寸重建，期间观看端仍显示旧尺寸的流，被 `max-width/max-height:100%` 缩进新舞台（实测 1910×812 的流在 1280 宽舞台里显示 3s 才切到 1280×632）。窗口缩放、头部重排都会触发；这是已知的瞬态，不是持续错位。
+- **LAN 测试脚本优先用 release 构建，但它不是 DOM 卡顿的解药**：同一 YouTube 观看页（快照 5.5MB）实测 DOM 快照耗时 release p50 426ms / p95 836ms，debug p50 514ms / p95 748ms，差别很小——耗时主要在页内 JS 序列化与大体积传输，不在 Rust。B 站 DOM 模式比视频模式卡，更可能是巨大的 DOM/CSS 体量与持续 delta，而非构建档位；未定位到具体瓶颈。
+- **DOM 模式点开新标签：** 跟随新标签后 DOM 镜像由 300ms 的视图巡检重新 setup+snapshot；本机用 `window.open` 实测镜像能换成新页内容（example.com、YouTube watch）。用户报告「新标签打开但内容仍是首页」本机未复现。
+- **DOM 模式下 YouTube 字幕翻倍/残留（真实页面 1 个字幕窗，镜像里 2 个、文字逐字重复）**：增量序列化器有两处会把同一节点 add 两次，镜像里同 id 出现两个节点、`mirMap` 只指向后一个，之后的更新/删除只落在后一个上，前一个永远残留。(1) `onMutations` 里「先把父挂进文档、再往父里加子」同批出现：`ser(父)` 读的是回调时的最终 DOM、已含该子节点，子节点那条 childList 记录再 add 一次就重复——已有 id 的节点必已被序列化过，直接跳过；(2) 快照与队列竞态：队列里尚未 flush 的 add 排在快照之后送达，而快照已含该节点——`snapshot()` 开头清空 `S.queue`。排查线索：镜像里按 `.__rigId` 取同一父下的子节点，出现重复 id 且 `mirMap.get(id) !== 节点`。回归网 `edge_dom_no_duplicate_adds`（`RIG_EDGE_IT=1`，无修复时失败）。实测同一视频（有 CC）连续 25 次采样，真实页与镜像字幕一致。
+- **DOM 字幕仍重复的第三处成因：快照与已发出的增量乱序**：快照（eval 返回）与增量（绑定事件）走不同路径，快照读取之前页内已 flush 的增量会在快照广播之后才被泵处理——它们已被快照包含，重放即重复 add。修法：页内每次 flush 带递增 `ps`，快照返回当时的 `ps`；边缘 `snap_ps` 锁覆盖「取快照→广播」与「判重→广播增量」，丢弃 `ps <=` 快照者。另：快照先 `takeRecords()` 丢弃观察器里未投递的记录；`add` 的参照节点改取后面第一个**已有 id**的兄弟（同记录连加多节点时紧邻后兄弟尚无 id，原先退化为追加末尾，次序错乱）。回归网 `edge_dom_resync_under_mutation_no_dup`（`RIG_EDGE_IT=1`；页面 6000 节点 + 1ms 突变 + 反复 dom-resync，禁用 `ps` 判重则失败）。
+- **YouTube 滚动时画面「乱跳」（撕裂帧）——人眼可见，CDP 层看不出来**：复现法：观看页 `<video>` 上 `requestVideoFrameCallback` 逐帧画到 canvas 导出，同时用 `WheelEvent` 滚动；边缘加临时 dump（编码器输入的合成帧 + 当时底图）对比。结果：Chrome 原始 screencast 帧干净，传输层 `packetsLost=0/nack=0`，坏的是**边缘合成**——内容帧（视频区帧）贴回整页底图时：(1) 滚动中播放器矩形部分滚出视口，`getBoundingClientRect` 的 y 为负，`as u32` 钳成 0，内容帧被贴在左上角；(2) 内容帧本身是「滚动前位置的页面区域」（含顶栏/logo），贴上去后画面里出现第二个顶栏、左侧一片空白（与底图同位置平均绝对差 96~106，正常贴入 4~11）。现在：负坐标矩形不作候选；贴入块与底图差异 >40（`PASTE_MAX_DIFF`）丢弃；内容帧 JPEG 实际尺寸与元数据不符（实测元数据 663x373、实际 663x253）也丢弃。实测修复后滚动 28 帧无撕裂（`pump.dropped` 由 0 变 9）。单测 `region_diff_separates_stale_paste`、`content_dims_must_match_metadata`。
+- **滚轮的本地「滚动预览」叠在 RTC 流之上**：`fbScroll` 给 `<video>` 加 `translateY(-累计deltaY)`，但 RTC/HLS 是连续流、没有「真帧到达」可归位的时机，只靠 180ms 空闲定时器——连续滚动时画面被双倍位移（流自己也在滚），停手后整体弹回。预览现只对 WS 画布（每张真帧到达即归位）生效。
+- **排查教训**：只看 CDP/协议层数字（帧尺寸、`/health`）会漏掉呈现问题；要从观看端逐帧取像素，并在边缘 dump 编码器输入，二分「Chrome 出帧 / 边缘合成 / 编码传输 / 观看端渲染」。`ps | grep` 的模式若在同一条命令里字面出现（如 `--listen 127.0.0.1:39880`）会匹配到自己的 shell（退出码 144），用 pid 文件。
+- **DOM 模式点进 YouTube：地址栏/标题瞬间变了，内容却要等数秒（镜像每 ~300ms 整页重建一次）**：三个都会触发整页 `resync`（快照）的页内来源，在 YouTube 上全部「误报」：(1) 序列化器不序列化 script，但 `head` 里任何变动都重同步，而 YouTube 的脚本加载器持续增删 `<script>`、改 nonce/class——现在只对 SCRIPT/NOSCRIPT 的 head 变动忽略；其余 head 变动（link/style/title）合并成 500ms 尾随一次；(2) `window.resize` 事件被当作视口变化，YouTube 自己会周期性派发——现在只在 `innerWidth/Height` 与上次快照不同才重发；(3) 注入脚本（`addScriptToEvaluateOnNewDocument`）会进入每个同进程子 frame，about:blank/同源 iframe 各自上报 `installed` 触发整页快照——现在只在顶层 frame 工作。实测导航到 YouTube 后快照由「永不停的每 ~300ms 一张」变为加载期 3 张后停止。排查法：给每处 `send({kind:'resync'})` 打 `why`/`d`（记录类型、目标、节点名）后统计分布，别靠猜。
+- **视频模式播放中「铺满整个窗口、过会儿又缩回」（编码器被切到视频区尺寸）**：`连续 8 帧同尺寸无法归属任何矩形 → 重定整页基准`（为弹窗新标签冻结加的）在 YouTube 上误触发——播放器布局切换/滚动时视频区帧（873x491、800x544、1168x657）暂时匹配不上矩形，连续 8 帧就把整页基准改成视频区尺寸，此后视频区帧被当整页帧送进编码器（日志：`[pump] 连续 8 帧 873x491 无法归属任何矩形：整页基准 1280x800 重定为新尺寸` 紧跟 `[rtc] 编码器就绪 872x490`），观看端于是看到视频放大铺满、而页面只剩左上角；真整页帧（面积更大）到来才恢复。内容帧只可能来自 video/canvas，所以现在页面上还有 video/canvas 矩形时一律不重定基准（`should_rebase`，单测 `rebase_never_with_media_rects`）；没有任何 video/canvas 的页面（弹窗回归网场景）仍可重定。排查线索：LAN 日志里搜 `无法归属` 与 `编码器就绪` 的先后与尺寸。本机无头环境未能复现，依据是生产日志；修复后请在你的环境再验证。
+- **上一条修复仍不彻底（生产日志 `连续 8 帧 853x480 无法归属` 仍出现）——两个互相放大的原因**：(1) Chrome screencast 的元数据 `deviceWidth/Height` 与 JPEG 实际尺寸经常对不上（本机实测约 1/3 内容帧：`meta=663x373 jpeg=663x253`、`meta=873x491 jpeg=1280x800`、`meta=1280x489 jpeg=782x489`），按元数据分类本来就不可靠；上一轮加的「尺寸不符就跳过」既没记丢弃，又让这些帧不触发矩形抓取、还照旧计入「无法归属」连续计数；(2) 我把部分滚出视口（x/y 为负）的矩形从候选里滤掉后，`gate_rects.is_empty()` 就不再等于「页面没有媒体元素」。现在：尺寸不符的内容帧记入 `dropped` 并直接丢弃、不计入连续计数；`should_rebase` 的前提改为 `gate_has_media`（取几何时 video/canvas 的**原始**数量，不受候选过滤影响）。本机 1280x800 + 反复滚动 + 视口缩放，`无法归属` 0 次、编码器只在启动时重建一次。教训：为一处启发式加的「过滤」要同步检查所有读取同一状态的其它启发式。
+- **本机测试边缘默认用 Playwright 的 Chromium，播不了 YouTube**（无专有编解码器，报「Something went wrong」）：测视频页要设 `RIG_CHROMIUM=/opt/google/chrome/chrome`。
+- **排查教训**：`pkill -f`/`pgrep -f` 的模式会匹配到执行它的 shell 自己的命令行（退出码 144），按 `ps | grep "[x]yz"` 取 PID 再 kill。
+- **标签栏顺序不稳**：标签栏直接用 `Target.getTargets` 的返回顺序，Chrome 在新建/切换后会把最近活动的排前面——新建标签落在第一位、切换后标签栏重排（`edge_chrome_ui_and_takeover` 在基线 HEAD 就因此失败，期望新标签 `active:1`）。巡检循环现在用 `stable_tab_order` 保持已有标签相对顺序、新标签追加末尾（单测 `tab_order_is_stable_and_appends_new`）。
+- **本机跑 `edge_av_and_image_clipboard` 的前置**：便携 PulseAudio 的 PATH/LD_LIBRARY_PATH/PULSE_SERVER（同 `scripts/edge-lan.sh`），以及 `ffprobe`/`ffmpeg` 命令行（`apt-get install -y ffmpeg`；边缘自身是进程内链接 libav，不需要 ffmpeg 命令，命令行只给测试后半段断言用）。**坑**：照 `edge-lan.sh` 导出环境会把 `HOME` 改成 `.temp/pulse-home`，导致 `edge_stdio_mcp_and_attach` 找不到 `~/.cache/ms-playwright`、`git` 报 dubious ownership；跑测试前在 source 之后再 `export HOME=/root`。
+- **集成测试里的“排空”循环要按时限**：页面在动时 DOM 差分文本持续到达，`while let Ok(Some(Ok(_))) = timeout(..)` 永不退出、测试挂死；改成固定时长内排空。
+- **后台 DOM 感知不能决定 WS 帧流**：Viewer 为自动模式判断会常驻 `dom-start`，若边缘据此停发 JPEG，RTC 回退到 canvas 后画面停在旧帧。帧流需求只看观看端的 `jpeg-demand`（`jpeg_want`）。
+- **AI 截图遮罩取自完整快照**：响应视图可能被子树/预算裁剪，敏感区域必须取自未裁剪的同一份采集；采集期间换页则不交付截图。
+- **RGB 解码按需**：帧泵只存原始 JPEG（`LazyRgb`），RTC/HLS/V02 取用时才解码且每帧一次；无人看视频时解码从每帧 ≈4ms（debug）降到 0。
+- **`single_rendition_builds_one_output` 偶发失败的疑似原因**：该单测 `set_var("RIG_HLS_SINGLE")` 修改进程级环境变量，与同进程并行的其他单测互相干扰；尚未单独验证，不当作“与改动无关”的结论。
+
 ## 六、探针与测试方法论（栽过的跟头）
 
 - **坐标换算**必须用真实帧尺寸且等画布收敛（宽 >900 且连续两次采样一致、帧宽=视口宽、条带差 0 或 88 二选一稳定）；reload 后有中间尺寸陈旧帧，只看显示矩形会算出负坐标。
@@ -327,3 +365,15 @@
 - 未采纳（记待议）：**字符归文本键盘模型**（无修饰普通字符走 input 事件整段送 text，IME 类问题从源头消失）——RIG 现行桌面打字路径已验证可用，重构回归风险大，暂缓；若日后输入法问题复发再议。
 - 未采纳（结构性差异）：帧流零解码透传 + 「观看端取走才 ack」背压——RIG 因 chrome 合成必须解码重编码，多一层是结构性的；真要优化先量
 ...[truncated 2119 chars]
+## 帧尺寸以 JPEG 自身为准；跨源图片「复制图片」
+
+- **screencast 元数据 `deviceWidth/Height` 不可信**：与 JPEG 真实尺寸常对不上。整页帧的 WS 透传路径把元数据尺寸写进 8 字节帧头、观看端 canvas 按它重设尺寸，归类也按它——尺寸错了画面就忽大忽小。现读 JPEG SOF 段（`jpeg_dims`，不解码）得到真实宽高，归类与帧头都用它，元数据只留给滚动/缩放。
+- **右键「复制图片」对跨源图片原先静默失败**：页内 canvas 被污染读不到像素 → 不出该菜单项 → 用户点了文本「复制」，选区为空，弹出空的手动复制框。现回落 `Page.getResourceContent`（按 url 在资源树里找 frameId）取缓存字节，再页内 `createImageBitmap` 重绘成 PNG；文本复制选区为空时只提示，不再弹空框。
+- 编码器日志里 1910x772↔1280x712↔1280x800 的交替是用户在菜单里切「跟随窗口/固定」造成的（1280x712 是清除仿真后的默认窗口），不是视频跳动本身。
+
+## 操作与呈现解耦（2026-11-21）
+
+- **异步事件订阅者不能当“先于后续响应”的依据**：变化日志最初用 `broadcast` 订阅，点击后紧跟的 `observe` 可能赶在订阅任务被调度前判成“没变”。改成 CDP 读泵里的同步钩子（`Cdp::tap`）：同一连接上事件总先于其后的响应被读到，先记账后放行响应，顺序确定，也就没有 Lagged 丢事件。
+- **“没收到通知”≠“页面没变”**：滚动、CSS 动画、`:hover` 没有任何 DOM 事件（探针实测滚动零事件）。“没变”判断必须同时看视口状态，且只在调用方显式带 `since_frame` 时启用；权威快照仍是不带 `since_frame` 的 observe。
+- **不要依赖 `Accessibility.nodesUpdated`**：Chromium 156 下 getFullAXTree/getPartialAXTree 之后做各种改动都从未触发。
+- **测试里的页面定时器要留足余量**：`setTimeout 1200ms` 的变化会抢在基线 observe 之前发生，“没变”断言随机失败；定时拉到 5s、等 5.5s 后稳定（3/3）。

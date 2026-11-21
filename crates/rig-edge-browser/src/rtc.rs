@@ -535,9 +535,11 @@ const DC_CHUNK_MAX: usize = 16 * 1024;
 /// T01 有界 DC 待发队列：按“整条旧代次”管理——超限时丢弃全部
 /// 旧帧并请求一次全量重同步，绝不丢单个分片（seq 连续性要求，
 /// 丢片段会让后续 seq 永远对不上）。
-/// 上限：总字节 4MB、总分片 512、队首驻留 5s。
-const DC_PENDING_MAX_BYTES: usize = 4 * 1024 * 1024;
-const DC_PENDING_MAX_FRAMES: usize = 512;
+/// 上限：总字节 16MB、总分片 1280、队首驻留 5s。
+/// （真实页面快照可达 5MB+：YouTube 内联 CSS 4.7MB，4MB 上限会让它永远
+/// 进不了队、反复重同步，观看端 8s 超时回落视频。）
+const DC_PENDING_MAX_BYTES: usize = 16 * 1024 * 1024;
+const DC_PENDING_MAX_FRAMES: usize = 1280;
 const DC_PENDING_MAX_AGE: Duration = Duration::from_secs(5);
 /// 旧代次丢弃后重发 resync 请求的冷却（防慢消费者持续触发风暴）
 const DC_RESYNC_COOLDOWN: Duration = Duration::from_secs(5);
@@ -1113,11 +1115,11 @@ mod pending_tests {
     fn repeated_snapshots_stay_bounded() {
         let mut q = DcPending::new();
         let t = Instant::now();
-        // 4MB 上限：前 4 条 1MB 入队不触发（边界：bytes==MAX 不算超限）
-        for _ in 0..4 {
-            assert!(!q.push_msg(vec![mb(1)], t), "4MB 以内不得丢弃");
+        // 16MB 上限：前 16 条 1MB 入队不触发（边界：bytes==MAX 不算超限）
+        for _ in 0..16 {
+            assert!(!q.push_msg(vec![mb(1)], t), "16MB 以内不得丢弃");
         }
-        assert_eq!(q.bytes, 4 * 1024 * 1024);
+        assert_eq!(q.bytes, 16 * 1024 * 1024);
         // 第 5 条触发旧代次整体丢弃，只剩新来的 1MB
         assert!(q.push_msg(vec![mb(1)], t), "超限必须丢弃旧代次");
         assert_eq!(q.bytes, 1024 * 1024, "丢弃后只剩新代次");
@@ -1129,7 +1131,7 @@ mod pending_tests {
     fn single_oversize_message_is_rejected() {
         let mut q = DcPending::new();
         let t = Instant::now();
-        assert!(q.push_msg(vec![mb(5)], t));
+        assert!(q.push_msg(vec![mb(17)], t));
         assert_eq!(q.bytes, 0, "超大单条不得入队");
         assert!(q.q.is_empty());
     }

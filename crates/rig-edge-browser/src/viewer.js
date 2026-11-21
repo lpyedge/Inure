@@ -95,11 +95,11 @@ window.__rig = { domStats: __domStats, rtcStop: () => rtcStop() };
    快照可达 1.6MB）发 dom-chunk 帧序列，拼回整条再走原处理；
    WS 不分片，同一入口无害 */
 const chunkBuf = new Map();
-/* D03 有界：残缺包 10s 过期回收、最多 16 个在途重组、总量 8MB；
+/* D03 有界：残缺包 10s 过期回收、最多 16 个在途重组、总量 16MB；
    跨 RTC 会话换代时 clear（见 rtcStop）。超限/过期一律丢弃并
    请求全量快照，不拿半条拼。序号/数量/类型先校验，不信任远端。 */
 const CHUNK_MAX_N = 4096, CHUNK_MAX_ENTRIES = 16;
-const CHUNK_MAX_BYTES = 8 * 1024 * 1024, CHUNK_TTL_MS = 10000;
+const CHUNK_MAX_BYTES = 16 * 1024 * 1024, CHUNK_TTL_MS = 10000;
 let chunkBytes = 0;
 function chunkSweep(now) {
   let expired = false;
@@ -224,8 +224,10 @@ function fbScrollReset() {
 function fbScroll(dy) {
   fbScrollDy = Math.max(-2400, Math.min(2400, fbScrollDy + dy));
   const t = 'translateY(' + (-fbScrollDy) + 'px)';
+  /* 只预览画布（WS 帧）：每张真帧到达即归位（见 onmessage）。RTC/HLS 的
+     <video> 是连续流、没有「真帧到达」可归位的时机，预览位移会叠在流自身的
+     滚动之上——连续滚动时画面被双倍位移、停手 180ms 后又整体弹回 */
   if (cv.style.display !== 'none') cv.style.transform = t;
-  if (vid.style.display !== 'none') vid.style.transform = t;
   clearTimeout(fbScrollTimer);
   fbScrollTimer = setTimeout(fbScrollReset, 180); /* 帧流追上后归位 */
 }
@@ -313,7 +315,7 @@ ime.addEventListener('paste', e => {
    时弹手动复制框（文本已填好选好）。粘贴靠真实 paste 事件
    （clipboardData 直送），与安全上下文无关。 */
 function deliverLocalText(text) {
-  if (!text) { showCopyBox(''); return; }
+  if (!text) { flashHint('没有选中的文字'); return; }
   if (navigator.clipboard && navigator.clipboard.writeText) {
     navigator.clipboard.writeText(text)
       .then(() => flashHint('已复制 ' + text.length + ' 字'))
@@ -493,6 +495,18 @@ function reportSize() {
 }
 addEventListener('resize', reportSize);
 reportSize();
+/* 尺寸心跳：边缘处理 resize 时若恰逢会话切换/瞬时失败会静默丢弃，而本端
+   已按「已发送」去重不再重发，远端视口就卡在旧尺寸（视频被缩小显示）。
+   每 3s 核对：舞台尺寸变了就走 reportSize，没变就重报一次；边缘只在视口真不一致时才应用 */
+setInterval(() => {
+  const [w, h] = stageSize();
+  /* 只让「正被使用」的观看端发心跳：多个观看端（另一标签/设备）共用一个
+     边缘视口，后台页也心跳就会持续互相抢视口，视频随之忽大忽小 */
+  if (ws.readyState !== 1 || document.visibilityState !== 'visible' || !document.hasFocus()) return;
+  /* 舞台尺寸变了但没有窗口 resize 事件（头部/标签栏重排等）也要报 */
+  if (w !== rzSentW || h !== rzSentH) reportSize();
+  else send({type:'resize', w, h});
+}, 3000);
 /* WebRTC 主路（Phase 1c；音频与优先级按 LIU 2026-11-19 口径修订）：
    WS 开后即尝试 rtc-start，连通后 video 显示 RTC 流（服务端同步停发
    本连接的 WS 帧）；失败/断开自动回退 canvas。AV 呈现 WebRTC 优先
@@ -555,6 +569,10 @@ function rtcStop() {
   showDisplay();
 }
 function rtcStart() {
+  /* ws 未就绪不建 pc：send 在 ws 未开时静默丢弃 rtc-start，pc 却已
+     创建，随后 ws open 回调的 rtcStart 因 pc 已存在直接返回——offer
+     永远不来，8s 后落到 HLS。pollAv 的 fetch 先于 ws 握手返回时必现 */
+  if (ws.readyState !== 1) return;
   if (pc || avVia === 'hls' || !window.RTCPeerConnection) return;
   pc = new RTCPeerConnection();
   /* rig-dom 数据通道：DOM 模式下快照/差分优先走这里（可靠有序），
@@ -751,10 +769,10 @@ let mirMap = new Map();
    下一次导航（快照 URL 变化）为止；右键菜单可关自动模式 */
 let modeAuto = true, modeLock = false, lastSnapUrl = '';
 /* U03 自适应迟滞：临界比例 + 单快照抖动曾导致视频/DOM 反复横跳
-   （伴随 AV 开关）。自动裁决需连续 2 次一致、且距上次自动切换
-   超过 3s 才执行；手动锁定仍是最高优先级 */
-let autoWant = null, autoStable = 0, lastAutoSwitch = 0;
-const AUTO_STABLE_N = 2, AUTO_MIN_INTERVAL_MS = 3000;
+   （伴随 AV 开关）。自动裁决需持续 3s、且距上次自动切换
+   超过 3s 才执行（每页首次裁决立即生效）；手动锁定仍是最高优先级 */
+let autoWant = null, autoSince = 0, lastAutoSwitch = 0, autoTimer = 0, autoFlips = 0;
+const AUTO_HOLD_MS = 3000, AUTO_MIN_INTERVAL_MS = 3000, AUTO_MAX_FLIPS = 2;
 function snapStats(tree, vw, vh) {
   let region = 0, video = 0, canvas = 0, interactive = 0;
   const walk = (n) => {
@@ -774,7 +792,7 @@ function onSnapAuto(m) {
   if (m.url) {
     if (lastSnapUrl && m.url !== lastSnapUrl) {
       modeLock = false; /* 导航解锁 */
-      autoWant = null; autoStable = 0; /* 导航清零迟滞计数 */
+      autoWant = null; autoFlips = 0; clearTimeout(autoTimer); /* 导航清零迟滞状态 */
     }
     lastSnapUrl = m.url;
   }
@@ -786,16 +804,29 @@ function onSnapAuto(m) {
      表单页靠交互密度被救回 DOM，视频页交互稀少维持视频 */
   const wantDom = !((st.video > 0.10 && st.interactive < 3) || st.region > 0.30 || st.canvas > 0.20);
   window.__rigAuto = { ...st, wantDom, url: m.url || '' };
-  if (wantDom !== autoWant) { autoWant = wantDom; autoStable = 1; }
-  else autoStable++;
-  if (autoStable < AUTO_STABLE_N) return; /* 单次快照不翻转 */
-  if (Date.now() - lastAutoSwitch < AUTO_MIN_INTERVAL_MS) return;
+  /* 迟滞按“裁决持续时间”而不是快照个数：静态页只推一次快照，
+     数快照会永远等不到第二次（审查整改引入的回归）。每页首次裁决
+     立即生效；同页内翻转需新裁决持续 AUTO_HOLD_MS 且距上次自动
+     切换 ≥ AUTO_MIN_INTERVAL_MS，期间由定时器复核，不依赖新快照 */
+  const now = Date.now();
+  const first = autoWant === null;
+  if (wantDom !== autoWant) { autoWant = wantDom; autoSince = now; }
+  clearTimeout(autoTimer);
+  const need = first ? 0 : Math.max(AUTO_HOLD_MS - (now - autoSince),
+    AUTO_MIN_INTERVAL_MS - (now - lastAutoSwitch), 0);
+  if (need > 0) { autoTimer = setTimeout(() => onSnapAuto(m), need); return; }
+  /* 每次导航最多自动切 2 次（首判 + 一次校正，如 SPA 先出壳后出视频）：
+     B站/YouTube 的广告、播放器重排会让面积判据在阈值附近来回穿越，
+     不封顶就是「视频/DOM 反复切、画面忽大忽小」；之后交给用户手动 */
+  if (autoFlips >= AUTO_MAX_FLIPS) return;
   if (wantDom && !domOn) {
-    lastAutoSwitch = Date.now();
+    autoFlips++;
+    lastAutoSwitch = now;
     domStart(true); flashHint('自动模式：已切换到 DOM');
   }
   else if (!wantDom && domOn) {
-    lastAutoSwitch = Date.now();
+    autoFlips++;
+    lastAutoSwitch = now;
     exitDomDisplay(); flashHint('自动模式：已切换到视频');
   }
 }
@@ -1477,5 +1508,12 @@ if (new URLSearchParams(location.search).get('dom') === '1') {
 /* F-08：自动模式默认起感知会话（快照到达后由 onSnapAuto 裁决
    显示模式；视频页保持视频、表单/文章页自动进 DOM） */
 ws.addEventListener('open', () => { if (modeAuto && !wantDomAuto) { wantDomAuto = true; syncDomSub(); } });
+/* 自动播放策略：取消静音时若尚无用户手势，浏览器会把 vid 暂停，
+   画面冻在最后一帧；任何点击/按键即视为手势，在影音面上恢复播放 */
+function resumeVid() {
+  if (vid.paused && avVia && vid.style.display !== 'none') vid.play().catch(() => {});
+}
+document.addEventListener('pointerdown', resumeVid, true);
+document.addEventListener('keydown', resumeVid, true);
 pollAv();
 ime.focus();

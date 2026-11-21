@@ -96,7 +96,23 @@ AI 与 Viewer 永远看不到物理像素。
    - Observer 维护最近 N 帧的环形缓冲（建议 N=8，可配置）；被淘汰的帧视为过期。
 4. **策略**：`Navigate` 受目标的 `allowed_origins` 约束；高风险动作按策略要求人确认（`NeedsConfirmation`）。
 
-> 被拒绝的动作不会静默重试。AI 收到 `StaleFrame` 后应重新观察。
+> 被拒绝的动作不会静默重试。
+
+### 6.1 动作前的单元素快速复核与拒绝回包（边缘实现，不改 `rig-proto` 类型）
+
+- **快速复核**：含元素目标、且请求帧就是最新存储帧、主文档 `loaderId` 未变、目标在主会话时，
+  边缘只向浏览器取**该元素自己**的 AX 节点、DOM 属性和位置（`Accessibility.getPartialAXTree`、
+  `DOM.describeNode`、`DOM.getContentQuads`，约 4 次调用），用与整页构建**同一个**转换
+  （`snapshot::element_core`）算出元素，再与存储帧中的同一元素做 `element_unchanged`（容差 2px）。
+  一致才直接沿用存储帧，省掉整页重采。
+- **快路径只确认、不裁决**：不一致、出错、或不适用（请求帧不是最新、已换文档、目标在子帧会话）
+  一律退回整页快照，由原有校验决定接受或拒绝。因此不会多误拒，也不会放过变化。
+- 复核发生在 `scroll_into_view` 之前（滚动后位置本来就会变）。命中/退回次数见 `/health` 的
+  `act_precheck.fast_hit / fast_miss`。
+- **拒绝回包**：被拒原因为页面状态不符（`StaleFrame`、`UnknownElement`、`NotInteractable`、`OutOfBounds`）时，
+  响应在 `result` 之外由边缘附带最新页面状态，调用方不必再补一次 `observe`：请求帧仍在历史池 → `delta`
+  （增量）+ `text`；否则 `observation`（整帧）+ `text`。刚采的帧（<500ms）直接复用，不重采。
+  MCP 在拒绝时多附一个文本块（增量时再附一个 delta 块）。成功、`Aborted`、`PolicyDenied` 不附带。
 
 ## 7. 人与 AI 的对应
 
@@ -268,3 +284,25 @@ canvas 0%/63,671、100%/5,534；iframe 0%/70,842、0%/37,755。
 
 很薄的一层，提供 `observe` / `act` / `subscribe`（以及标注读取）。**渲染面向模型的文本时负责不可信内容的分隔与声明（§11）。**
 MCP 不是底层依赖：核心与 Observer 不依赖它。
+
+## 8. 操作与呈现解耦（2026-11-21）
+
+**原则**：操作（`act`）只回答“动作有没有执行”；页面因此变成什么样是**呈现**，由变化检测驱动，
+人/AI/页面自己引起的变化一视同仁。
+
+- **`act` 不再做动作后整页刷新**。`ActionResult::Done.frame_id` 是**动作所基于的校验帧**（不是动作之后的新帧）。
+  需要新状态时调用方 `observe`，带 `since_frame = Done.frame_id` 取增量。
+- **变化日志**（`changes.rs`）：CDP 读泵里同步把结构类通知（`DOM.attributeModified`/`childNodeInserted`/
+  `childNodeRemoved`/`characterDataModified`/`inlineStyleInvalidated`、`DOM.documentUpdated`、
+  `Page.frameNavigated`/`navigatedWithinDocument` 等）记入有界环形日志；基线被淘汰、变化节点过多按“整页变了”处理。
+  同步写入保证事件先于其后的命令响应被记账，没有异步队列也就没有溢出丢事件。
+- **`observe(since_frame)` 的“没变”判断**：`since_frame` 是最新存储帧，且自该帧采集起 ①主文档没换
+  ②无结构类通知 ③视口（pageX/pageY/宽/高）没变 → 回空增量（`frame_id == base_frame`），**不采集**
+  （`/health` 的 `changes.observe_unchanged` 计数）；否则重新采集并回增量/整帧。不带 `since_frame` 的 observe
+  始终是权威采集。
+- **实测依据**（真 Chromium 156，探针 9 场景）：文字/属性/插入/删除/整页跳转/pushState 都有通知且能定位节点；
+  文字变化表现为“删旧文本节点+插新文本节点”（父节点受影响）；**滚动没有任何通知**（所以另读视口状态）；
+  `Accessibility.nodesUpdated` 在所有条件下都未触发，不使用。
+- **已知盲区**：不改 DOM 的纯视觉变化（CSS 动画、`:hover` 显隐）浏览器不通知，“没通知”只代表 DOM 结构与属性
+  没变。需要最新几何的路径（动作前复核）自己现查；想要权威快照的调用方不带 `since_frame`。
+  局部变化目前仍整页重采（只在“没变/换页”两端省采集）；按节点局部补算留待量测后再做。

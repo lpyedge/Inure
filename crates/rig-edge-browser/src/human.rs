@@ -28,8 +28,67 @@ pub struct FrameMsg {
     pub height: u32,
 }
 
-/// 最近合成帧的共享槽：帧本体 + 合成时刻（F-04 的 Arc 共享）
-type LastRgbSlot = Arc<std::sync::Mutex<Option<(Arc<image::RgbImage>, std::time::Instant)>>>;
+/// 整页帧的 RGB，按需解码：帧泵只存原始 JPEG，真有消费者
+/// （RTC/HLS 编码层、V02 贴图底图）取用时才解码 + 归一化，且同一帧
+/// 只解一次（OnceLock）。没人看视频时帧泵不再为每帧付 RGB 解码。
+pub(crate) struct LazyRgb {
+    raw: Arc<Vec<u8>>,
+    /// 归一化目标（已取偶）；0 表示不缩放
+    target: (u32, u32),
+    cell: std::sync::OnceLock<Option<Arc<image::RgbImage>>>,
+}
+
+impl LazyRgb {
+    fn lazy(raw: Arc<Vec<u8>>, target: (u32, u32)) -> Arc<Self> {
+        Arc::new(Self {
+            raw,
+            target,
+            cell: std::sync::OnceLock::new(),
+        })
+    }
+
+    /// 已就绪的 RGB（合成路径产出，无需再解码）
+    fn ready(img: image::RgbImage) -> Arc<Self> {
+        let cell = std::sync::OnceLock::new();
+        let _ = cell.set(Some(Arc::new(img)));
+        Arc::new(Self {
+            raw: Arc::new(Vec::new()),
+            target: (0, 0),
+            cell,
+        })
+    }
+
+    pub(crate) fn get(&self) -> Option<Arc<image::RgbImage>> {
+        self.cell
+            .get_or_init(|| {
+                let t = std::time::Instant::now();
+                let mut rgb = decode_jpeg_rgb(&self.raw)?;
+                // 编码层（yuv420p）要求偶数边：奇数边裁掉最后一行/列
+                // （≤1px，坐标映射无感）
+                let (ew, eh) = (rgb.width() & !1, rgb.height() & !1);
+                if ew > 0 && eh > 0 && (ew != rgb.width() || eh != rgb.height()) {
+                    rgb = image::imageops::crop_imm(&rgb, 0, 0, ew, eh).to_image();
+                }
+                // 归一化到基准尺寸：整页帧自身有几像素的高度变体
+                // （如 1078/1055），不归一编码层仍会偶发重建
+                let (tw, th) = self.target;
+                if tw > 0 && th > 0 && (rgb.width() != tw || rgb.height() != th) {
+                    rgb = image::imageops::resize(
+                        &rgb,
+                        tw,
+                        th,
+                        image::imageops::FilterType::Triangle,
+                    );
+                }
+                crate::metrics::global().compose.record(t.elapsed());
+                Some(Arc::new(rgb))
+            })
+            .clone()
+    }
+}
+
+/// 最近合成帧的共享槽：帧本体（可能尚未解码）+ 合成时刻（F-04 的 Arc 共享）
+type LastRgbSlot = Arc<std::sync::Mutex<Option<(Arc<LazyRgb>, std::time::Instant)>>>;
 
 pub struct HumanChannel {
     browser: Arc<Browser>,
@@ -113,20 +172,140 @@ fn classify_full(w: u32, h: u32, base: (u32, u32)) -> bool {
     (fw * bh - fh * bw).abs() <= 0.05 * fw * bh
 }
 
-/// V04：在缓存矩形里找与内容帧尺寸匹配的唯一者——0 个或多个都算
-/// 无法可靠归属（多 video/canvas 尺寸接近会贴错元素），返回 None，
-/// 调用方丢弃内容帧等整页帧，不错贴。
-fn find_unique_rect(rects: &[(u32, u32, u32, u32)], w: u32, h: u32) -> Option<(u32, u32)> {
-    let mut hit = None;
-    for r in rects {
-        if (r.2 as i64 - w as i64).abs() <= 3 && (r.3 as i64 - h as i64).abs() <= 3 {
-            if hit.is_some() {
-                return None;
-            }
-            hit = Some((r.0, r.1));
+/// 稳定标签顺序：order 记录已见标签的先后；targets 按 order 重排，
+/// 未见过的追加到末尾（并登记），已关闭的从 order 中剔除。
+fn stable_tab_order(order: &mut Vec<String>, targets: &mut [(String, String, String)]) {
+    order.retain(|id| targets.iter().any(|t| &t.0 == id));
+    for t in targets.iter() {
+        if !order.contains(&t.0) {
+            order.push(t.0.clone());
         }
     }
-    hit
+    targets.sort_by_key(|t| order.iter().position(|id| id == &t.0).unwrap_or(usize::MAX));
+}
+
+/// 内容帧与底图同位置的平均绝对差上限。正常播放的相邻帧差 4~11，滚动中
+/// 贴上「滚动前位置的页面区域」的撕裂帧实测 96~106（视频整页画面被盖成
+/// 顶栏+旧内容）；取 40，场景切换偶尔丢一帧无碍（整页帧每 ~66ms 一张）。
+const PASTE_MAX_DIFF: f64 = 40.0;
+
+/// 是否把连续无法归属的同尺寸帧当作「视口真的变小后的整页帧」并重定整页基准。
+/// 内容帧只可能来自 video/canvas：页面上还有 video/canvas 矩形时，这些帧就是
+/// 视频区帧（只是暂时没匹配上，如布局切换、滚动中），重定基准会把编码器切到
+/// 视频区尺寸——观看端「视频铺满整个窗口、过会儿又缩回」（生产日志：`连续 8 帧
+/// 873x491/800x544 无法归属任何矩形` 后紧跟 `编码器就绪 872x490/800x544`）。
+/// 只有页面上没有任何 video/canvas（内容帧不可能是视频）才允许重定。
+fn should_rebase(
+    unmatched: u32,
+    frame: (u32, u32),
+    base: (u32, u32),
+    no_media_rects: bool,
+) -> bool {
+    no_media_rects && unmatched >= 8 && frame.0 * 2 >= base.0 && frame.1 * 2 >= base.1
+}
+
+/// 内容帧的 JPEG 实际尺寸必须与元数据（deviceWidth/Height）一致：Chrome 在
+/// 滚动时会发出「元数据报播放器尺寸（如 663x373）、实际是整页缩略图（663x253，
+/// 带顶栏）」的帧，按元数据匹配到视频矩形再贴上去，画面里就出现一张迷你整页
+/// （顶栏跑到画面中部、左侧空白——观看端「视频乱跳」的撕裂帧）。尺寸对不上的
+/// 内容帧不是视频内容，丢弃。
+fn content_dims_match(rw: u32, rh: u32, w: u32, h: u32) -> bool {
+    rw.abs_diff(w) <= 2 && rh.abs_diff(h) <= 2
+}
+
+/// 从 JPEG 的 SOF 段读真实宽高（不解码）。screencast 元数据尺寸与 JPEG
+/// 实际尺寸常常对不上（本机实测约三分之一内容帧、且整页帧也有），帧归类和
+/// 观看端帧头必须以 JPEG 自身为准，否则 canvas 会被元数据尺寸忽大忽小地重设。
+fn jpeg_dims(b: &[u8]) -> Option<(u32, u32)> {
+    if b.len() < 4 || b[0] != 0xFF || b[1] != 0xD8 {
+        return None;
+    }
+    let mut i = 2;
+    while i + 4 <= b.len() {
+        if b[i] != 0xFF {
+            return None;
+        }
+        let m = b[i + 1];
+        if m == 0xFF {
+            i += 1;
+            continue;
+        }
+        // 无长度段：TEM / RSTn / SOI / EOI
+        if m == 0x01 || (0xD0..=0xD9).contains(&m) {
+            i += 2;
+            continue;
+        }
+        let len = u16::from_be_bytes([b[i + 2], b[i + 3]]) as usize;
+        // SOF0..SOF15，排除 DHT(C4)/JPG(C8)/DAC(CC)
+        if (0xC0..=0xCF).contains(&m) && !matches!(m, 0xC4 | 0xC8 | 0xCC) {
+            let s = b.get(i + 5..i + 9)?;
+            let h = u16::from_be_bytes([s[0], s[1]]) as u32;
+            let w = u16::from_be_bytes([s[2], s[3]]) as u32;
+            return (w > 0 && h > 0).then_some((w, h));
+        }
+        i += 2 + len;
+    }
+    None
+}
+
+/// V04：在缓存矩形里找与内容帧尺寸匹配的候选位置（±3px）。
+fn candidate_rects(rects: &[(u32, u32, u32, u32)], w: u32, h: u32) -> Vec<(u32, u32)> {
+    rects
+        .iter()
+        .filter(|r| (r.2 as i64 - w as i64).abs() <= 3 && (r.3 as i64 - h as i64).abs() <= 3)
+        .map(|r| (r.0, r.1))
+        .collect()
+}
+
+/// 内容块与底图某位置的差异（稀疏采样的平均绝对差，越小越像）。
+fn region_diff(base: &image::RgbImage, rgb: &image::RgbImage, rx: u32, ry: u32) -> f64 {
+    let (tw, th) = (base.width(), base.height());
+    let (pw, ph) = (
+        rgb.width().min(tw.saturating_sub(rx)),
+        rgb.height().min(th.saturating_sub(ry)),
+    );
+    if pw == 0 || ph == 0 {
+        return f64::MAX;
+    }
+    let (mut sum, mut n) = (0u64, 0u64);
+    for y in (0..ph).step_by(7) {
+        for x in (0..pw).step_by(7) {
+            let a = base.get_pixel(rx + x, ry + y).0;
+            let b = rgb.get_pixel(x, y).0;
+            for c in 0..3 {
+                sum += (a[c] as i32 - b[c] as i32).unsigned_abs() as u64;
+            }
+            n += 3;
+        }
+    }
+    sum as f64 / n.max(1) as f64
+}
+
+/// V04：唯一候选直接用；多个同尺寸候选（如首页两个预览视频）靠
+/// 与干净底图的像素相似度裁决——正在播的那个，新帧与上一整页帧里
+/// 同位置内容最接近。最优不显著优于次优（<0.8 倍）就无法可靠归属，
+/// 返回 None，调用方丢弃内容帧等整页帧，不错贴。
+fn pick_rect(
+    cands: &[(u32, u32)],
+    base: &image::RgbImage,
+    rgb: &image::RgbImage,
+) -> Option<(u32, u32)> {
+    match cands {
+        [] => None,
+        [one] => Some(*one),
+        many => {
+            let mut scored: Vec<(f64, (u32, u32))> = many
+                .iter()
+                .map(|&(x, y)| (region_diff(base, rgb, x, y), (x, y)))
+                .collect();
+            scored.sort_by(|a, b| a.0.total_cmp(&b.0));
+            if scored[0].0 < scored[1].0 * 0.8 {
+                Some(scored[0].1)
+            } else {
+                None
+            }
+        }
+    }
 }
 
 /// V02：在干净整页底图上贴内容块（越界裁剪），返回合成帧。
@@ -357,7 +536,9 @@ impl HumanChannel {
     /// 最近一帧的合成后 RGB（编码层在自己的线程里同步取用；
     /// Arc 共享，取用不拷贝像素）
     pub fn last_rgb(&self) -> Option<(Arc<image::RgbImage>, std::time::Instant)> {
-        self.last_rgb.lock().unwrap().clone()
+        // 先放锁再解码：解码可能几毫秒，不能占着槽锁
+        let (lazy, at) = self.last_rgb.lock().unwrap().clone()?;
+        Some((lazy.get()?, at))
     }
 
     /// F-03 需求记账：一个连接进入/离开 WS 帧流显示模式时调用
@@ -481,6 +662,9 @@ impl HumanChannel {
                 let mut gate_full = (0u32, 0u32);
                 let mut gate_rects: Vec<(u32, u32, u32, u32)> = Vec::new();
                 let mut gate_rects_for = (0u32, 0u32);
+                // 最近一次取几何时页面上是否有 video/canvas（含部分滚出视口、被候选
+                // 过滤掉的）：重定基准的唯一前提是页面上根本没有媒体元素
+                let mut gate_has_media = false;
                 let mut gate_scroll = (0i64, 0i64);
                 let mut gate_view: Option<String> = None;
                 // 页面当前视口缓存（缩型整页帧重定基准用，500ms
@@ -489,6 +673,8 @@ impl HumanChannel {
                 let mut gate_vp_at = std::time::Instant::now() - std::time::Duration::from_secs(1);
                 // V01 rect 缓存取样时刻（TTL 过期强制重取，见下）
                 let mut gate_rects_at = std::time::Instant::now();
+                // 连续「归属不上任何矩形」的同尺寸帧：((w,h), 连续个数)，见内容帧分支末尾
+                let mut unmatched: ((u32, u32), u32) = ((0, 0), 0);
                 // O01：帧泵定期汇总（30s）：full/content/pasted/dropped/
                 // refetch 计数 + 最近一次 rect 取样。逐次打取样日志
                 // 会刷屏（视频页 TTL 到期即打），只留计数与最近几何。
@@ -600,6 +786,8 @@ impl HumanChannel {
                     let Ok(raw) = base64::engine::general_purpose::STANDARD.decode(b64) else {
                         continue;
                     };
+                    // 尺寸以 JPEG 自身为准（见 jpeg_dims）：元数据只用于滚动/缩放
+                    let (w, h) = jpeg_dims(&raw).unwrap_or((w, h));
                     let raw = Arc::new(raw);
                     *last_raw.lock().await = Some(raw.clone());
                     // ── 帧分类（2026-11-20 LIU 实测「视频不停跳
@@ -673,12 +861,28 @@ impl HumanChannel {
                         }
                         // 内容帧：贴回合成（找不到唯一匹配矩形/尚无
                         // 整页底图时丢弃，整页帧随后就到）
-                        if let Some(mut rgb) = decode_jpeg_rgb(&raw) {
+                        let pasted_before = crate::metrics::global()
+                            .pump_pasted
+                            .load(std::sync::atomic::Ordering::Relaxed);
+                        let decoded = decode_jpeg_rgb(&raw);
+                        // 元数据尺寸与 JPEG 实际尺寸对不上的帧（实测 35% 的内容帧：
+                        // meta=663x373 jpeg=663x253 整页缩略图、meta=873x491
+                        // jpeg=1280x800 整页帧…）按任何一方归类都会错：直接丢弃，
+                        // 且不计入「无法归属」连续计数（否则会据此误重定基准）
+                        if let Some(d) = &decoded {
+                            if !content_dims_match(d.width(), d.height(), w, h) {
+                                crate::metrics::global()
+                                    .pump_dropped
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                continue;
+                            }
+                        }
+                        if let Some(mut rgb) = decoded {
                             let (ew, eh) = (rgb.width() & !1, rgb.height() & !1);
                             if ew > 0 && eh > 0 && (ew != rgb.width() || eh != rgb.height()) {
                                 rgb = image::imageops::crop_imm(&rgb, 0, 0, ew, eh).to_image();
                             }
-                            let mut rect = None;
+                            let mut cands: Vec<(u32, u32)> = Vec::new();
                             // V01：缓存只在 TTL 内可信——元素在无滚动的
                             // reflow 中移动/改尺寸时缓存不自知，过期必须
                             // 重取几何，不能按旧 rect 贴（P1 主因之首）
@@ -686,14 +890,22 @@ impl HumanChannel {
                                 && gate_rects_at.elapsed()
                                     <= std::time::Duration::from_millis(RECT_TTL_MS)
                             {
-                                rect = find_unique_rect(&gate_rects, w, h);
+                                cands = candidate_rects(&gate_rects, w, h);
                             }
-                            if rect.is_none() {
+                            if cands.is_empty() {
                                 let expr = "(() => { const out = []; for (const el of document.querySelectorAll('video,canvas')) { const r = el.getBoundingClientRect(); if (r.width > 1 && r.height > 1) out.push([r.x, r.y, r.width, r.height]); } return out; })()";
                                 if let Ok(Value::Array(a)) = browser.eval_json(&session, expr).await
                                 {
+                                    gate_has_media = !a.is_empty();
                                     gate_rects = a
                                         .iter()
+                                        // 部分滚出视口的元素（x/y 为负）不作候选：`as u32`
+                                        // 会把负坐标钳成 0，内容帧被贴到左上角，盖住真画面
+                                        .filter(|r| {
+                                            r.get(0).and_then(Value::as_f64).unwrap_or(0.0) >= 0.0
+                                                && r.get(1).and_then(Value::as_f64).unwrap_or(0.0)
+                                                    >= 0.0
+                                        })
                                         .map(|r| {
                                             let g = |i: usize| {
                                                 r.get(i).and_then(Value::as_f64).unwrap_or(0.0)
@@ -715,23 +927,41 @@ impl HumanChannel {
                                     // 时输出（含自带 sf 口径，可辨错缩放）
                                     last_rect_sample =
                                         format!("{w}x{h} sf={sf} rects={gate_rects:?}");
-                                    rect = find_unique_rect(&gate_rects, w, h);
+                                    cands = candidate_rects(&gate_rects, w, h);
                                 }
                             }
-                            if let Some((rx, ry)) = rect {
+                            if !cands.is_empty() {
                                 // V02：在干净整页底图上贴，不在上次合成结果
                                 // 上叠加——旧位置残影的根因。底图缺失/尺寸
                                 // 不对就丢弃，等新基准（整页帧随后就到）。
-                                let base = full_base.lock().unwrap().clone();
+                                let base = full_base
+                                    .lock()
+                                    .unwrap()
+                                    .clone()
+                                    .and_then(|(b, at)| Some((b.get()?, at)));
                                 match base {
                                     Some((base, _))
                                         if base.width() == (gate_full.0 & !1)
                                             && base.height() == (gate_full.1 & !1)
                                             && gate_full.0 > 0 =>
                                     {
+                                        let Some((rx, ry)) = pick_rect(&cands, &base, &rgb) else {
+                                            crate::metrics::global()
+                                                .pump_dropped
+                                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                            continue;
+                                        };
+                                        if region_diff(&base, &rgb, rx, ry) > PASTE_MAX_DIFF {
+                                            crate::metrics::global()
+                                                .pump_dropped
+                                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                            continue;
+                                        }
                                         let canvas = compose_on_clean(&base, &rgb, rx, ry);
-                                        *last_rgb.lock().unwrap() =
-                                            Some((Arc::new(canvas), std::time::Instant::now()));
+                                        *last_rgb.lock().unwrap() = Some((
+                                            LazyRgb::ready(canvas),
+                                            std::time::Instant::now(),
+                                        ));
                                         rgb_seq.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                                         crate::metrics::global()
                                             .pump_pasted
@@ -749,8 +979,35 @@ impl HumanChannel {
                                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             }
                         }
+                        // 重定基准：连续 8 帧同尺寸、都没能归属任何矩形、且不小于基准
+                        // 一半——那不是内容帧，是视口真的变小后的整页帧（新标签抢前台
+                        // 又切回后，Chrome 出的整页帧可能比旧基准小；基准只增不减时
+                        // 会把它们全当内容帧丢弃，观看画面就此冻结）。
+                        let pasted_now = crate::metrics::global()
+                            .pump_pasted
+                            .load(std::sync::atomic::Ordering::Relaxed);
+                        if pasted_now != pasted_before {
+                            unmatched = ((0, 0), 0);
+                        } else {
+                            if unmatched.0 == (w, h) {
+                                unmatched.1 += 1;
+                            } else {
+                                unmatched = ((w, h), 1);
+                            }
+                            if should_rebase(unmatched.1, (w, h), gate_full, !gate_has_media) {
+                                eprintln!(
+                                    "[pump] 连续 {} 帧 {w}x{h} 无法归属任何矩形：整页基准 {}x{} 重定为新尺寸",
+                                    unmatched.1, gate_full.0, gate_full.1
+                                );
+                                gate_full = (w, h);
+                                gate_rects.clear();
+                                gate_rects_for = (0, 0);
+                                unmatched = ((0, 0), 0);
+                            }
+                        }
                         continue;
                     }
+                    unmatched = ((0, 0), 0);
                     // 整页帧：更新基准（只长不缩，真实改尺寸靠
                     // 会话切换/重开投屏复位）与滚动失效缓存
                     if w > 0 && h > 0 {
@@ -788,34 +1045,13 @@ impl HumanChannel {
                             .frames_sent
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
-                    let t_decode = std::time::Instant::now();
-                    let decoded = decode_jpeg_rgb(&raw);
-                    crate::metrics::global().compose.record(t_decode.elapsed());
-                    if let Some(mut rgb) = decoded {
-                        // 编码层（yuv420p）要求偶数边：奇数边裁
-                        // 掉最后一行/列（≤1px，坐标映射无感）
-                        let (ew, eh) = (rgb.width() & !1, rgb.height() & !1);
-                        if ew > 0 && eh > 0 && (ew != rgb.width() || eh != rgb.height()) {
-                            rgb = image::imageops::crop_imm(&rgb, 0, 0, ew, eh).to_image();
-                        }
-                        // 归一化到基准尺寸：整页帧自身有几像素的
-                        // 高度变体（如 1078/1055），不归一编码层
-                        // 仍会偶发重建
-                        let (tw, th) = (gate_full.0 & !1, gate_full.1 & !1);
-                        if tw > 0 && th > 0 && (rgb.width() != tw || rgb.height() != th) {
-                            rgb = image::imageops::resize(
-                                &rgb,
-                                tw,
-                                th,
-                                image::imageops::FilterType::Triangle,
-                            );
-                        }
-                        *last_rgb.lock().unwrap() =
-                            Some((Arc::new(rgb), std::time::Instant::now()));
-                        // V02 干净底图：只由整页路径更新
-                        *full_base.lock().unwrap() = last_rgb.lock().unwrap().clone();
-                        rgb_seq.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    }
+                    // RGB 解码推迟到有消费者取用时（LazyRgb），帧泵只记原始 JPEG
+                    let lazy = LazyRgb::lazy(raw.clone(), (gate_full.0 & !1, gate_full.1 & !1));
+                    let slot = Some((lazy, std::time::Instant::now()));
+                    *last_rgb.lock().unwrap() = slot.clone();
+                    // V02 干净底图：只由整页路径更新
+                    *full_base.lock().unwrap() = slot;
+                    rgb_seq.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 }
             });
         }
@@ -830,7 +1066,14 @@ impl HumanChannel {
             let notices = self.notices.clone();
             let last_state_json = self.last_state_json.clone();
             let flag = flag.clone();
+            let human = self.clone();
             tokio::spawn(async move {
+                let mut known_ids: Vec<String> = Vec::new();
+                let mut tab_order: Vec<String> = Vec::new();
+                let mut last_sent = 0u64;
+                let mut stale_ticks = 0u32;
+                let mut last_activate =
+                    std::time::Instant::now() - std::time::Duration::from_secs(10);
                 loop {
                     if !flag.load(Ordering::SeqCst) {
                         break;
@@ -839,13 +1082,66 @@ impl HumanChannel {
                     if !flag.load(Ordering::SeqCst) {
                         break;
                     }
-                    let Ok(targets) = browser.page_targets().await else {
+                    let Ok(mut targets) = browser.page_targets().await else {
                         continue;
                     };
+                    // 标签栏顺序必须稳定：Target.getTargets 的返回顺序由 Chrome 决定
+                    // （新建/切换后最近活动的会排前面），直接用会让标签栏随切换重排、
+                    // 新建标签落在第一位。保留已有标签的相对顺序，新标签追加到末尾。
+                    stable_tab_order(&mut tab_order, &mut targets);
                     let view_target = match view_session.lock().await.clone() {
                         Some(sid) => browser.target_id_of(&sid).await,
                         None => None,
                     };
+                    // 页面 window.open / target=_blank 开了新标签：新标签抢走前台，
+                    // 观看标签变后台，Chrome 对后台页不再出 screencast 帧，观看画面
+                    // 冻结。新标签自己的激活可能晚于我们的一次激活，所以不能只在
+                    // "新标签出现"时激活一次：自拉起的浏览器里，标签多于 1 个且帧数
+                    // 停滞，就（至多每 3s）把观看标签切回前台。挂靠用户自己的浏览器
+                    // 不做——那会反复抢用户的前台。
+                    let sent = crate::metrics::global()
+                        .frames_sent
+                        .load(std::sync::atomic::Ordering::Relaxed);
+                    if sent != last_sent {
+                        last_sent = sent;
+                        stale_ticks = 0;
+                    } else {
+                        stale_ticks += 1;
+                    }
+                    let ids: Vec<String> = targets.iter().map(|t| t.0.clone()).collect();
+                    let appeared = ids.iter().any(|i| !known_ids.contains(i));
+                    // 观看标签开出新标签（链接 target=_blank / window.open）：像真浏览器
+                    // 一样跟过去——新标签在前台才会加载出帧，留在旧标签等于看不到
+                    // 也加载不了（用户实测要手动刷新）。只跟本观看标签开的，且
+                    // 首轮（known_ids 为空）的既有标签不算。
+                    let mut followed = false;
+                    if appeared && !known_ids.is_empty() {
+                        if let Some(vt) = view_target.as_ref() {
+                            let popups = browser.new_popups(vt, &known_ids).await;
+                            if let Some(p) = popups.last() {
+                                followed = human.switch_view(p).await.is_ok();
+                            }
+                        }
+                    }
+                    known_ids = ids;
+                    let view_target = if followed {
+                        match view_session.lock().await.clone() {
+                            Some(sid) => browser.target_id_of(&sid).await,
+                            None => None,
+                        }
+                    } else {
+                        view_target
+                    };
+                    if targets.len() > 1
+                        && (appeared || stale_ticks >= 2)
+                        && last_activate.elapsed() >= std::time::Duration::from_secs(3)
+                        && browser.is_self_launched().await
+                    {
+                        if let Some(vt) = view_target.as_ref() {
+                            last_activate = std::time::Instant::now();
+                            let _ = browser.activate_target(vt).await;
+                        }
+                    }
                     let mut changed = false;
                     {
                         let mut st = chrome.lock().await;
@@ -954,6 +1250,17 @@ impl HumanChannel {
             self.start_screencast(&session).await?;
         }
         let _ = self.browser.activate_target(target_id).await;
+        // 静态页（刚开出来、已在前台）激活不会触发重绘，screencast 起了却一帧
+        // 不来，观看端就是旧画面。截一张小图强制出一次合成帧。
+        let _ = self
+            .browser
+            .cdp
+            .call(
+                Some(&session),
+                "Page.captureScreenshot",
+                json!({"format": "jpeg", "quality": 1}),
+            )
+            .await;
         // 当前分辨率模式落到新标签
         let res = self.chrome.lock().await.res;
         if let ResMode::Fixed(w, h) = res {
@@ -1226,12 +1533,23 @@ impl HumanChannel {
         }
         let res = self.chrome.lock().await.res;
         if res == ResMode::Auto {
-            if let Ok(session) = self.view().await {
-                let _ = self
-                    .browser
-                    .set_viewport(&session, w.clamp(320, 2560), h.clamp(240, 1600))
-                    .await;
+            let (w, h) = (w.clamp(320, 2560), h.clamp(240, 1600));
+            // 观看端会周期性重报尺寸（防一次丢失让远端视口卡在旧尺寸、
+            // 视频被缩小显示）：视口已一致就不重复设，免得无谓重排
+            let Ok(session) = self.view().await else {
+                return;
+            };
+            if let Ok(Value::Array(a)) = self
+                .browser
+                .eval_json(&session, "[window.innerWidth, window.innerHeight]")
+                .await
+            {
+                let g = |i: usize| a.get(i).and_then(Value::as_u64).unwrap_or(0) as u32;
+                if (g(0), g(1)) == (w, h) {
+                    return;
+                }
             }
+            let _ = self.browser.set_viewport(&session, w, h).await;
         }
     }
 
@@ -1504,11 +1822,35 @@ impl HumanChannel {
             "window.__rigDom && window.__rigDom.imgData ? window.__rigDom.imgData({i}) : ''"
         );
         let v = self.browser.eval_json(&session, &js).await?;
+        self.resolve_image(&session, v.as_str().unwrap_or("")).await
+    }
+
+    /// 页内取像素的结果归一为 PNG base64：`@url` 表示 canvas 被
+    /// 跨源污染读不到，改取浏览器缓存的原始字节，再在页内用
+    /// blob 解码重绘成 PNG（剪贴板只收 image/png）。
+    async fn resolve_image(&self, session: &str, raw: &str) -> Result<String, String> {
+        let Some(url) = raw.strip_prefix('@') else {
+            return Ok(raw.to_string());
+        };
+        let b64 = self.browser.image_resource_b64(session, url).await?;
+        let js = format!(
+            "(async () => {{ \
+               const bin = atob('{b64}'); \
+               const bytes = new Uint8Array(bin.length); \
+               for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i); \
+               const bmp = await createImageBitmap(new Blob([bytes])); \
+               const c = document.createElement('canvas'); \
+               c.width = bmp.width; c.height = bmp.height; \
+               c.getContext('2d').drawImage(bmp, 0, 0); \
+               return c.toDataURL('image/png').split(',')[1]; \
+             }})()"
+        );
+        let v = self.browser.eval_json(session, &js).await?;
         Ok(v.as_str().unwrap_or("").to_string())
     }
 
     /// 按视口坐标命中图片并读其像素（PNG base64）：命中 img 且
-    /// 像素可读（同源/CORS）才有数据；跨源污染读不到回空串。
+    /// 像素可读（同源/CORS）直接取；跨源经资源缓存回落，仍失败回空串。
     pub async fn image_at(&self, x: f32, y: f32) -> Result<String, String> {
         let session = self.view().await?;
         let js = format!(
@@ -1521,11 +1863,11 @@ impl HumanChannel {
                  c.width = img.naturalWidth; c.height = img.naturalHeight; \
                  c.getContext('2d').drawImage(img, 0, 0); \
                  return c.toDataURL('image/png').split(',')[1]; \
-               }} catch (e) {{ return ''; }} \
+               }} catch (e) {{ return /^https?:/.test(img.currentSrc) ? '@' + img.currentSrc : ''; }} \
              }})()"
         );
         let v = self.browser.eval_json(&session, &js).await?;
-        Ok(v.as_str().unwrap_or("").to_string())
+        self.resolve_image(&session, v.as_str().unwrap_or("")).await
     }
 
     pub async fn paste_image(&self, png_base64: &str) -> Result<(), String> {
@@ -1600,6 +1942,21 @@ fn decode_jpeg_rgb(raw: &[u8]) -> Option<image::RgbImage> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// LazyRgb：同一帧只解码一次，并按目标尺寸归一化（奇数边取偶）
+    #[test]
+    fn lazy_rgb_decodes_once_and_normalizes() {
+        let img = image::RgbImage::from_pixel(65, 33, image::Rgb([200, 30, 30]));
+        let jpeg = encode_jpeg_ffmpeg(&img).expect("编码测试 JPEG");
+        let lazy = LazyRgb::lazy(Arc::new(jpeg), (64, 32));
+        let a = lazy.get().expect("应可解码");
+        assert_eq!((a.width(), a.height()), (64, 32));
+        let b = lazy.get().unwrap();
+        assert!(Arc::ptr_eq(&a, &b), "同一帧不应重复解码");
+        assert!(LazyRgb::lazy(Arc::new(vec![1, 2, 3]), (0, 0))
+            .get()
+            .is_none());
+    }
 
     /// ffmpeg mjpeg 编码一帧 RGB → JPEG 字节（qscale 5 ≈ libjpeg
     /// quality 80 的保真度；YUVJ420P 全范围，观看端解码口径与
@@ -1754,6 +2111,49 @@ mod tests {
     /// V01/分类：90% 阈值边界。1280x800 基准下 1152x720 算整页
     /// （恰 90%，同比例）；1151 宽不算——后走缩型视口核对分支
     #[test]
+    fn region_diff_separates_stale_paste() {
+        let base = image::RgbImage::from_fn(64, 64, |x, y| {
+            image::Rgb([(x * 4) as u8, (y * 4) as u8, 90])
+        });
+        let same = base.clone();
+        let stale = image::RgbImage::from_fn(64, 64, |x, y| {
+            image::Rgb([255 - (x * 4) as u8, 255 - (y * 4) as u8, 255])
+        });
+        assert!(region_diff(&base, &same, 0, 0) <= PASTE_MAX_DIFF);
+        assert!(region_diff(&base, &stale, 0, 0) > PASTE_MAX_DIFF);
+    }
+
+    #[test]
+    fn rebase_never_with_media_rects() {
+        // 页面上有视频矩形：连续无法归属的是视频区帧，不得重定基准
+        assert!(!should_rebase(50, (873, 491), (1280, 800), false));
+        // 无 video/canvas：确是整页帧缩小（新标签抢前台后），允许
+        assert!(should_rebase(8, (900, 557), (900, 700), true));
+        assert!(!should_rebase(7, (900, 557), (900, 700), true));
+        assert!(!should_rebase(8, (300, 200), (900, 700), true));
+    }
+
+    #[test]
+    fn jpeg_dims_reads_sof() {
+        // SOI + APP0(len 4) + SOF0(len 11): 精度8 高21 宽37
+        let b = [
+            0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x04, 0x00, 0x00, 0xFF, 0xC0, 0x00, 0x0B, 0x08, 0x00,
+            0x15, 0x00, 0x25, 0x01, 0x01, 0x11, 0x00,
+        ];
+        assert_eq!(jpeg_dims(&b), Some((37, 21)));
+        assert_eq!(jpeg_dims(b"not a jpeg"), None);
+        assert_eq!(jpeg_dims(&b[..10]), None);
+    }
+
+    #[test]
+    fn content_dims_must_match_metadata() {
+        assert!(content_dims_match(663, 373, 663, 373));
+        assert!(content_dims_match(662, 372, 663, 373));
+        // 实测：元数据 663x373，实际 JPEG 是 663x253 的整页缩略图
+        assert!(!content_dims_match(663, 253, 663, 373));
+    }
+
+    #[test]
     fn classify_full_uses_ninety_percent() {
         assert!(classify_full(1280, 800, (1280, 800)));
         assert!(classify_full(1152, 720, (1280, 800)));
@@ -1772,24 +2172,61 @@ mod tests {
         assert!(!classify_full(865, 487, (1280, 800)));
     }
 
-    /// V04：唯一匹配才贴。单元素命中返回位置；多元素尺寸接近
-    /// （0 个之外，多个也）返回 None——宁可丢帧不错贴
+    /// V04：候选按尺寸收集；唯一候选直接用，多候选靠底图相似度裁决，
+    /// 区分不开宁可丢帧不错贴
     #[test]
-    fn rect_match_requires_unique_identity() {
+    fn tab_order_is_stable_and_appends_new() {
+        let t = |id: &str| (id.to_string(), String::new(), String::new());
+        let mut order = Vec::new();
+        let mut a = vec![t("A")];
+        stable_tab_order(&mut order, &mut a);
+        // Chrome 把新建的 B 排到最前：我们仍应 A、B
+        let mut b = vec![t("B"), t("A")];
+        stable_tab_order(&mut order, &mut b);
+        assert_eq!(
+            b.iter().map(|x| x.0.as_str()).collect::<Vec<_>>(),
+            ["A", "B"]
+        );
+        // 切换后 Chrome 再换序：不得跟着变
+        let mut c = vec![t("A"), t("B")];
+        stable_tab_order(&mut order, &mut c);
+        assert_eq!(
+            c.iter().map(|x| x.0.as_str()).collect::<Vec<_>>(),
+            ["A", "B"]
+        );
+        // 关闭 A 再新开 C：B、C
+        let mut d = vec![t("C"), t("B")];
+        stable_tab_order(&mut order, &mut d);
+        assert_eq!(
+            d.iter().map(|x| x.0.as_str()).collect::<Vec<_>>(),
+            ["B", "C"]
+        );
+    }
+
+    #[test]
+    fn rect_candidates_and_disambiguation() {
         let rects = vec![(41, 168, 803, 452)];
-        assert_eq!(find_unique_rect(&rects, 803, 452), Some((41, 168)));
-        assert_eq!(find_unique_rect(&rects, 865, 487), None);
+        assert_eq!(candidate_rects(&rects, 803, 452), vec![(41, 168)]);
+        assert!(candidate_rects(&rects, 865, 487).is_empty());
         // 生产样本：同一会话三个几何——每个尺寸独立命中自己的 rect
         let rects = vec![
             (295, 172, 865, 487),
             (41, 168, 803, 452),
             (34, 168, 818, 460),
         ];
-        assert_eq!(find_unique_rect(&rects, 865, 487), Some((295, 172)));
-        assert_eq!(find_unique_rect(&rects, 818, 460), Some((34, 168)));
-        // 两个元素尺寸差 ≤3px：身份无法区分，拒绝贴图
-        let ambiguous = vec![(41, 168, 803, 452), (300, 200, 805, 453)];
-        assert_eq!(find_unique_rect(&ambiguous, 803, 452), None);
+        assert_eq!(candidate_rects(&rects, 865, 487), vec![(295, 172)]);
+        assert_eq!(candidate_rects(&rects, 818, 460), vec![(34, 168)]);
+
+        // 首页场景：两个 310x174 预览视频；新内容帧与第二个位置的
+        // 底图内容一致 → 选第二个；两处底图一样时无法区分 → None
+        let mut base = image::RgbImage::from_pixel(1000, 400, image::Rgb([200, 200, 200]));
+        let video = image::RgbImage::from_pixel(310, 174, image::Rgb([20, 90, 160]));
+        image::imageops::overlay(&mut base, &video, 600, 100);
+        let two = vec![(20u32, 100u32), (600u32, 100u32)];
+        assert_eq!(pick_rect(&two, &base, &video), Some((600, 100)));
+        let flat = image::RgbImage::from_pixel(1000, 400, image::Rgb([200, 200, 200]));
+        assert_eq!(pick_rect(&two, &flat, &video), None);
+        assert_eq!(pick_rect(&two[..1], &flat, &video), Some((20, 100)));
     }
 
     /// V02/测试#10：干净底图合成不留残影。视频块先在 A 处、再在

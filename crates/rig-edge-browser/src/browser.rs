@@ -539,6 +539,20 @@ impl Browser {
                                                 .await;
                                         }
                                     }
+                                    // 自动附加的新标签（window.open / target=_blank）会停在
+                                    // 「等调试器」状态，不放行就永远停在 about:blank，用户得
+                                    // 手动刷新才加载（对 waitForDebuggerOnStart=false 也成立，
+                                    // 2026-11-20 裸 Chrome 对照实测）。放行对已运行页无副作用。
+                                    if is_page {
+                                        let _ = b
+                                            .cdp
+                                            .call(
+                                                Some(&sid),
+                                                "Runtime.runIfWaitingForDebugger",
+                                                json!({}),
+                                            )
+                                            .await;
+                                    }
                                     let _ = b.cdp.call(Some(&sid), "Page.enable", json!({})).await;
                                     let _ = b.cdp.call(Some(&sid), "DOM.enable", json!({})).await;
                                     // 不启用 Accessibility 域时，新版 Chrome 的
@@ -653,6 +667,52 @@ impl Browser {
         Ok(r.get("nodes").cloned().unwrap_or(Value::Null))
     }
 
+    /// 单节点 AX（不取亲属）：动作前快速复核用，字段口径与
+    /// getFullAXTree 的节点一致，可直接喂 `snapshot::element_core`。
+    pub async fn ax_node(&self, session: &str, backend: i64) -> CdpResult<Option<Value>> {
+        let r = self
+            .cdp
+            .call(
+                Some(session),
+                "Accessibility.getPartialAXTree",
+                json!({"backendNodeId": backend, "fetchRelatives": false}),
+            )
+            .await?;
+        Ok(r.get("nodes")
+            .and_then(Value::as_array)
+            .and_then(|a| {
+                a.iter()
+                    .find(|n| n.get("backendDOMNodeId").and_then(Value::as_i64) == Some(backend))
+            })
+            .cloned())
+    }
+
+    /// 单节点 DOM 属性（与 `collect_dom` 同口径的 attributes 表）。
+    pub async fn dom_attrs(
+        &self,
+        session: &str,
+        backend: i64,
+    ) -> CdpResult<HashMap<String, String>> {
+        let r = self
+            .cdp
+            .call(
+                Some(session),
+                "DOM.describeNode",
+                json!({"backendNodeId": backend}),
+            )
+            .await?;
+        let mut attrs = HashMap::new();
+        if let Some(arr) = r.pointer("/node/attributes").and_then(Value::as_array) {
+            let mut it = arr.iter();
+            while let (Some(k), Some(v)) = (it.next(), it.next()) {
+                if let (Some(k), Some(v)) = (k.as_str(), v.as_str()) {
+                    attrs.insert(k.to_string(), v.to_string());
+                }
+            }
+        }
+        Ok(attrs)
+    }
+
     /// 整页 DOM 映射：backendNodeId → DomInfo
     pub async fn dom_map(&self, session: &str) -> CdpResult<DomMap> {
         let r = self
@@ -679,6 +739,55 @@ impl Browser {
             .and_then(Value::as_str)
             .map(str::to_string)
             .ok_or_else(|| "getFrameTree 无 frame id".to_string())
+    }
+
+    /// 取页面已加载的图片资源字节（base64）：跨源图片在页内
+    /// canvas 会污染读不到像素，而 Page.getResourceContent 直接
+    /// 取浏览器缓存里的原始字节，不受同源限制。按 url 在整棵
+    /// frame 资源树里找 frameId。
+    pub async fn image_resource_b64(&self, session: &str, url: &str) -> CdpResult<String> {
+        fn find(node: &Value, url: &str) -> Option<String> {
+            let fid = node.pointer("/frame/id").and_then(Value::as_str)?;
+            let hit = node
+                .get("resources")
+                .and_then(Value::as_array)
+                .is_some_and(|rs| {
+                    rs.iter()
+                        .any(|r| r.get("url").and_then(Value::as_str) == Some(url))
+                });
+            if hit {
+                return Some(fid.to_string());
+            }
+            node.get("childFrames")
+                .and_then(Value::as_array)?
+                .iter()
+                .find_map(|c| find(c, url))
+        }
+        let tree = self
+            .cdp
+            .call(Some(session), "Page.getResourceTree", json!({}))
+            .await?;
+        let fid = tree
+            .get("frameTree")
+            .and_then(|t| find(t, url))
+            .ok_or("资源树里没有该图片")?;
+        let r = self
+            .cdp
+            .call(
+                Some(session),
+                "Page.getResourceContent",
+                json!({"frameId": fid, "url": url}),
+            )
+            .await?;
+        let content = r
+            .get("content")
+            .and_then(Value::as_str)
+            .ok_or("getResourceContent 无内容")?;
+        if r.get("base64Encoded").and_then(Value::as_bool) == Some(true) {
+            Ok(content.to_string())
+        } else {
+            Err("图片资源不是二进制".to_string())
+        }
     }
 
     /// 整页几何批量采集（R-16 定向批量化）：一次
@@ -809,6 +918,20 @@ impl Browser {
             y2 = y2.max(nums[i + 1]);
         }
         Ok(Some([x1, y1, x2, y2]))
+    }
+
+    /// 视口状态 [pageX, pageY, 宽, 高]（CSS 像素）：滚动与缩放没有任何
+    /// DOM 通知，呈现一侧靠它单独判断“视口动没动”（见 changes.rs）。
+    pub async fn view_state(&self, session: &str) -> CdpResult<[f32; 4]> {
+        let r = self
+            .cdp
+            .call(Some(session), "Page.getLayoutMetrics", json!({}))
+            .await?;
+        let vv = r
+            .get("cssVisualViewport")
+            .ok_or_else(|| "getLayoutMetrics 无 cssVisualViewport".to_string())?;
+        let f = |k: &str| vv.get(k).and_then(Value::as_f64).unwrap_or(0.0) as f32;
+        Ok([f("pageX"), f("pageY"), f("clientWidth"), f("clientHeight")])
     }
 
     /// (CSS 视口宽, 高, devicePixelRatio)
@@ -1069,6 +1192,26 @@ impl Browser {
         Ok(out)
     }
 
+    /// 由 `parent` 页面开出的、不在 `known` 里的新标签（window.open /
+    /// target=_blank）。靠 targetInfo.openerId 判断，用户自己在别处开的不算。
+    pub async fn new_popups(&self, parent: &str, known: &[String]) -> Vec<String> {
+        let Ok(v) = self.cdp.call(None, "Target.getTargets", json!({})).await else {
+            return Vec::new();
+        };
+        v.get("targetInfos")
+            .and_then(Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .filter(|t| t.get("type").and_then(Value::as_str) == Some("page"))
+                    .filter(|t| t.get("openerId").and_then(Value::as_str) == Some(parent))
+                    .filter_map(|t| t.get("targetId").and_then(Value::as_str))
+                    .filter(|id| !known.iter().any(|k| k == id))
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     pub async fn create_target(&self, url: &str) -> CdpResult<String> {
         let v = self
             .cdp
@@ -1085,6 +1228,11 @@ impl Browser {
             .call(None, "Target.closeTarget", json!({"targetId": target_id}))
             .await?;
         Ok(())
+    }
+
+    /// 是否由本程序自行拉起的 Chromium（挂靠用户自己的浏览器时为 false）
+    pub async fn is_self_launched(&self) -> bool {
+        self.child.lock().await.is_some()
     }
 
     pub async fn activate_target(&self, target_id: &str) -> CdpResult<()> {

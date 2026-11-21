@@ -1326,6 +1326,23 @@ async fn edge_chrome_ui_and_takeover() {
     );
     assert_eq!(r["result"], "rejected", "陈旧帧 Point 应被拒: {r}");
     assert_eq!(r["reason"]["code"], "stale_frame", "应为陈旧帧拒绝: {r}");
+    // 被拒时程序自己附最新一帧（AI 不必再补 observe）
+    let (_, full) = http_json(
+        edge_port,
+        "POST",
+        "/act",
+        Some(
+            json!({"request_id": "stale-fresh", "frame_id": f1, "action":
+            {"kind": "click", "target": {"by": "point", "x": 100, "y": 100}}}),
+        ),
+    );
+    // f1 仍在历史池 → 回增量（局部刷新）；带的是最新状态
+    assert!(
+        full["delta"]["frame_id"].as_u64().unwrap_or(0) >= f2
+            || full["observation"]["frame_id"].as_u64().unwrap_or(0) >= f2,
+        "陈旧拒绝应附带最新状态（delta 或整帧）: {full}"
+    );
+    assert!(full["text"].as_str().is_some_and(|t| !t.is_empty()));
 
     // ── 2. chrome 命令与状态推送（第五期：原生工具栏） ──
     // 注意：每次 HTTP observe/act 后有 2 秒执行保持窗（§7.1），窗内
@@ -1671,6 +1688,392 @@ fn tree_find_by_id<'a>(node: &'a Value, id_attr: &str) -> Option<&'a Value> {
 
 /// DOM 镜像通道（§9.2）：快照建成、输入差分（val）、节点增删差分（add）、
 /// 滚动差分（scr）、seq 单调、dom-resync 后新快照收敛到最新页面状态。
+const PRECHK_HTML: &str = r#"<!DOCTYPE html><html lang="zh"><head><meta charset="utf-8"><title>预检</title></head>
+<body>
+<button id="b1">按钮一</button> <button id="b2">按钮二</button>
+<label>文本框 <input id="t" type="text"></label>
+<button id="mv" style="position:relative">会移动</button>
+<button id="dis">会禁用</button>
+<button id="rm">会消失</button>
+<iframe src="__FRAMEORIGIN__/precheck_frame.html" width="300" height="60"></iframe>
+<script>
+setTimeout(() => {
+  document.getElementById('mv').style.left = '120px';
+  document.getElementById('mv').style.top = '40px';
+  document.getElementById('dis').disabled = true;
+  document.getElementById('rm').remove();
+}, __DELAY__);
+</script>
+</body></html>"#;
+
+const PRECHK_FRAME_HTML: &str = r#"<!DOCTYPE html><html><head><meta charset="utf-8"></head>
+<body style="margin:0"><button id="fb">框内按钮</button></body></html>"#;
+
+const PRECHK_NAV_HTML: &str = r#"<!DOCTYPE html><html lang="zh"><head><meta charset="utf-8"><title>将跳转</title></head>
+<body><button id="go">离开前的按钮</button>
+<script>setTimeout(() => { location.href = '/precheck_after.html'; }, 1500);</script></body></html>"#;
+
+const PRECHK_AFTER_HTML: &str = r#"<!DOCTYPE html><html lang="zh"><head><meta charset="utf-8"><title>已跳转</title></head>
+<body><button id="go2">离开后的按钮</button></body></html>"#;
+
+fn precheck_counts(port: u16) -> (u64, u64) {
+    let (_, h) = http_json(port, "GET", "/health", None);
+    (
+        h["act_precheck"]["fast_hit"].as_u64().unwrap(),
+        h["act_precheck"]["fast_miss"].as_u64().unwrap(),
+    )
+}
+
+/// 动作前单元素快速复核：①页面没变时主页面元素全部走快路径（说明
+/// 单元素算出的 role/name/states/bbox 与整页构建一致）；②页面自己
+/// 变了（移位/禁用/消失/换文档）时必须仍被拒，快路径不得放过；
+/// ③子帧内元素交给整页快照（miss），行为不变。
+#[tokio::test]
+async fn edge_act_fast_precheck() {
+    if std::env::var("RIG_EDGE_IT").is_err() {
+        eprintln!("跳过：未设置 RIG_EDGE_IT");
+        return;
+    }
+    let _serial = SERIAL.lock().await;
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let origin = format!("http://127.0.0.1:{port}");
+    // 页面变化延迟 2.5s：先让快路径验证在“没变”时全部命中
+    serve(
+        listener,
+        vec![
+            (
+                "/p.html".to_string(),
+                PRECHK_HTML
+                    .replace("__DELAY__", "6000")
+                    // 跨源（localhost ≠ 127.0.0.1）→ 独立 OOPIF 会话
+                    .replace("__FRAMEORIGIN__", &format!("http://localhost:{port}")),
+            ),
+            (
+                "/precheck_frame.html".to_string(),
+                PRECHK_FRAME_HTML.to_string(),
+            ),
+            ("/nav.html".to_string(), PRECHK_NAV_HTML.to_string()),
+            (
+                "/precheck_after.html".to_string(),
+                PRECHK_AFTER_HTML.to_string(),
+            ),
+        ],
+    );
+    let edge_port = free_port();
+    let mut proc = spawn_edge(&[
+        "--listen".into(),
+        format!("127.0.0.1:{edge_port}"),
+        "--url".into(),
+        format!("{origin}/p.html"),
+        "--allow-origin".into(),
+        origin.clone(),
+        "--width".into(),
+        "900".into(),
+        "--height".into(),
+        "700".into(),
+    ]);
+    wait_health(edge_port).await;
+    let _ = &mut proc;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // ── ① 没变：逐个点主页面按钮/聚焦文本框，全部快路径命中 ──
+    let mut obs = observe(edge_port);
+    let mut frame = obs["observation"]["frame_id"].as_u64().unwrap();
+    let click = |id: &str| json!({"kind": "click", "target": {"by": "element", "id": id}});
+    let (h0, m0) = precheck_counts(edge_port);
+    for name in ["按钮一", "按钮二"] {
+        let id = find_element(&obs["observation"], "button", name)
+            .unwrap_or_else(|| panic!("找不到按钮 {name}: {obs}"))["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let r = act(edge_port, frame, click(&id));
+        assert_eq!(r["result"], "done", "没变时点击应成功: {r}");
+        frame = r["frame_id"].as_u64().unwrap();
+        obs = observe(edge_port);
+        frame = obs["observation"]["frame_id"].as_u64().unwrap().max(frame);
+    }
+    let (h1, m1) = precheck_counts(edge_port);
+    assert_eq!(
+        h1 - h0,
+        2,
+        "主页面元素应全部走快路径（hit {h0}→{h1}, miss {m0}→{m1}）"
+    );
+    assert_eq!(m1, m0, "没变时不应有退回整页");
+
+    // ── ③ 子帧内元素：快路径不适用 → miss，行为仍正确 ──
+    let fb = find_element(&obs["observation"], "button", "框内按钮").expect("子帧按钮应在快照里")
+        ["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let r = act(edge_port, frame, click(&fb));
+    assert_eq!(r["result"], "done", "子帧点击应成功: {r}");
+    let (h2, m2) = precheck_counts(edge_port);
+    assert_eq!(h2, h1, "子帧元素不走快路径");
+    assert_eq!(m2, m1 + 1, "子帧元素应记一次 miss");
+
+    // ── ② 页面自己变了：移位/禁用/消失都必须被拒 ──
+    let obs = observe(edge_port);
+    let frame = obs["observation"]["frame_id"].as_u64().unwrap();
+    let ids: Vec<String> = ["会移动", "会禁用", "会消失"]
+        .iter()
+        .map(|n| {
+            find_element(&obs["observation"], "button", n).unwrap()["id"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        })
+        .collect();
+    tokio::time::sleep(Duration::from_secs(7)).await; // 页面脚本已改动，且期间无人再 observe
+    for (name, id) in ["会移动", "会禁用", "会消失"].iter().zip(&ids) {
+        let r = act(edge_port, frame, click(id));
+        assert_eq!(
+            r["result"], "rejected",
+            "页面已变（{name}），旧帧上的动作必须被拒: {r}"
+        );
+    }
+    let (_, m3) = precheck_counts(edge_port);
+    assert!(
+        m3 >= m2 + 3,
+        "三次都应从快路径退回整页裁决（miss {m2}→{m3}）"
+    );
+
+    // ── ② 换文档：同帧号、同元素 id，文档已换 → 被拒 ──
+    let r = act(
+        edge_port,
+        frame,
+        json!({"kind": "navigate", "url": format!("{origin}/nav.html")}),
+    );
+    assert_eq!(r["result"], "done", "导航应成功: {r}");
+    let obs = observe(edge_port);
+    let frame = obs["observation"]["frame_id"].as_u64().unwrap();
+    let go = find_element(&obs["observation"], "button", "离开前的按钮")
+        .expect("导航后应见到 nav 页按钮")["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    tokio::time::sleep(Duration::from_secs(3)).await; // 页面自己跳到 after 页
+    let r = act(edge_port, frame, click(&go));
+    assert_eq!(r["result"], "rejected", "文档已换，旧元素必须被拒: {r}");
+}
+
+const UNCH_TXT_HTML: &str = r#"<!DOCTYPE html><html lang="zh"><head><meta charset="utf-8"><title>文字</title></head>
+<body><button id="a">按钮甲</button> <p id="lbl">状态：旧</p>
+<script>setTimeout(() => { document.getElementById('lbl').textContent = '状态：新'; }, 5000);</script>
+</body></html>"#;
+
+const UNCH_SCROLL_HTML: &str = r#"<!DOCTYPE html><html lang="zh"><head><meta charset="utf-8"><title>滚动</title></head>
+<body><div id="box"></div>
+<script>
+const box = document.getElementById('box');
+for (let i = 0; i < 60; i++) { const b = document.createElement('button'); b.textContent = '行' + i; b.style.display = 'block'; b.style.height = '40px'; box.appendChild(b); }
+setTimeout(() => window.scrollTo(0, 800), 5000);
+</script></body></html>"#;
+
+const UNCH_CLICK_HTML: &str = r#"<!DOCTYPE html><html lang="zh"><head><meta charset="utf-8"><title>点击</title></head>
+<body><button id="chg" onclick="document.getElementById('lbl').textContent='已点击'">会改文字</button>
+<button id="nop">什么都不改</button><p id="lbl">未点击</p></body></html>"#;
+
+fn observe_since(port: u16, since: u64) -> Value {
+    let (s, v) = http_json(
+        port,
+        "POST",
+        "/observe",
+        Some(json!({"mode": "tree", "since_frame": since})),
+    );
+    assert_eq!(s, 200, "增量 observe 应成功: {v}");
+    v
+}
+
+fn unchanged_count(port: u16) -> u64 {
+    let (_, h) = http_json(port, "GET", "/health", None);
+    h["changes"]["observe_unchanged"].as_u64().unwrap()
+}
+
+/// 呈现一侧：页面没变 → 回空增量且不采集；页面自己变了（无人操作）、
+/// 视口滚动了（浏览器对滚动不发任何通知）→ 必须重新采集并送出变化。
+#[tokio::test]
+async fn edge_observe_unchanged_vs_changed() {
+    if std::env::var("RIG_EDGE_IT").is_err() {
+        eprintln!("跳过：未设置 RIG_EDGE_IT");
+        return;
+    }
+    let _serial = SERIAL.lock().await;
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    serve(
+        listener,
+        vec![
+            ("/txt.html".to_string(), UNCH_TXT_HTML.to_string()),
+            ("/scroll.html".to_string(), UNCH_SCROLL_HTML.to_string()),
+            ("/click.html".to_string(), UNCH_CLICK_HTML.to_string()),
+        ],
+    );
+    for page in ["txt.html", "scroll.html"] {
+        let edge_port = free_port();
+        let mut proc = spawn_edge(&[
+            "--listen".into(),
+            format!("127.0.0.1:{edge_port}"),
+            "--url".into(),
+            format!("http://127.0.0.1:{port}/{page}"),
+            "--width".into(),
+            "900".into(),
+            "--height".into(),
+            "600".into(),
+        ]);
+        wait_health(edge_port).await;
+        let _ = &mut proc;
+        // 等页面脚本的定时变化/滚动发生之前先取基线帧
+        let f = observe(edge_port)["observation"]["frame_id"]
+            .as_u64()
+            .unwrap();
+        let before = unchanged_count(edge_port);
+
+        // ① 页面还没变：空增量，未采集
+        let d = observe_since(edge_port, f);
+        assert_eq!(d["delta"]["frame_id"], f, "{page}: 没变不应产生新帧: {d}");
+        assert!(d["delta"]["upserts"].as_array().unwrap().is_empty());
+        assert_eq!(
+            unchanged_count(edge_port),
+            before + 1,
+            "{page}: 应记一次未采集"
+        );
+
+        // ② 页面自己变了/滚动了（无人操作）：必须重新采集并带出变化
+        tokio::time::sleep(Duration::from_millis(5500)).await;
+        let d = observe_since(edge_port, f);
+        assert!(
+            d["delta"]["frame_id"].as_u64().unwrap() > f,
+            "{page}: 页面已变，必须重新采集: {d}"
+        );
+        assert!(
+            !d["delta"]["upserts"].as_array().unwrap().is_empty()
+                || !d["delta"]["removed"].as_array().unwrap().is_empty(),
+            "{page}: 增量应带出变化: {d}"
+        );
+    }
+
+    // ── 操作与呈现解耦：act 做完即返回，页面因动作变成什么样按需取增量 ──
+    let edge_port = free_port();
+    let mut proc = spawn_edge(&[
+        "--listen".into(),
+        format!("127.0.0.1:{edge_port}"),
+        "--url".into(),
+        format!("http://127.0.0.1:{port}/click.html"),
+        "--width".into(),
+        "900".into(),
+        "--height".into(),
+        "600".into(),
+    ]);
+    wait_health(edge_port).await;
+    let _ = &mut proc;
+    let obs = observe(edge_port);
+    let f = obs["observation"]["frame_id"].as_u64().unwrap();
+    let id_of = |name: &str| {
+        find_element(&obs["observation"], "button", name).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    let click = |id: &str| json!({"kind": "click", "target": {"by": "element", "id": id}});
+    // 点“什么都不改”：Done 指向校验帧；随后按需取增量 = 空，且未采集
+    let before = unchanged_count(edge_port);
+    let r = act(edge_port, f, click(&id_of("什么都不改")));
+    assert_eq!(r["result"], "done", "{r}");
+    assert_eq!(r["frame_id"], f, "Done 应指向动作所基于的校验帧: {r}");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let d = observe_since(edge_port, f);
+    assert_eq!(d["delta"]["frame_id"], f, "什么都没变不应产生新帧: {d}");
+    assert_eq!(unchanged_count(edge_port), before + 1, "应走“没变”不采集");
+    // 点“会改文字”：随后取增量必须带出文字变化
+    let r = act(edge_port, f, click(&id_of("会改文字")));
+    assert_eq!(r["result"], "done", "{r}");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let d = observe_since(edge_port, f);
+    assert!(
+        d["delta"]["frame_id"].as_u64().unwrap() > f,
+        "页面变了，应重新采集: {d}"
+    );
+    assert!(
+        d["text"].as_str().unwrap_or("").contains("增量")
+            && d["delta"]["upserts"].to_string().contains("已点击"),
+        "增量应带出新文字: {d}"
+    );
+}
+
+/// 回归（审查 P1）：后台 DOM 感知订阅不得停发 WS JPEG 帧——
+/// jpeg-demand 才是帧流需求的唯一来源。
+#[tokio::test(flavor = "multi_thread")]
+async fn edge_dom_subscription_keeps_jpeg_frames() {
+    if std::env::var("RIG_EDGE_IT").is_err() {
+        eprintln!("跳过：未设置 RIG_EDGE_IT");
+        return;
+    }
+    let _serial = SERIAL.lock().await;
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let anim = "<html><body><div id=b style='width:80px;height:80px;background:red'></div>\
+        <script>let n=0;setInterval(()=>{document.getElementById('b').style.marginLeft=(n++%200)+'px'},30)</script>\
+        </body></html>";
+    serve(listener, vec![("/anim.html".to_string(), anim.to_string())]);
+    let edge_port = free_port();
+    let mut proc = spawn_edge(&[
+        "--listen".into(),
+        format!("127.0.0.1:{edge_port}"),
+        "--url".into(),
+        format!("http://127.0.0.1:{port}/anim.html"),
+        "--human".into(),
+    ]);
+    wait_health(edge_port).await;
+    let _ = &mut proc;
+
+    use futures_util::SinkExt;
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{edge_port}/ws"))
+        .await
+        .expect("人通道 WS 应可连接");
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        json!({"type": "dom-start"}).to_string().into(),
+    ))
+    .await
+    .unwrap();
+    // 订阅 DOM 后 2 秒内仍应持续收到二进制帧（至少 3 张）
+    let mut frames = 0;
+    let end = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < end {
+        if let Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Binary(_)))) =
+            tokio::time::timeout(Duration::from_millis(500), ws.next()).await
+        {
+            frames += 1;
+        }
+    }
+    assert!(frames >= 3, "后台 DOM 订阅下应仍收 JPEG 帧，实际 {frames}");
+    // 观看端声明不消费 JPEG（前台 DOM/RTC）后应停发
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        json!({"type": "jpeg-demand", "on": false})
+            .to_string()
+            .into(),
+    ))
+    .await
+    .unwrap();
+    // 排空在途消息（页面在动，DOM 差分文本会持续到达，按时限排空）
+    let drain_end = Instant::now() + Duration::from_millis(800);
+    while Instant::now() < drain_end {
+        let _ = tokio::time::timeout(Duration::from_millis(100), ws.next()).await;
+    }
+    let mut late = 0;
+    let end = Instant::now() + Duration::from_secs(1);
+    while Instant::now() < end {
+        if let Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Binary(_)))) =
+            tokio::time::timeout(Duration::from_millis(300), ws.next()).await
+        {
+            late += 1;
+        }
+    }
+    assert_eq!(late, 0, "jpeg-demand off 后不应再收帧");
+}
+
 #[tokio::test]
 async fn edge_dom_channel() {
     if std::env::var("RIG_EDGE_IT").is_err() {
@@ -2656,4 +3059,320 @@ async fn edge_dom_sub_idempotent_and_cleanup() {
     drop(ws);
     wait_viewers(edge_port, 0, "断开连接后名额应回收").await;
     drop(proc);
+}
+
+/// 页面开新标签（target=_blank / window.open）会抢走前台，观看标签变后台，
+/// Chrome 对后台页不再出 screencast 帧，观看画面冻结。帧泵巡检发现新标签后
+/// 必须把观看标签切回前台：开标签之后帧仍持续输出（动画页，帧龄应很小）。
+#[tokio::test]
+async fn edge_popup_keeps_view_frames() {
+    if std::env::var("RIG_EDGE_IT").is_err() {
+        eprintln!("跳过：未设置 RIG_EDGE_IT");
+        return;
+    }
+    let _serial = SERIAL.lock().await;
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let origin = format!("http://127.0.0.1:{port}");
+    let page = r##"<!DOCTYPE html><html><head><meta charset="utf-8"><title>popup</title></head>
+<body style="margin:0"><a href="/other.html" target="_blank" style="display:block;width:400px;height:100px;background:#fa0">开新标签</a>
+<canvas id="c" width="600" height="300"></canvas>
+<script>const x=document.getElementById('c').getContext('2d');let i=0;setInterval(()=>{x.fillStyle='hsl('+(i++*5%360)+',80%,50%)';x.fillRect(0,0,600,300)},33)</script>
+</body></html>"##;
+    serve(
+        listener,
+        vec![
+            ("/popup.html".to_string(), page.to_string()),
+            (
+                "/other.html".to_string(),
+                r##"<html><body><canvas id="c" width="600" height="300"></canvas><script>const x=document.getElementById('c').getContext('2d');let i=0;setInterval(()=>{x.fillStyle='hsl('+(i++*7%360)+',80%,50%)';x.fillRect(0,0,600,300)},33)</script></body></html>"##.to_string(),
+            ),
+        ],
+    );
+    let edge_port = free_port();
+    let mut proc = spawn_edge(&[
+        "--listen".into(),
+        format!("127.0.0.1:{edge_port}"),
+        "--url".into(),
+        format!("{origin}/popup.html"),
+        "--human".into(),
+        "--width".into(),
+        "900".into(),
+        "--height".into(),
+        "700".into(),
+    ]);
+    wait_health(edge_port).await;
+    let _ = &mut proc;
+
+    async fn frames_sent(edge_port: u16) -> (u64, f64) {
+        let h = http_json(edge_port, "GET", "/health", None).1;
+        (
+            h["frames"]["sent"].as_u64().unwrap_or(0),
+            h["last_frame_age_ms"].as_f64().unwrap_or(f64::MAX),
+        )
+    }
+    // 先确认动画页确实在持续出帧
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let (before, _) = frames_sent(edge_port).await;
+    assert!(before > 0, "开标签前应已有帧");
+
+    use futures_util::SinkExt;
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{edge_port}/ws"))
+        .await
+        .expect("人通道 WS 应可连接");
+    for (action, buttons) in [("move", 0), ("down", 1), ("up", 0)] {
+        ws.send(tokio_tungstenite::tungstenite::Message::Text(
+            format!(
+                r#"{{"type":"mouse","action":"{action}","button":0,"buttons":{buttons},"count":1,"x":100,"y":40}}"#
+            )
+            .into(),
+        ))
+        .await
+        .unwrap();
+    }
+    // 新标签必须真的开出来、自己加载（不停在 about:blank 等手动刷新）、
+    // 且观看画面跟了过去（active=新标签）：看观看通道的 chrome-state
+    {
+        use futures_util::StreamExt;
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            assert!(
+                !left.is_zero(),
+                "点击链接后新标签应加载 other.html 并成为观看标签"
+            );
+            let Ok(Some(Ok(msg))) = tokio::time::timeout(left, ws.next()).await else {
+                continue;
+            };
+            if let tokio_tungstenite::tungstenite::Message::Text(t) = msg {
+                if let Ok(v) = serde_json::from_str::<Value>(&t) {
+                    if v["type"] == "chrome-state" {
+                        let tabs = v["tabs"].as_array().cloned().unwrap_or_default();
+                        let loaded = tabs.iter().position(|t| {
+                            t["url"]
+                                .as_str()
+                                .is_some_and(|u| u.ends_with("/other.html"))
+                        });
+                        if loaded.is_some() && loaded == v["active"].as_u64().map(|a| a as usize) {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // 巡检周期 600ms；给 3s 收敛，之后帧必须持续增长、帧龄很小
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let (a, _) = frames_sent(edge_port).await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let (b, age) = frames_sent(edge_port).await;
+    assert!(
+        b > a + 10 && age < 1500.0,
+        "跟随新标签后观看画面应持续出帧：sent {a}→{b}，帧龄 {age}ms"
+    );
+}
+
+/// 回归：同一批突变里「先把父挂进文档、再往父里加子」（YouTube 字幕即此模式）。
+/// ser(父) 读的是回调时的最终 DOM，已含子节点；子节点那条 childList 记录若再发
+/// 一次 add，镜像里就重复一份（实测字幕逐字翻倍）。断言：整个增量流里目标文本
+/// 只在一个 add 树里出现一次。
+#[tokio::test]
+async fn edge_dom_no_duplicate_adds() {
+    if std::env::var("RIG_EDGE_IT").is_err() {
+        eprintln!("跳过：未设置 RIG_EDGE_IT");
+        return;
+    }
+    let _serial = SERIAL.lock().await;
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let origin = format!("http://127.0.0.1:{port}");
+    let page = r##"<!DOCTYPE html><html><head><meta charset="utf-8"><title>dup</title></head>
+<body style="margin:0"><button id="b" style="position:absolute;left:0;top:0;width:120px;height:40px"
+ onclick="const c=document.getElementById('box');const p=document.createElement('div');c.appendChild(p);const s=document.createElement('span');s.textContent='UNIQ-TEXT';p.appendChild(s);">go</button>
+<div id="box" style="position:absolute;top:60px"></div></body></html>"##;
+    serve(listener, vec![("/dup.html".to_string(), page.to_string())]);
+    let edge_port = free_port();
+    let mut proc = spawn_edge(&[
+        "--listen".into(),
+        format!("127.0.0.1:{edge_port}"),
+        "--url".into(),
+        format!("{origin}/dup.html"),
+        "--human".into(),
+        "--width".into(),
+        "900".into(),
+        "--height".into(),
+        "700".into(),
+    ]);
+    wait_health(edge_port).await;
+    let _ = &mut proc;
+    tokio::time::sleep(Duration::from_millis(800)).await;
+
+    use futures_util::SinkExt;
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{edge_port}/ws"))
+        .await
+        .expect("人通道 WS 应可连接");
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        json!({"type": "dom-start"}).to_string().into(),
+    ))
+    .await
+    .unwrap();
+    let _snap = next_dom(&mut ws, "dom-snapshot", Duration::from_secs(20)).await;
+    for action in ["down", "up"] {
+        ws.send(tokio_tungstenite::tungstenite::Message::Text(
+            json!({"type": "mouse", "dom": true, "action": action, "x": 50, "y": 20})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+    }
+    fn count_text(n: &Value, needle: &str) -> usize {
+        let mut c = usize::from(n["t"].as_str() == Some(needle));
+        if let Some(a) = n["c"].as_array() {
+            c += a.iter().map(|x| count_text(x, needle)).sum::<usize>();
+        }
+        c
+    }
+    // 收满 2s 内的全部差分，统计 UNIQ-TEXT 在所有 add 子树里共出现几次
+    let got = collect_deltas_until(&mut ws, |_| false, Duration::from_secs(3)).await;
+    let total: usize = got
+        .iter()
+        .filter(|(_, op)| op["o"] == "add")
+        .map(|(_, op)| count_text(&op["n"], "UNIQ-TEXT"))
+        .sum();
+    assert_eq!(
+        total, 1,
+        "UNIQ-TEXT 应只被 add 一次，实际 {total}；差分: {got:?}"
+    );
+}
+
+/// 快照与增量并发（反复 dom-resync + 页面持续突变）：按观看端同样的规则
+/// 重放（snapshot 重建、seq 连续才应用 delta），同一 id 不得在镜像里同时
+/// 出现两份。无「快照已含的旧增量不重放」的保护时，此测试失败。
+#[tokio::test(flavor = "multi_thread")]
+async fn edge_dom_resync_under_mutation_no_dup() {
+    if std::env::var("RIG_EDGE_IT").is_err() {
+        eprintln!("跳过：未设置 RIG_EDGE_IT");
+        return;
+    }
+    let _serial = SERIAL.lock().await;
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let origin = format!("http://127.0.0.1:{port}");
+    let page = r##"<!DOCTYPE html><html><head><meta charset="utf-8"><title>churn</title></head>
+<body><div id="box"></div><div id="big"></div><script>
+for(let k=0;k<6000;k++){const d=document.createElement('div');d.textContent='x'+k;document.getElementById('big').appendChild(d);}
+let n=0;const box=document.getElementById('box');
+setInterval(()=>{const p=document.createElement('p');const b=document.createElement('b');
+ b.textContent='t'+(n++);p.appendChild(b);box.appendChild(p);
+ if(box.children.length>20)box.removeChild(box.firstChild);},4);
+</script></body></html>"##;
+    serve(
+        listener,
+        vec![("/churn.html".to_string(), page.to_string())],
+    );
+    let edge_port = free_port();
+    let mut proc = spawn_edge(&[
+        "--listen".into(),
+        format!("127.0.0.1:{edge_port}"),
+        "--url".into(),
+        format!("{origin}/churn.html"),
+        "--human".into(),
+    ]);
+    wait_health(edge_port).await;
+    let _ = &mut proc;
+    tokio::time::sleep(Duration::from_millis(800)).await;
+
+    use futures_util::SinkExt;
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{edge_port}/ws"))
+        .await
+        .expect("人通道 WS 应可连接");
+    let send = |t: &str| {
+        tokio_tungstenite::tungstenite::Message::Text(json!({"type": t}).to_string().into())
+    };
+    ws.send(send("dom-start")).await.unwrap();
+
+    // id -> 子 id；present 为镜像里当前存在的 id 集合
+    fn add_tree(n: &Value, present: &mut std::collections::HashSet<u64>, dup: &mut Vec<u64>) {
+        if let Some(i) = n["i"].as_u64() {
+            if !present.insert(i) {
+                dup.push(i);
+            }
+        }
+        for c in n["c"].as_array().into_iter().flatten() {
+            add_tree(c, present, dup);
+        }
+    }
+    fn drop_ids(n: &Value, present: &mut std::collections::HashSet<u64>) {
+        if let Some(i) = n["i"].as_u64() {
+            present.remove(&i);
+        }
+        for c in n["c"].as_array().into_iter().flatten() {
+            drop_ids(c, present);
+        }
+    }
+    let mut present = std::collections::HashSet::new();
+    let mut dup: Vec<u64> = Vec::new();
+    let mut seq = 0u64;
+    let mut synced = false;
+    // rm 需要子树：用 id -> 节点树的映射
+    let mut nodes: std::collections::HashMap<u64, Value> = std::collections::HashMap::new();
+    fn index(n: &Value, m: &mut std::collections::HashMap<u64, Value>) {
+        if let Some(i) = n["i"].as_u64() {
+            m.insert(i, n.clone());
+        }
+        for c in n["c"].as_array().into_iter().flatten() {
+            index(c, m);
+        }
+    }
+    let end = Instant::now() + Duration::from_secs(8);
+    let mut next_resync = Instant::now() + Duration::from_millis(300);
+    while Instant::now() < end {
+        if Instant::now() >= next_resync {
+            ws.send(send("dom-resync")).await.unwrap();
+            next_resync = Instant::now() + Duration::from_millis(250);
+        }
+        let Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Text(t)))) =
+            tokio::time::timeout(Duration::from_millis(200), ws.next()).await
+        else {
+            continue;
+        };
+        let Ok(v) = serde_json::from_str::<Value>(&t) else {
+            continue;
+        };
+        match v["type"].as_str() {
+            Some("dom-snapshot") => {
+                present.clear();
+                nodes.clear();
+                add_tree(&v["tree"], &mut present, &mut dup);
+                index(&v["tree"], &mut nodes);
+                seq = v["seq"].as_u64().unwrap_or(0);
+                synced = true;
+            }
+            Some("dom-delta") if synced => {
+                let s = v["seq"].as_u64().unwrap_or(0);
+                if s != seq + 1 {
+                    synced = false; // 观看端此时会请求重同步并等新快照
+                    continue;
+                }
+                seq = s;
+                for op in v["ops"].as_array().into_iter().flatten() {
+                    match op["o"].as_str() {
+                        Some("add") => {
+                            add_tree(&op["n"], &mut present, &mut dup);
+                            index(&op["n"], &mut nodes);
+                        }
+                        Some("rm") => {
+                            if let Some(n) = op["i"].as_u64().and_then(|i| nodes.get(&i).cloned()) {
+                                drop_ids(&n, &mut present);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    assert!(dup.is_empty(), "镜像里出现重复 id：{dup:?}");
 }

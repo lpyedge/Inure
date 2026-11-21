@@ -126,6 +126,11 @@ pub struct Metrics {
     pub pump_content: AtomicU64,
     /// 帧泵：内容帧成功贴图数
     pub pump_pasted: AtomicU64,
+    /// 动作前单元素快速复核：确认跳过整页重采 / 退回整页快照的次数
+    pub act_fast_hit: AtomicU64,
+    pub act_fast_miss: AtomicU64,
+    /// observe(since_frame) 因无变化而未采集的次数
+    pub observe_unchanged: AtomicU64,
     /// 帧泵：内容帧丢弃数（无唯一矩形/无干净底图/回退模式）
     pub pump_dropped: AtomicU64,
     /// 帧泵：rect 几何重取次数
@@ -147,6 +152,9 @@ impl Metrics {
             pump_full: AtomicU64::new(0),
             pump_content: AtomicU64::new(0),
             pump_pasted: AtomicU64::new(0),
+            act_fast_hit: AtomicU64::new(0),
+            act_fast_miss: AtomicU64::new(0),
+            observe_unchanged: AtomicU64::new(0),
             pump_dropped: AtomicU64::new(0),
             pump_rect_refetch: AtomicU64::new(0),
             last_observe: Mutex::new(None),

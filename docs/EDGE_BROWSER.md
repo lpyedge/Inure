@@ -732,6 +732,22 @@ HTTP act 點擊後 ghost 到達且落點在目標中心 40px 內。
   last_snapshot 可查）。
 - 動作必須攜帶觀察時的幀號；幀已推進 → 回 `StaleFrame` 拒絕執行（陳舊校驗）。
   因此調用方在引用元素前應以最近一次 observe 的幀為準。
+- 動作前複核與拒絕回包（2026-11-21）：含元素目標且請求幀即最新存儲幀時，先做**單元素快速複核**
+  （只取該元素的 AX 節點/DOM 屬性/位置，與整頁構建共用 `snapshot::element_core`），一致則沿用存儲幀、
+  省掉整頁重採；不一致/出錯/不適用（換文檔、目標在子幀）一律退回整頁快照裁決，快路徑自己從不判拒絕。
+  被拒（陳舊/不存在/不可交互/越界）時，邊緣自己附帶最新頁面狀態（請求幀在歷史池 → `delta`，否則整幀
+  `observation`，刷新不足 500ms 的幀複用不重採）。語義詳見 PERCEPTION.md §6.1。
+- 操作與呈現解耦（2026-11-21）：`act` 做完動作即返回，不再做動作後整頁刷新；`Done.frame_id` 為動作所基於的
+  校驗幀。頁面變化由 `changes.rs` 的變化日誌（CDP 讀泵同步記賬）驅動：`observe` 帶 `since_frame` 時，
+  自該幀起無結構類通知且視口未動 → 空增量、不採集。語義與盲區詳見 PERCEPTION.md §8。
+  解耦後實測（debug 構建，本地回環，單次運行各 20 次，頁面無副作用的按鈕）：小頁點擊 `act` p50 65.9ms（p95 66.3）；
+  大頁（約 550 元素）點擊 `act` p50 67.8ms（p95 68.6），隨後 `observe(since_frame)` 空增量 p50 2.2ms，兩者合計
+  70.1ms；小頁 no-op 點擊後 `observe(since)` p50 1.5ms。20/20 次動作前複核走快路徑、20/20 次 observe 走“沒變”。
+  **只覆蓋“點擊不引起頁面變化”的情形**；頁面確有變化時 `observe(since)` 的耗時未測（正確性由
+  `edge_observe_unchanged_vs_changed` 鎖定）。演進對照（同機同腳本）：小頁點擊 p50 130.0（改前）→101.1（單元素複核）→65.9（解耦）。
+  單元素複核版的實測（小頁）：小頁點擊 `act` p50 130.0→101.1ms（p95 131.2→103.6）；
+  大頁（約 550 個元素）20 次點擊全部命中快路徑（`fast_hit=20, fast_miss=0`），大頁點擊 p50 246.2ms
+  （改前未測，剩餘耗時主要是動作後那次整頁刷新）。
 - 密碼框整棵子樹脫敏（掩碼字符會經子文本節點洩漏，故按子樹清除，不做值替換）。
 - Navigate 受 origin 白名單約束（`--url` 的 origin + `--allow-origin` 追加）。
 - 截圖為編號 PNG，敏感元素（密碼框等）區域以黑塊遮罩，與快照編號對應。
@@ -857,6 +873,9 @@ rig-proto 單元測試鎖定 upload/新拒絕碼/Done.note 的線格式。
 | `edge_dom_channel` | DOM 通道全鏈：快照建成、val/add/scr 差分、seq 嚴格遞增、resync 收斂；DOM 模式幽靈指針下發與落點；canvas 子流幀（節點 id 對應、PNG data URL）；同源 iframe 內容經 f 子樹進快照、內嵌突變觸發重同步 |
 | `edge_profile_persistence` | 持久化雙目錄：Cookie / LocalStorage / IndexedDB 寫入 → SIGTERM 優雅停機（cookie 名與 ls 值落盤實據斷言）→ 同 `--profile-dir` / `--cache-dir` 重啟 → 三值全數恢復 |
 | `edge_internal_gate_and_dblclick` | 雙擊透傳（視頻/DOM 兩路 count=2 → 遠端 dblclick 計數遞增，判據走 DOM 快照——observe 判據會按 §7.1 遮蔽人手勢自鎖）；內部頁把關：切 chrome://settings 後只收內部頁狀態、無該頁快照 |
+| `edge_act_fast_precheck` | 動作前單元素快速複核：頁面沒變時主頁面元素全部命中快路徑（證明單元素算出的 role/name/states/bbox 與整頁構建一致）；子幀元素退回整頁；頁面自己變了（移位/禁用/消失/換文檔）仍必須被拒 |
+| `edge_observe_unchanged_vs_changed` | 呈現一側：沒變 → 空增量且不採集；頁面自己變了/視口滾動（無人操作）→ 必須重新採集並帶出變化；點擊後 act 立即返回、按需取增量（不引起變化 → 空增量；改文字 → 增量帶出新文字） |
+| `edge_dom_subscription_keeps_jpeg_frames` | 後台 DOM 感知訂閱不得停發 WS JPEG 幀；`jpeg-demand off` 後才停 |
 | `edge_upload_action` | Upload 動作：正例（頁面 change 收到文件名:大小）、負例按碼斷言（not_file_input / file_not_found）、單選文件框多文件截斷（Done.note 註明、頁面只收首個） |
 | `edge_observe_modes_budget` | observe 全字段：mode=text/tree/tree_image 響應組成、budget_tokens 裁剪響應視圖且存儲幀不動（裁剪後點擊仍成）、subtree 子樹與不存在 id 回 400、include_offscreen 默認過濾視口外元素、since_frame 增量（基幀對齊、upsert 含新值、未知基幀回完整、text 模式不走增量） |
 | `edge_dom_sub_idempotent_and_cleanup` | D01/D02：同連接重複 dom-start 只訂閱一次；配對 stop 回零、多餘 stop 不倒扣；直接斷開（不發 dom-stop）名額照常回收（/health `dom_viewers` 斷言） |

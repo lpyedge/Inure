@@ -49,6 +49,47 @@ struct FrameState {
     /// 与 obs 同快照的定位表（配对本体）：无元素目标的动作直接
     /// 用存储帧校验+执行，读到的就是这一对，不会错位。
     locate: LocateMap,
+    /// 采集前后主文档 loaderId 一致时才记录（采集期间换页则为 None）：
+    /// 动作前快速复核据此确认“还是同一个文档”。
+    loader: Option<String>,
+    /// 采集完成时刻：拒绝时复用刚采的帧而不重采
+    at: std::time::Instant,
+    /// 采集**开始前**的变化日志序号与视口状态：之后无结构类通知且视口
+    /// 没动，页面就算“没变”（呈现一侧据此跳过采集，见 changes.rs）
+    mark: u64,
+    view: Option<[f32; 4]>,
+}
+
+/// 把 CDP 结构类事件同步喂进变化日志（读泵内、先于其后的命令响应，
+/// 顺序确定；无异步队列，也就没有溢出丢事件的情况）。
+fn spawn_change_listener(browser: &Browser, log: Arc<crate::changes::ChangeLog>) {
+    browser.cdp.tap(Arc::new(move |ev| {
+        if let Some(hit) = crate::changes::classify(&ev.method, &ev.params) {
+            log.record(ev.session.as_deref().unwrap_or(""), hit);
+        }
+    }));
+}
+
+/// 以 `prev` 为基帧、`full` 为目标，生成增量输出（文本说明 + delta）。
+fn delta_out(prev: Observation, full: &Observation, include_offscreen: bool) -> ObserveOut {
+    let (base, target) = if include_offscreen {
+        (prev, full.clone())
+    } else {
+        let mut b = prev;
+        b.elements = strip_offscreen(std::mem::take(&mut b.elements));
+        let mut t = full.clone();
+        t.elements = strip_offscreen(std::mem::take(&mut t.elements));
+        (b, t)
+    };
+    let delta = diff_observations(&base, &target);
+    let text = format!(
+        "[增量观察：帧 {} → {}，upsert {} 个子树、移除 {} 个元素。增量本体在 delta 字段（HTTP）/ 第二个文本块（MCP）；base 不匹配或需要顺序时请重新完整 observe。]\n",
+        delta.base_frame,
+        delta.frame_id,
+        delta.upserts.len(),
+        delta.removed.len()
+    );
+    ObserveOut::Delta(delta, text)
 }
 
 pub struct AiChannel {
@@ -70,6 +111,9 @@ pub struct AiChannel {
     idem: Mutex<Vec<(String, std::time::Instant, ActionResult)>>,
     /// 人机交互模型的执行状态（与人通道共享，见 exec.rs）
     exec: Arc<ExecControl>,
+    /// 页面变化日志：监听浏览器的结构类通知，供“呈现”一侧判断页面
+    /// 变没变（与 act 解耦，见 changes.rs）
+    changes: Arc<crate::changes::ChangeLog>,
     /// 当前动作的意图标签（供 AI 指针显示），act 执行前设置
     pending_label: Mutex<Option<String>>,
     pub allowed_origins: Vec<String>,
@@ -81,8 +125,11 @@ impl AiChannel {
         allowed_origins: Vec<String>,
         exec: Arc<ExecControl>,
     ) -> AiChannel {
+        let changes = Arc::new(crate::changes::ChangeLog::new(512, 64));
+        spawn_change_listener(&browser, changes.clone());
         AiChannel {
             browser,
+            changes,
             ids: Mutex::new(IdMap::default()),
             frame: AtomicU64::new(0),
             state: Mutex::new(None),
@@ -93,6 +140,11 @@ impl AiChannel {
             pending_label: Mutex::new(None),
             allowed_origins,
         }
+    }
+
+    /// 变化日志当前序号（/health 暴露，供观测与测试）
+    pub fn changes_mark(&self) -> u64 {
+        self.changes.mark()
     }
 
     fn next_frame(&self) -> u64 {
@@ -107,9 +159,19 @@ impl AiChannel {
     /// （它是一张真实快照），只是不安装为当前状态。
     async fn observe_full(&self) -> Result<(Observation, LocateMap, Vec<String>), String> {
         let fid = self.next_frame();
+        let loader0 = self.browser.main_loader_id().await.ok();
+        let mark = self.changes.mark();
+        let view = match self.browser.main().await {
+            Ok(m) => self.browser.view_state(&m).await.ok(),
+            Err(_) => None,
+        };
         let (obs, locate, warnings) = {
             let mut ids = self.ids.lock().await;
             build_observation(&self.browser, &mut ids, fid).await?
+        };
+        let loader = match (&loader0, self.browser.main_loader_id().await) {
+            (Some(a), Ok(b)) if *a == b => Some(b),
+            _ => None,
         };
         {
             let mut st = self.state.lock().await;
@@ -118,6 +180,10 @@ impl AiChannel {
                 *st = Some(FrameState {
                     obs: obs.clone(),
                     locate: locate.clone(),
+                    loader,
+                    at: std::time::Instant::now(),
+                    mark,
+                    view,
                 });
             }
         }
@@ -170,6 +236,14 @@ impl AiChannel {
     async fn observe_req_inner(&self, req: &ObserveRequest) -> Result<ObserveOut, String> {
         // R-14：采集前记主文档 loaderId，采集后比对——期间发生
         // 导航则快照与截图可能不是同一页，必须警告观察者
+        // 呈现一侧：带 since_frame 的增量请求，页面没变就不采集
+        if req.mode == ObserveMode::Tree && req.subtree.is_none() && req.budget_tokens.is_none() {
+            if let Some(since) = req.since_frame {
+                if let Some(out) = self.try_unchanged(since).await {
+                    return Ok(out);
+                }
+            }
+        }
         let loader0 = self.browser.main_loader_id().await.ok();
         let (full, _, mut warn) = self.observe_full().await?;
 
@@ -184,24 +258,7 @@ impl AiChannel {
                     .find(|o| o.frame_id == since)
                     .cloned();
                 if let Some(prev) = prev {
-                    let (base, target) = if req.include_offscreen {
-                        (prev, full.clone())
-                    } else {
-                        let mut b = prev;
-                        b.elements = strip_offscreen(std::mem::take(&mut b.elements));
-                        let mut t = full.clone();
-                        t.elements = strip_offscreen(std::mem::take(&mut t.elements));
-                        (b, t)
-                    };
-                    let delta = diff_observations(&base, &target);
-                    let text = format!(
-                        "[增量观察：帧 {} → {}，upsert {} 个子树、移除 {} 个元素。增量本体在 delta 字段（HTTP）/ 第二个文本块（MCP）；base 不匹配或需要顺序时请重新完整 observe。]\n",
-                        delta.base_frame,
-                        delta.frame_id,
-                        delta.upserts.len(),
-                        delta.removed.len()
-                    );
-                    return Ok(ObserveOut::Delta(delta, text));
+                    return Ok(delta_out(prev, &full, req.include_offscreen));
                 }
             }
         }
@@ -234,18 +291,27 @@ impl AiChannel {
         if let Some(n) = note {
             text.push_str(&format!("[{n}]\n"));
         }
-        let image = if req.mode == ObserveMode::TreeImage {
+        let mut image = if req.mode == ObserveMode::TreeImage {
             let main = self.browser.main().await?;
             let png = self.browser.screenshot_png(&main).await?;
-            Some(draw_marks(&png, &view)?)
+            // 打码取自完整快照（响应视图可能被子树/预算裁掉敏感字段），
+            // 描边编号取自响应视图
+            Some(draw_marks(&png, &view, &full)?)
         } else {
             None
         };
-        // R-14 收尾：采集期间主文档导航过 → 快照/截图可能不是
-        // 同一页，如实警告（不假装同帧）
+        // R-14 收尾：采集期间主文档导航过 → 快照/截图不是同一页：
+        // 截图（遮罩可能错位）不交付，只留警告
         if let (Some(a), Ok(b)) = (&loader0, self.browser.main_loader_id().await) {
             if *a != b {
-                warn.push("采集期间页面发生导航：快照与截图可能不一致，请重新 observe".to_string());
+                if image.take().is_some() {
+                    warn.push(
+                        "采集期间页面发生导航：截图已丢弃（遮罩无法确认对齐），请重新 observe"
+                            .to_string(),
+                    );
+                } else {
+                    warn.push("采集期间页面发生导航：快照可能不一致，请重新 observe".to_string());
+                }
             }
         }
         // R-12：部分采集警告必须到达观察者，不静默
@@ -260,7 +326,7 @@ impl AiChannel {
         let (obs, _) = self.observe().await?;
         let main = self.browser.main().await?;
         let png = self.browser.screenshot_png(&main).await?;
-        draw_marks(&png, &obs)
+        draw_marks(&png, &obs, &obs)
     }
 
     pub async fn act(&self, req: ActionRequest) -> ActionResult {
@@ -276,6 +342,161 @@ impl AiChannel {
         self.exec.end(h).await;
         crate::metrics::global().act.record(t0.elapsed());
         r
+    }
+
+    /// 带“拒绝即附最新状态”的 act：被拒原因是页面状态不符（陈旧帧/
+    /// 元素不存在/不可交互/越界）时，程序自己把最新页面状态一并交回，
+    /// AI 不必再多走一轮 observe。请求帧还在历史池就只回增量（局部
+    /// 刷新、省带宽），否则回整帧；刚采的帧（<500ms）直接复用，不再
+    /// 重采。成功、中断、策略类拒绝不附带。取不到最新帧则只回拒绝本身。
+    pub async fn act_with_fresh(&self, req: ActionRequest) -> (ActionResult, Option<ObserveOut>) {
+        let req_frame = req.frame_id;
+        let r = self.act(req).await;
+        let state_related = matches!(
+            &r,
+            ActionResult::Rejected {
+                reason: RejectReason::StaleFrame { .. }
+                    | RejectReason::UnknownElement { .. }
+                    | RejectReason::NotInteractable { .. }
+                    | RejectReason::OutOfBounds
+            }
+        );
+        if !state_related {
+            return (r, None);
+        }
+        let reusable = {
+            let st = self.state.lock().await;
+            st.as_ref()
+                .filter(|fs| fs.at.elapsed() < std::time::Duration::from_millis(500))
+                .map(|fs| fs.obs.clone())
+        };
+        let latest = match reusable {
+            Some(o) => o,
+            None => match self.observe_full().await {
+                Ok((o, _, _)) => o,
+                Err(_) => return (r, None),
+            },
+        };
+        let prev = self
+            .history
+            .lock()
+            .await
+            .iter()
+            .find(|o| o.frame_id == req_frame)
+            .cloned();
+        let out = match prev {
+            Some(prev) if prev.frame_id != latest.frame_id => delta_out(prev, &latest, false),
+            _ => {
+                let mut view = latest.clone();
+                view.elements = strip_offscreen(std::mem::take(&mut view.elements));
+                let text = render(&view);
+                ObserveOut::Full(view, text, None)
+            }
+        };
+        (r, Some(out))
+    }
+
+    /// 呈现一侧的“没变”判断：调用方带的 since_frame 就是最新存储帧，
+    /// 且自该帧采集起 ①主文档没换 ②没有任何结构类通知 ③视口没滚动/缩放，
+    /// 则页面对 AI 可见的结构与几何都没变，回空增量，不再采集。
+    ///
+    /// 已知盲区（浏览器本身不通知）：不改 DOM 的纯视觉变化（CSS 动画、
+    /// :hover 显隐）。想要权威快照的调用方不带 since_frame 即可。
+    async fn try_unchanged(&self, since: u64) -> Option<ObserveOut> {
+        let st = self.state.lock().await.clone()?;
+        if st.obs.frame_id != since {
+            return None;
+        }
+        let loader = st.loader.as_ref()?;
+        let view0 = st.view?;
+        if self.changes.since(st.mark) != crate::changes::Change::None {
+            return None;
+        }
+        if &self.browser.main_loader_id().await.ok()? != loader {
+            return None;
+        }
+        let main = self.browser.main().await.ok()?;
+        if self.browser.view_state(&main).await.ok()? != view0 {
+            return None;
+        }
+        // 复查：取视口期间若又来了通知，不能算没变
+        if self.changes.since(st.mark) != crate::changes::Change::None {
+            return None;
+        }
+        crate::metrics::global()
+            .observe_unchanged
+            .fetch_add(1, Ordering::Relaxed);
+        Some(ObserveOut::Delta(
+            ObservationDelta {
+                base_frame: since,
+                frame_id: since,
+                upserts: Vec::new(),
+                removed: Vec::new(),
+            },
+            format!("[页面自帧 {since} 起无变化，未重新采集；增量为空。]\n"),
+        ))
+    }
+
+    /// 动作前的单元素快速复核：不重采整页，只向浏览器取目标元素自己的
+    /// AX 节点、DOM 属性和位置，用与整页构建同一个转换（`element_core`）
+    /// 算出元素，与存储帧里的同一元素做 `element_unchanged` 比对。
+    ///
+    /// 只会“确认没变”（返回 true）；任何不一致、出错或不适用（请求帧
+    /// 不是最新存储帧、已换文档、目标不在主会话）一律返回 false，调用
+    /// 方退回整页快照裁决——快路径自己从不判拒绝，因此不会多误拒，
+    /// 也不会放过变化。必须在 scroll_into_view 之前调用（滚动后位置
+    /// 本来就会变）。
+    async fn fast_confirm(&self, st: &FrameState, req_frame: u64, ids: &[&str]) -> bool {
+        if ids.is_empty() || req_frame != st.obs.frame_id {
+            return false;
+        }
+        let Some(loader) = &st.loader else {
+            return false;
+        };
+        let Ok(live_loader) = self.browser.main_loader_id().await else {
+            return false;
+        };
+        if &live_loader != loader {
+            return false;
+        }
+        let Ok(main) = self.browser.main().await else {
+            return false;
+        };
+        let (vw, vh) = (st.obs.space.width, st.obs.space.height);
+        for id in ids {
+            let Some((session, backend)) = st.locate.get(*id) else {
+                return false;
+            };
+            if *session != main {
+                return false; // 子帧需要帧偏移，第一版交给整页快照
+            }
+            let Some(stored) = st.obs.find(id) else {
+                return false;
+            };
+            let Ok(Some(node)) = self.browser.ax_node(session, *backend).await else {
+                return false;
+            };
+            let Ok(attrs) = self.browser.dom_attrs(session, *backend).await else {
+                return false;
+            };
+            let quad = match self.browser.quads(session, *backend).await {
+                Ok(q) => q,
+                Err(_) => return false,
+            };
+            let live = crate::snapshot::element_core(
+                id.to_string(),
+                &node,
+                Some(&attrs),
+                quad,
+                (0.0, 0.0),
+                vw,
+                vh,
+            );
+            if !rig_proto::observation::element_unchanged(stored, &live, 2.0) {
+                return false;
+            }
+        }
+        true
     }
 
     /// 串行 + 幂等层（R-06）：act_lock 内先查幂等缓存，命中
@@ -344,7 +565,35 @@ impl AiChannel {
             .targets()
             .iter()
             .any(|t| matches!(t, Target::Element { .. }));
-        let fresh = if has_element {
+        // 含元素目标时先试单元素快速复核：确认目标没变就直接用存储帧
+        // （同一对 obs+locate），省掉整页重采；复核不成立再整页快照裁决。
+        let fast_ok = if has_element {
+            let ids: Vec<&str> = req
+                .action
+                .targets()
+                .iter()
+                .filter_map(|t| match t {
+                    Target::Element { id } => Some(id.as_str()),
+                    _ => None,
+                })
+                .collect();
+            match seen_state.as_ref() {
+                Some(fs) => self.fast_confirm(fs, req.frame_id, &ids).await,
+                None => false,
+            }
+        } else {
+            false
+        };
+        if has_element {
+            let m = crate::metrics::global();
+            let c = if fast_ok {
+                &m.act_fast_hit
+            } else {
+                &m.act_fast_miss
+            };
+            c.fetch_add(1, Ordering::Relaxed);
+        }
+        let fresh = if has_element && !fast_ok {
             None
         } else {
             seen_state
@@ -446,31 +695,14 @@ impl AiChannel {
             };
         }
         match exec {
-            Ok(note) => {
-                // 动作后刷新帧，Done 携带本次刷新成功构建的帧号（A01）：
-                // 并发 observe 递增的全局帧计数不得冒充本次结果。
-                match self.observe_full().await {
-                    Ok((obs, _, _)) => ActionResult::Done {
-                        frame_id: obs.frame_id,
-                        note,
-                    },
-                    Err(e) => {
-                        // 副作用已执行，不能伪装成 Rejected。用旧契约字段
-                        // 如实说明：所带帧号是动作前校验帧（非动作后帧），
-                        // 调用方必须重新 observe（A01）。
-                        let refresh_note = format!(
-                            "动作已执行；动作后刷新失败（{e}），frame_id 为动作前校验帧，需重新 observe"
-                        );
-                        ActionResult::Done {
-                            frame_id: current.frame_id,
-                            note: Some(match note {
-                                Some(n) => format!("{n}；{refresh_note}"),
-                                None => refresh_note,
-                            }),
-                        }
-                    }
-                }
-            }
+            // 操作与呈现解耦：act 只回答“动作有没有执行”，不再顺手整页重采。
+            // 页面因此变成什么样，由变化日志驱动、调用方按需
+            // observe(since_frame=本帧) 取增量（页面没变则空增量、不采集）。
+            // frame_id 是本动作所基于的校验帧。
+            Ok(note) => ActionResult::Done {
+                frame_id: current.frame_id,
+                note,
+            },
             Err(ExecErr::Aborted) => ActionResult::Aborted {
                 reason: AbortReason::UserTakeover,
             },
@@ -1024,7 +1256,7 @@ fn digit_rows(d: u8) -> [[bool; 3]; 5] {
     rows
 }
 
-fn draw_marks(png: &[u8], obs: &Observation) -> Result<Vec<u8>, String> {
+fn draw_marks(png: &[u8], obs: &Observation, full: &Observation) -> Result<Vec<u8>, String> {
     use image::{Rgba, RgbaImage};
     let img = image::load_from_memory(png).map_err(|e| format!("截圖解码失败: {e}"))?;
     let mut img = img.to_rgba8();
@@ -1053,7 +1285,7 @@ fn draw_marks(png: &[u8], obs: &Observation) -> Result<Vec<u8>, String> {
     };
 
     // 敏感区域打码
-    for r in obs.sensitive_regions() {
+    for r in full.sensitive_regions() {
         let (x1, y1, x2, y2) = to_px(r.0);
         fill_rect(&mut img, x1, y1, x2, y2, black);
     }
@@ -1133,6 +1365,35 @@ fn draw_marks(png: &[u8], obs: &Observation) -> Result<Vec<u8>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 回归（审查 P1）：打码取自完整快照——响应视图被裁掉敏感字段时，
+    /// 截图上对应区域仍必须是黑块。
+    #[test]
+    fn draw_marks_masks_sensitive_from_full_not_trimmed_view() {
+        use rig_proto::observation::{Element, ObservationSource, Origin, Space};
+        let space = Space {
+            width: 100.0,
+            height: 100.0,
+            scale: 1.0,
+        };
+        let mut full = Observation::new(1, ObservationSource::Cdp, space);
+        full.elements = vec![Element::new("e1", "textbox", Origin::A11y)
+            .with_bbox([10.0, 10.0, 50.0, 30.0])
+            .with_states(&[ElementState::Password])];
+        let view = Observation::new(1, ObservationSource::Cdp, space); // 已被裁空
+
+        let white = image::RgbaImage::from_pixel(100, 100, image::Rgba([255, 255, 255, 255]));
+        let mut png = Vec::new();
+        image::DynamicImage::ImageRgba8(white)
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+
+        let out = draw_marks(&png, &view, &full).unwrap();
+        let img = image::load_from_memory(&out).unwrap().to_rgba8();
+        assert_eq!(img.get_pixel(30, 20).0, [0, 0, 0, 255], "敏感区域必须打码");
+        assert_eq!(img.get_pixel(80, 80).0, [255, 255, 255, 255]);
+    }
+
     use futures_util::{SinkExt, StreamExt};
     use std::sync::atomic::AtomicUsize;
 
@@ -1303,29 +1564,20 @@ mod tests {
         }
     }
 
-    /// 报告测试#4：动作后刷新失败时，Done 必须携带本次实际构建的
-    /// 帧号（动作前校验帧），绝不能是并发递增的全局计数器；且必须
-    /// 附注要求重新 observe。旧实现取全局计数器，本测试锁死修法。
+    /// 操作与呈现解耦：act 不再做动作后整页刷新。Done 携带的是动作所基于
+    /// 的校验帧（即当时存储帧），不会为了“看新画面”多采一次——这里让
+    /// 第 3 次 AX 起注入失败，若 act 仍去刷新，就会拿到失败/附注。
     #[tokio::test]
-    async fn act_done_frame_points_at_built_frame_not_counter() {
-        // 第 1/2 次 AX 成功（首帧观察 + 动作中复核），第 3 次（动作后
-        // 刷新）开始注入失败
+    async fn act_done_does_not_refresh_and_points_at_validated_frame() {
         let (_browser, ch) = attach_fake(3).await;
         let (obs, _) = ch.observe().await.expect("首帧观察应建成");
         let f1 = obs.frame_id;
         match ch.act(click_point(f1, 10.0, 10.0)).await {
             ActionResult::Done { frame_id, note } => {
-                assert_eq!(
-                    frame_id, f1,
-                    "Done 必须指向本次构建的校验帧，不能是全局计数"
-                );
-                let n = note.expect("刷新失败必须附注重观察说明");
-                assert!(
-                    n.contains("重新 observe"),
-                    "附注应要求重新 observe，实际: {n}"
-                );
+                assert_eq!(frame_id, f1, "Done 应指向动作所基于的校验帧");
+                assert!(note.is_none(), "没有刷新就没有刷新失败附注，实际: {note:?}");
             }
-            other => panic!("动作后刷新失败应回 Done（副作用已执行），实际: {other:?}"),
+            other => panic!("动作应回 Done，实际: {other:?}"),
         }
     }
 
@@ -1338,6 +1590,88 @@ mod tests {
         match ch.act(click_point(0, 10.0, 10.0)).await {
             ActionResult::Rejected { .. } => {}
             other => panic!("CDP 不可用时动作应干净拒绝，实际: {other:?}"),
+        }
+    }
+
+    /// 被拒（页面状态不符）时由程序自己带回最新状态，AI 不必再多走一轮
+    /// observe：请求帧不在历史池 → 整帧；在历史池 → 只回增量；刚采的帧
+    /// （<500ms）复用不重采，过了则重采；成功动作不附带。
+    #[tokio::test]
+    async fn rejected_stale_attaches_fresh_state() {
+        let (_browser, ch) = attach_fake(usize::MAX).await;
+        let (obs, _) = ch.observe().await.expect("首帧观察应建成");
+        let f1 = obs.frame_id;
+        // 请求帧号不在历史池 → StaleFrame + 整帧；刚采的帧复用，不重采
+        let (r, fresh) = ch.act_with_fresh(click_point(f1 + 100, 10.0, 10.0)).await;
+        assert!(
+            matches!(
+                r,
+                ActionResult::Rejected {
+                    reason: RejectReason::StaleFrame { .. }
+                }
+            ),
+            "实际: {r:?}"
+        );
+        match fresh.expect("陈旧拒绝应附最新状态") {
+            ObserveOut::Full(o, text, _) => {
+                assert_eq!(o.frame_id, f1, "刚采的帧应被复用而非重采");
+                assert!(!text.is_empty());
+            }
+            ObserveOut::Delta(..) => panic!("请求帧不在历史池，应回整帧"),
+        }
+        // 帧过期（>500ms）→ 重采出更新的帧
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+        let (_, fresh) = ch.act_with_fresh(click_point(f1 + 100, 10.0, 10.0)).await;
+        match fresh.unwrap() {
+            ObserveOut::Full(o, _, _) => assert!(o.frame_id > f1, "过期应重采"),
+            ObserveOut::Delta(..) => panic!("应回整帧"),
+        }
+        // 请求帧在历史池且已不是最新 → 回增量
+        let (cur, _) = ch.observe().await.unwrap();
+        let (_, fresh) = ch.act_with_fresh(click_point(f1, 10.0, 10.0)).await;
+        match fresh.unwrap() {
+            ObserveOut::Delta(d, _) => {
+                assert_eq!(d.base_frame, f1);
+                assert!(d.frame_id >= cur.frame_id);
+            }
+            ObserveOut::Full(..) => panic!("请求帧在历史池，应回增量"),
+        }
+        // 成功动作不附带
+        let (cur, _) = ch.observe().await.unwrap();
+        let (r, fresh) = ch
+            .act_with_fresh(click_point(cur.frame_id, 10.0, 10.0))
+            .await;
+        assert!(matches!(r, ActionResult::Done { .. }), "实际: {r:?}");
+        assert!(fresh.is_none(), "成功动作不应附带");
+    }
+
+    fn since_req(since: u64) -> ObserveRequest {
+        ObserveRequest {
+            since_frame: Some(since),
+            mode: ObserveMode::Tree,
+            ..Default::default()
+        }
+    }
+
+    /// 呈现一侧：页面自帧采集起没有任何结构类通知、视口没动 → 带
+    /// since_frame 的 observe 回空增量、不再采集；一旦有通知就必须重新采集。
+    #[tokio::test]
+    async fn observe_since_returns_empty_delta_when_unchanged() {
+        let (_browser, ch) = attach_fake(usize::MAX).await;
+        let (obs, _) = ch.observe().await.expect("首帧观察应建成");
+        let f1 = obs.frame_id;
+        match ch.observe_req(&since_req(f1)).await.unwrap() {
+            ObserveOut::Delta(d, _) => {
+                assert_eq!((d.base_frame, d.frame_id), (f1, f1), "没变不应产生新帧");
+                assert!(d.upserts.is_empty() && d.removed.is_empty());
+            }
+            ObserveOut::Full(..) => panic!("没变应回空增量"),
+        }
+        // 来了一条结构类通知 → 不能再当没变，必须重新采集出新帧
+        ch.changes.record("", crate::changes::Hit::Nodes(vec![1]));
+        match ch.observe_req(&since_req(f1)).await.unwrap() {
+            ObserveOut::Delta(d, _) => assert!(d.frame_id > f1, "有变化应重新采集"),
+            ObserveOut::Full(..) => panic!("应回增量"),
         }
     }
 }

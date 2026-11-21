@@ -26,6 +26,7 @@
 mod ai;
 mod browser;
 mod cdp;
+mod changes;
 mod chrome;
 mod dom;
 mod encode;
@@ -624,6 +625,14 @@ async fn health(State(app): State<Arc<App>>) -> Json<serde_json::Value> {
             "dropped": m.pump_dropped.load(Ordering::Relaxed),
             "rect_refetch": m.pump_rect_refetch.load(Ordering::Relaxed),
         },
+        "changes": {
+            "seq": app.ai.changes_mark(),
+            "observe_unchanged": m.observe_unchanged.load(Ordering::Relaxed),
+        },
+        "act_precheck": {
+            "fast_hit": m.act_fast_hit.load(Ordering::Relaxed),
+            "fast_miss": m.act_fast_miss.load(Ordering::Relaxed),
+        },
         "frames": {
             "sent": m.frames_sent.load(Ordering::Relaxed),
             "skipped": m.frames_skipped.load(Ordering::Relaxed),
@@ -855,8 +864,17 @@ async fn act(State(app): State<Arc<App>>, Json(req): Json<ActionRequest>) -> Res
     if !app.gate_ai.load(Ordering::SeqCst) {
         return channel_off();
     }
-    let result = app.ai.act(req).await;
-    Json(json!({"result": result})).into_response()
+    // 被拒（页面状态不符）时附带最新一帧，调用方不必再补一次 observe
+    let (result, fresh) = app.ai.act_with_fresh(req).await;
+    match fresh {
+        Some(ObserveOut::Delta(delta, text)) => {
+            Json(json!({"result": result, "delta": delta, "text": text})).into_response()
+        }
+        Some(ObserveOut::Full(obs, text, _)) => {
+            Json(json!({"result": result, "observation": obs, "text": text})).into_response()
+        }
+        None => Json(json!({"result": result})).into_response(),
+    }
 }
 
 async fn screenshot(State(app): State<Arc<App>>) -> Response {
@@ -990,9 +1008,11 @@ async fn ws_session(app: Arc<App>, socket: WebSocket, remote: std::net::SocketAd
     // （广播照常接收只丢弃）；RTC 断开/关闭自动恢复 WS 帧
     let rtc_active = Arc::new(AtomicBool::new(false));
     let rtc_on = rtc_active.clone();
-    // DOM 镜像模式同理停发二进制帧（镜像走文本消息）
-    let dom_active = Arc::new(AtomicBool::new(false));
-    let dom_on = dom_active.clone();
+    // 本连接当前是否需要 WS JPEG 帧：只由观看端的 jpeg-demand 决定
+    // （前台 DOM/RTC/HLS 显示时为 false）。后台 DOM 感知订阅不影响它，
+    // 否则 RTC 回退到 canvas 时画面会停在旧帧。
+    let jpeg_want = Arc::new(AtomicBool::new(true));
+    let jpeg_want_tx = jpeg_want.clone();
     // 本连接的 rig-dom 数据通道已打开时，DOM 消息改走 DC：
     // 发送侧跳过 WS 文本副本（会话任务用自己的订阅经 DC 送达）
     let dom_dc_open = Arc::new(AtomicBool::new(false));
@@ -1038,9 +1058,8 @@ async fn ws_session(app: Arc<App>, socket: WebSocket, remote: std::net::SocketAd
                 },
                 f = frames.recv() => match f {
                     Ok(f) => {
-                        if dom_on.load(Ordering::SeqCst) {
-                            // DOM 模式不送二进制帧（镜像走文本消息；
-                            // 工具栏是观看页原生 DOM，不再有条带帧）
+                        if !jpeg_want_tx.load(Ordering::SeqCst) {
+                            // 观看端不消费 JPEG（DOM 镜像/视频元素在显示）
                         } else if rtc_on.load(Ordering::SeqCst) {
                             // RTC 接管画面：WS 帧停发（广播照常收，只丢弃）
                         } else if sink.send(frame_message(&f)).await.is_err() {
@@ -1115,6 +1134,7 @@ async fn ws_session(app: Arc<App>, socket: WebSocket, remote: std::net::SocketAd
                             0
                         }
                     };
+                    jpeg_want.store(on, Ordering::SeqCst);
                     if op != 0 {
                         app2.human.jpeg_demand_add(op);
                     }
@@ -1151,7 +1171,6 @@ async fn ws_session(app: Arc<App>, socket: WebSocket, remote: std::net::SocketAd
                     rtc_session.take();
                 }
                 Some("dom-start") => {
-                    dom_active.store(true, Ordering::SeqCst);
                     // D01：同一连接重复 dom-start 只订阅一次（自动感知+
                     // 前台显示共用一份订阅，不重复发 START）
                     let start = subs2.lock().unwrap().acquire_dom();
@@ -1160,7 +1179,6 @@ async fn ws_session(app: Arc<App>, socket: WebSocket, remote: std::net::SocketAd
                     }
                 }
                 Some("dom-stop") => {
-                    dom_active.store(false, Ordering::SeqCst);
                     let stop = subs2.lock().unwrap().release_dom();
                     if stop {
                         app2.dom.viewer_stop().await;
@@ -1396,20 +1414,30 @@ async fn mcp_call(app: &Arc<App>, params: &serde_json::Value) -> (serde_json::Va
             }
             match serde_json::from_value::<ActionRequest>(args) {
                 Ok(req) => {
-                    let r = app.ai.act(req).await;
+                    let (r, fresh) = app.ai.act_with_fresh(req).await;
                     let taken = matches!(
                         r,
                         ActionResult::Aborted {
                             reason: AbortReason::UserTakeover
                         }
                     );
-                    (
-                        json!({
-                            "content": [{"type": "text", "text": serde_json::to_string(&r).unwrap_or_default()}],
-                            "isError": false
-                        }),
-                        taken,
-                    )
+                    let mut content = vec![
+                        json!({"type": "text", "text": serde_json::to_string(&r).unwrap_or_default()}),
+                    ];
+                    // 被拒时附最新帧文本视图（第二个文本块）
+                    match fresh {
+                        Some(ObserveOut::Delta(delta, text)) => {
+                            content.push(json!({"type": "text", "text": text}));
+                            content.push(
+                                json!({"type": "text", "text": serde_json::to_string(&delta).unwrap_or_default()}),
+                            );
+                        }
+                        Some(ObserveOut::Full(_, text, _)) => {
+                            content.push(json!({"type": "text", "text": text}));
+                        }
+                        None => {}
+                    }
+                    (json!({"content": content, "isError": false}), taken)
                 }
                 Err(e) => (err(format!("ActionRequest 解析失败: {e}")), false),
             }

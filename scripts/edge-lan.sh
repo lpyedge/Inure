@@ -46,8 +46,10 @@ if [ ! -S "$SOCK" ]; then
 fi
 "$PA/usr/bin/pactl" set-default-sink rigsink >/dev/null 2>&1 || true
 
-BIN="$ROOT/.temp/target/debug/rig-edge-browser"
-[ -x "$BIN" ] || { echo "先 cargo build"; exit 1; }
+# 优先 release：debug 构建下 DOM 序列化/JPEG/合成慢一个量级（实测 DOM 模式明显卡顿）
+BIN="$ROOT/.temp/target/release/rig-edge-browser"
+[ -x "$BIN" ] || BIN="$ROOT/.temp/target/debug/rig-edge-browser"
+[ -x "$BIN" ] || { echo "先 cargo build --release"; exit 1; }
 RIG_EDGE_TOKEN="$TOKEN" PULSE_SERVER="$PULSE_SERVER" PULSE_SINK=rigsink \
   "$BIN" --listen "$IP:$PORT" --human --av \
   >"$ROOT/.temp/edge-lan.log" 2>&1 &

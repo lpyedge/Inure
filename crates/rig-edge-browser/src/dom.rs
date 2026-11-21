@@ -17,9 +17,13 @@ use crate::human::HumanChannel;
 /// 页内序列化器：节点 id 注册表 + 快照 + MutationObserver 差分 +
 /// 表单/滚动旁路事件。经 __rigSend 绑定回传边缘。
 const SCRIPT: &str = r##"(() => {
+  // 只在顶层 frame 工作：注入脚本会进入每个同进程子 frame（about:blank、同源
+  // iframe 等），它们各自上报 installed，每次都触发整页快照；同源 iframe 的内容
+  // 本来就由顶层序列化器经 contentDocument 内联
+  if (window.top !== window) return;
   if (window.__rigDom) { window.__rigDom.hello(); return; }
   const S = { next: 1, ids: new WeakMap(), byId: new Map(), obs: null, queue: [], timer: 0,
-              cap: {}, dead: new Set(), capT: 0, blanks: new Map(),
+              cap: {}, dead: new Set(), capT: 0, blanks: new Map(), dseq: 0,
               watched: new WeakSet(), fdepth: 0 };
   const send = (o) => { try { window.__rigSend(JSON.stringify(o)); } catch (e) {} };
   function rid(node) {
@@ -216,8 +220,16 @@ const SCRIPT: &str = r##"(() => {
   }
   function snapshot() {
     S.cap = {}; // 镜像重建后占位块是新的：强制下一拍重发 canvas 帧
+    // 快照读的是当前整棵 DOM，队列里尚未发出的增量都已被它包含；留着的话
+    // 这批 add 会排在快照之后送达，镜像里同一 id 的节点就多出一份（旧的那份
+    // 永远不再被更新/删除——YouTube 字幕残留与重复的成因）
+    S.vw = window.innerWidth; S.vh = window.innerHeight;
+    S.queue = [];
+    // 已入观察器队列、尚未送达回调的记录同样已被快照包含：取出丢弃
+    // （只清被移除节点的 id，免得漏引用）
+    if (S.obs) { for (const r of S.obs.takeRecords()) for (const n of r.removedNodes) dropSubtree(n); }
     const cc = collectCss();
-    return { url: location.href, title: document.title, w: window.innerWidth, h: window.innerHeight,
+    return { ps: S.dseq, url: location.href, title: document.title, w: window.innerWidth, h: window.innerHeight,
              sx: Math.round(window.scrollX), sy: Math.round(window.scrollY),
              mode: document.compatMode,
              css: cc.css, links: cc.links, tree: ser(document.documentElement) };
@@ -255,7 +267,7 @@ const SCRIPT: &str = r##"(() => {
     // 增量上限（R-08/R-20）：突变风暴下宁可整帧重同步，
     // 不让无界队列拖垮页面与通道
     if (S.queue.length > 3000) { S.queue = []; send({ kind: 'resync' }); return; }
-    const ops = S.queue; S.queue = []; send({ kind: 'delta', ops });
+    const ops = S.queue; S.queue = []; send({ kind: 'delta', ops, ps: ++S.dseq });
   }
   // 删除一棵已移除子树的 id 映射（R-08：只发 rm 不清映射，
   // 被删节点会被 byId/ids 强引用到页面关闭，SPA 长开必漏）
@@ -272,15 +284,35 @@ const SCRIPT: &str = r##"(() => {
   function onMutations(recs) {
     for (const r of recs) {
       if (document.head && (r.target === document.head || (r.target.nodeType === 1 && document.head.contains(r.target)))) {
-        send({ kind: 'resync' }); return;
+        // script/noscript 不进镜像：YouTube 等站点的脚本加载器持续往 head 里增删
+        // <script>、改其属性，若都触发整页重同步，镜像会每 ~300ms 整体重建一次
+        // （导航后内容要等数秒才切过来、整体卡顿的成因）。只有真影响样式/标题的
+        // head 变动（link/style/meta/title…）才重同步
+        const sc = (n) => n.nodeType === 1 && (n.tagName === 'SCRIPT' || n.tagName === 'NOSCRIPT');
+        const inScript = r.target.nodeType === 1 && (sc(r.target) || !!r.target.closest('script,noscript'));
+        const only = r.type === 'childList' && (r.addedNodes.length + r.removedNodes.length) > 0 &&
+          [...r.addedNodes, ...r.removedNodes].every(sc);
+        if (inScript || only) continue;
+        // 加载期 link/style 陆续插入：合并成一次尾随重同步，别每次变动都整页重发
+        if (!S.hT) S.hT = setTimeout(() => { S.hT = 0; send({ kind: 'resync' }); }, 500);
+        return;
       }
       if (r.type === 'childList') {
         for (const n of r.removedNodes) { const id = S.ids.get(n); if (id) S.queue.push({ o: 'rm', i: id }); dropSubtree(n); }
         for (const n of r.addedNodes) {
+          // 同一批里先加父、再往父里加子：ser(父) 读的是回调时的最终 DOM，
+          // 已含该子节点并给它分配了 id；这条子节点记录再发一次 add 会让
+          // 镜像里重复一份（实测 YouTube 字幕逐字翻倍：「日本日本のの教科教科書書」）。
+          // 已有 id 的节点必然已被序列化过（移动/删除会先 dropSubtree 清 id）
+          if (S.ids.has(n)) continue;
           const s = ser(n);
           if (s) {
-            const nb = n.nextSibling ? S.ids.get(n.nextSibling) : undefined;
-            S.queue.push({ o: 'add', p: rid(r.target), b: nb || 0, n: s });
+            // 参照节点取后面第一个已有 id 的兄弟：同一记录里连加多个节点时
+            // 紧邻的后兄弟还没序列化（无 id），直接取它会退化成「追加到末尾」，
+            // 排到已有的后兄弟之后，次序错乱
+            let nb = 0;
+            for (let x = n.nextSibling; x; x = x.nextSibling) { const xi = S.ids.get(x); if (xi) { nb = xi; break; } }
+            S.queue.push({ o: 'add', p: rid(r.target), b: nb, n: s });
           }
         }
       } else if (r.type === 'attributes') {
@@ -298,7 +330,10 @@ const SCRIPT: &str = r##"(() => {
   document.addEventListener('input', onInputVal, true);
   let rzT = 0;
   window.addEventListener('resize', () => {
-    // 视口变化会整体重排版：防抖后请边缘重发快照（镜像几何以快照为准）
+    // 视口变化会整体重排版：防抖后请边缘重发快照（镜像几何以快照为准）。
+    // 视口尺寸没变就不重发：YouTube 等站点会自行周期性派发 resize 事件，
+    // 当真就是每 ~300ms 整页重建一次镜像
+    if (window.innerWidth === S.vw && window.innerHeight === S.vh) return;
     const now = performance.now(); if (now - rzT < 300) return; rzT = now;
     setTimeout(() => send({ kind: 'resync' }), 350);
   });
@@ -360,7 +395,7 @@ const SCRIPT: &str = r##"(() => {
       c.width = el.naturalWidth; c.height = el.naturalHeight;
       c.getContext('2d').drawImage(el, 0, 0);
       return c.toDataURL('image/png').split(',')[1];
-    } catch (e) { return ''; }
+    } catch (e) { return /^https?:/.test(el.currentSrc) ? '@' + el.currentSrc : ''; }
   }
   window.__rigDom = {
     snapshot,
@@ -404,6 +439,11 @@ pub struct DomChannel {
     human: Arc<HumanChannel>,
     msgs: broadcast::Sender<String>,
     seq: AtomicU64,
+    /// 最近一份快照在页内的增量序号（`ps`）。快照与增量分属不同路径
+    /// （eval 返回 vs 绑定事件），快照读取之前就已发出的增量会在快照
+    /// 之后才被处理；它们已被快照包含，重放就会重复 add。持锁覆盖
+    /// 「取快照→广播」与「判重→广播增量」，保证两者在广播流里有序
+    snap_ps: Mutex<Option<u64>>,
     viewers: AtomicUsize,
     active: AtomicBool,
     /// 已完成绑定+脚本注册的会话（避免重复 addScript）
@@ -423,6 +463,7 @@ impl DomChannel {
             human,
             msgs,
             seq: AtomicU64::new(0),
+            snap_ps: Mutex::new(None),
             viewers: AtomicUsize::new(0),
             active: AtomicBool::new(false),
             setup_for: Mutex::new(None),
@@ -565,6 +606,11 @@ impl DomChannel {
                         match p.get("kind").and_then(Value::as_str) {
                             Some("delta") => {
                                 if let Some(ops) = p.get("ops") {
+                                    let last = me.snap_ps.lock().await;
+                                    let ps = p.get("ps").and_then(Value::as_u64);
+                                    if matches!((ps, *last), (Some(ps), Some(sp)) if ps <= sp) {
+                                        continue; // 已被更晚的快照包含
+                                    }
                                     me.broadcast(json!({"type": "dom-delta", "seq": me.next_seq(), "ops": ops}));
                                 }
                             }
@@ -721,6 +767,8 @@ impl DomChannel {
                 }
             }
         }
+        let mut last_ps = self.snap_ps.lock().await;
+        *last_ps = None;
         let t0 = std::time::Instant::now();
         let r = self
             .browser
@@ -732,6 +780,7 @@ impl DomChannel {
         crate::metrics::global().dom_flush.record(t0.elapsed());
         match r {
             Ok(Value::Object(mut snap)) => {
+                *last_ps = snap.get("ps").and_then(Value::as_u64);
                 snap.insert("type".into(), json!("dom-snapshot"));
                 snap.insert("seq".into(), json!(self.next_seq()));
                 self.broadcast(Value::Object(snap));

@@ -26,10 +26,17 @@ struct Pending {
     tx: oneshot::Sender<CdpResult<Value>>,
 }
 
+/// 同步事件钩子：必须轻量、不阻塞（在读泵里直接调用）。
+pub type EventTap = Arc<dyn Fn(&CdpEvent) + Send + Sync>;
+
 pub struct Cdp {
     cmd_tx: mpsc::Sender<String>,
     pending: Arc<Mutex<HashMap<u64, Pending>>>,
     events: broadcast::Sender<CdpEvent>,
+    /// 同步事件钩子：在读泵里、广播之前调用。同一连接上事件总先于其后
+    /// 的命令响应被读到，钩子因此保证“先记账、后放行响应”的确定顺序
+    /// （异步订阅者做不到：它可能晚于后续响应才被调度）。
+    taps: Arc<std::sync::Mutex<Vec<EventTap>>>,
     next_id: AtomicU64,
     /// 读泵存活标志（R-19 可观测：/health 的 cdp_connected）
     alive: Arc<std::sync::atomic::AtomicBool>,
@@ -61,6 +68,9 @@ impl Cdp {
         // 读泵
         let pending2 = pending.clone();
         let events2 = events.clone();
+        let taps: Arc<std::sync::Mutex<Vec<EventTap>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let taps2 = taps.clone();
         let alive = Arc::new(std::sync::atomic::AtomicBool::new(true));
         let alive2 = alive.clone();
         tokio::spawn(async move {
@@ -79,14 +89,18 @@ impl Cdp {
                         let _ = p.tx.send(res);
                     }
                 } else if let Some(method) = v.get("method").and_then(Value::as_str) {
-                    let _ = events2.send(CdpEvent {
+                    let ev = CdpEvent {
                         session: v
                             .get("sessionId")
                             .and_then(Value::as_str)
                             .map(str::to_string),
                         method: method.to_string(),
                         params: v.get("params").cloned().unwrap_or(Value::Null),
-                    });
+                    };
+                    for t in taps2.lock().unwrap().iter() {
+                        t(&ev);
+                    }
+                    let _ = events2.send(ev);
                 }
             }
             // 读泵结束 = 连接已断：让全部在途命令立即失败，
@@ -102,6 +116,7 @@ impl Cdp {
             cmd_tx,
             pending,
             events,
+            taps,
             next_id: AtomicU64::new(1),
             alive,
             calls: AtomicU64::new(0),
@@ -120,6 +135,11 @@ impl Cdp {
             self.calls.load(std::sync::atomic::Ordering::Relaxed),
             self.call_us.load(std::sync::atomic::Ordering::Relaxed),
         )
+    }
+
+    /// 注册同步事件钩子（见 `taps`）。
+    pub fn tap(&self, f: EventTap) {
+        self.taps.lock().unwrap().push(f);
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<CdpEvent> {
