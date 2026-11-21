@@ -24,8 +24,11 @@ const SCRIPT: &str = r##"(() => {
   if (window.__rigDom) { window.__rigDom.hello(); return; }
   const S = { next: 1, ids: new WeakMap(), byId: new Map(), obs: null, queue: [], timer: 0,
               cap: {}, dead: new Set(), capT: 0, blanks: new Map(), dseq: 0,
-              watched: new WeakSet(), fdepth: 0 };
-  const send = (o) => { try { window.__rigSend(JSON.stringify(o)); } catch (e) {} };
+              watched: new Map(), fdepth: 0 };
+  const send = (o) => {
+    if (!S.obs && o.kind !== 'installed') return;
+    try { window.__rigSend(JSON.stringify(o)); } catch (e) {}
+  };
   function rid(node) {
     let id = S.ids.get(node);
     if (!id) { id = S.next++; S.ids.set(node, id); S.byId.set(id, node); }
@@ -141,7 +144,6 @@ const SCRIPT: &str = r##"(() => {
   // 的 val 旁路（id 注册表跨文档共享，镜像端按 id 定位即可）。
   function watchFrame(el, d) {
     if (S.watched.has(d)) return;
-    S.watched.add(d);
     let last = 0;
     try {
       const mo = new MutationObserver(() => {
@@ -149,11 +151,22 @@ const SCRIPT: &str = r##"(() => {
         send({ kind: 'resync' });
       });
       mo.observe(d.documentElement, { subtree: true, childList: true, attributes: true, characterData: true });
+      const onLoad = () => {
+        S.watched.get(d)?.();
+        S.watched.delete(d);
+        send({ kind: 'resync' });
+      };
+      S.watched.set(d, () => {
+        mo.disconnect();
+        d.removeEventListener('input', onInputVal, true);
+        el.removeEventListener('load', onLoad);
+      });
+      d.addEventListener('input', onInputVal, true);
+      el.addEventListener('load', onLoad);
     } catch (e) {}
-    d.addEventListener('input', onInputVal, true);
-    el.addEventListener('load', () => send({ kind: 'resync' }));
   }
   function onInputVal(e) {
+    if (!S.obs) return;
     const t = e.target;
     if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT')) {
       S.queue.push({ o: 'val', i: rid(t), v: t.value, k: t.checked ? 1 : 0 }); schedule();
@@ -251,6 +264,7 @@ const SCRIPT: &str = r##"(() => {
     return S.blanks.get(key);
   }
   function capCanvases() {
+    if (!S.obs) return;
     for (const [id, node] of S.byId) {
       if (S.dead.has(id) || !node || node.tagName !== 'CANVAS' || !node.isConnected) continue;
       const w = node.width, h = node.height;
@@ -328,17 +342,20 @@ const SCRIPT: &str = r##"(() => {
     schedule();
   }
   document.addEventListener('input', onInputVal, true);
-  let rzT = 0;
+  let rzT = 0, rzSend = 0;
   window.addEventListener('resize', () => {
+    if (!S.obs) return;
     // 视口变化会整体重排版：防抖后请边缘重发快照（镜像几何以快照为准）。
     // 视口尺寸没变就不重发：YouTube 等站点会自行周期性派发 resize 事件，
     // 当真就是每 ~300ms 整页重建一次镜像
     if (window.innerWidth === S.vw && window.innerHeight === S.vh) return;
     const now = performance.now(); if (now - rzT < 300) return; rzT = now;
-    setTimeout(() => send({ kind: 'resync' }), 350);
+    clearTimeout(rzSend);
+    rzSend = setTimeout(() => send({ kind: 'resync' }), 350);
   });
   let scrT = 0, scrTrail = 0;
   const pushScr = (t) => {
+    if (!S.obs) return;
     if (t === document || t === document.documentElement || t === document.body) {
       S.queue.push({ o: 'scr', i: 0, x: Math.round(window.scrollX), y: Math.round(window.scrollY) });
     } else if (t && t.nodeType === 1) {
@@ -347,6 +364,7 @@ const SCRIPT: &str = r##"(() => {
     schedule();
   };
   document.addEventListener('scroll', (e) => {
+    if (!S.obs) return;
     const now = performance.now();
     const t = e.target;
     if (now - scrT < 50) {
@@ -412,6 +430,16 @@ const SCRIPT: &str = r##"(() => {
     stop() {
       if (S.obs) { S.obs.disconnect(); S.obs = null; }
       if (S.capT) { clearInterval(S.capT); S.capT = 0; }
+      for (const cleanup of S.watched.values()) cleanup();
+      S.watched.clear();
+      for (const timer of [S.timer, S.hT, scrTrail, rzSend]) clearTimeout(timer);
+      S.timer = S.hT = scrTrail = rzSend = 0;
+      S.queue = [];
+      S.byId.clear();
+      S.ids = new WeakMap();
+      S.dead.clear();
+      S.cap = {};
+      S.blanks.clear();
     }
   };
   send({ kind: 'installed' });
@@ -434,6 +462,34 @@ fn is_internal_url(u: &str) -> bool {
     SCHEMES.iter().any(|s| u.starts_with(s))
 }
 
+// One geometry query for the display heuristic. No tree, page text, observer or capture.
+const MODE_SUMMARY: &str = r#"(() => {
+  const area = (el) => {
+    const r = el.getBoundingClientRect();
+    if (r.width <= 0 || r.height <= 0 || getComputedStyle(el).visibility !== 'visible') return 0;
+    return Math.max(0, Math.min(innerWidth, r.right) - Math.max(0, r.left)) *
+           Math.max(0, Math.min(innerHeight, r.bottom) - Math.max(0, r.top));
+  };
+  let video = 0, canvas = 0, regions = 0, interactive = 0;
+  for (const el of document.querySelectorAll('video, canvas, iframe')) {
+    const a = area(el);
+    if (el.localName === 'video') { video += a; regions += a; }
+    else if (el.localName === 'canvas') canvas += a;
+    else if (!el.contentDocument) regions += a;
+  }
+  for (const el of document.querySelectorAll('a[href], button, input, select, textarea, [role="button"], [contenteditable="true"]')) {
+    if (area(el) && ++interactive === 3) break;
+  }
+  const ratio = (a) => Math.min(1, a / Math.max(1, innerWidth * innerHeight));
+  return {url: location.href, videoRatio: ratio(video), regionRatio: ratio(regions),
+          canvasRatio: ratio(canvas), interactive};
+})()"#;
+
+struct DomSetup {
+    session: String,
+    script: Option<String>,
+}
+
 pub struct DomChannel {
     browser: Arc<Browser>,
     human: Arc<HumanChannel>,
@@ -446,8 +502,9 @@ pub struct DomChannel {
     snap_ps: Mutex<Option<u64>>,
     viewers: AtomicUsize,
     active: AtomicBool,
-    /// 已完成绑定+脚本注册的会话（避免重复 addScript）
-    setup_for: Mutex<Option<String>>,
+    /// Serialize observer installation, tab changes and the final unsubscribe.
+    lifecycle: Mutex<()>,
+    setup_for: Mutex<Option<DomSetup>>,
     pump: Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// 区域子流的当前采集目标会话（泵按视图变化维护，区域任务
     /// 只读）——F-01：区域采集独立任务，与差分泵解耦
@@ -466,6 +523,7 @@ impl DomChannel {
             snap_ps: Mutex::new(None),
             viewers: AtomicUsize::new(0),
             active: AtomicBool::new(false),
+            lifecycle: Mutex::new(()),
             setup_for: Mutex::new(None),
             pump: Mutex::new(None),
             region_session: Mutex::new(None),
@@ -490,21 +548,39 @@ impl DomChannel {
         let _ = self.msgs.send(v.to_string());
     }
 
-    /// 一个观看连接进入 DOM 模式
+    pub async fn mode_summary(&self) -> Option<Value> {
+        let page = self.browser.active_page().await.ok()?;
+        let summary = self
+            .browser
+            .eval_json(&page.session, MODE_SUMMARY)
+            .await
+            .ok()?;
+        if self.browser.active_page().await.ok()? != page {
+            return None;
+        }
+        let url = summary.get("url")?.as_str()?;
+        let ratio = |field| {
+            let value = summary.get(field)?.as_f64()?;
+            (0.0..=1.0).contains(&value).then_some(value)
+        };
+        Some(json!({
+            "supported": !is_internal_url(url),
+            "videoRatio": ratio("videoRatio")?,
+            "regionRatio": ratio("regionRatio")?,
+            "canvasRatio": ratio("canvasRatio")?,
+            "interactive": summary.get("interactive")?.as_u64()?.min(3),
+        }))
+    }
+
     pub async fn viewer_start(self: &Arc<Self>) {
+        let _transition = self.lifecycle.lock().await;
         let first = self.viewers.fetch_add(1, Ordering::SeqCst) == 0;
         if first {
             self.active.store(true, Ordering::SeqCst);
             self.ensure_pump().await;
         }
         if let Some(s) = self.human.current_view().await {
-            // 每次进入都确保页内观察者在跑：页面导航/刷新后序列化
-            // 器是新实例（观察者未启动），只靠首个观看者那次 start
-            // 不够——计数一旦因断线泄漏，后来者永远走补快照分支，
-            // 增量会静默死亡（实测）。setup_session 对已装会话只
-            // 补一发 start() eval，开销可忽略
-            self.setup_session(&s).await;
-            self.snapshot(&s).await;
+            self.refresh(&s).await;
         } else if first {
             self.broadcast(
                 json!({"type": "dom-state", "state": "error", "reason": "人通道未启动"}),
@@ -512,45 +588,44 @@ impl DomChannel {
         }
     }
 
-    /// 一个观看连接退出 DOM 模式
     pub async fn viewer_stop(&self) {
-        // 计数下限为 0：未配对的 stop（重连后的旧页面、重复消息）
-        // 不许把计数减成负数，否则后续 start 的首入判定永久错位。
-        // CAS 循环手写（fetch_update 的继任 API 超出仓库 MSRV）
-        let mut took_last = false;
-        let mut cur = self.viewers.load(Ordering::SeqCst);
-        while cur > 0 {
-            match self
-                .viewers
-                .compare_exchange(cur, cur - 1, Ordering::SeqCst, Ordering::SeqCst)
-            {
-                Ok(_) => {
-                    took_last = cur == 1;
-                    break;
-                }
-                Err(actual) => cur = actual,
+        let _transition = self.lifecycle.lock().await;
+        let count = self.viewers.load(Ordering::SeqCst);
+        if count == 0 {
+            return;
+        }
+        self.viewers.store(count - 1, Ordering::SeqCst);
+        if count != 1 {
+            return;
+        }
+
+        self.active.store(false, Ordering::SeqCst);
+        for slot in [&self.pump, &self.region_pump] {
+            if let Some(task) = slot.lock().await.take() {
+                task.abort();
+                let _ = task.await;
             }
         }
-        if took_last {
-            self.active.store(false, Ordering::SeqCst);
+        *self.region_session.lock().await = None;
+        *self.snap_ps.lock().await = None;
+        if let Some(setup) = self.setup_for.lock().await.take() {
+            self.stop_session(setup).await;
+        }
+    }
+
+    pub async fn resync(&self) {
+        let _transition = self.lifecycle.lock().await;
+        if self.active.load(Ordering::SeqCst) {
             if let Some(s) = self.human.current_view().await {
-                let _ = self
-                    .browser
-                    .eval_json(&s, "window.__rigDom && window.__rigDom.stop()")
-                    .await;
+                self.refresh(&s).await;
             }
         }
     }
 
-    /// 观看端请求重同步（seq 缺口/手动）
-    pub async fn resync(&self) {
-        if !self.active.load(Ordering::SeqCst) {
-            return;
-        }
-        if let Some(s) = self.human.current_view().await {
-            self.setup_session(&s).await;
-            self.snapshot(&s).await;
-        }
+    async fn refresh(&self, session: &str) {
+        self.setup_session(session).await;
+        self.snapshot(session).await;
+        *self.region_session.lock().await = Some(session.to_string());
     }
 
     async fn ensure_pump(self: &Arc<Self>) {
@@ -595,12 +670,16 @@ impl DomChannel {
             loop {
                 tokio::select! {
                     ev = rx.recv() => {
-                        let Ok(ev) = ev else { continue };
+                        let ev = match ev {
+                            Ok(ev) => ev,
+                            Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                            Err(broadcast::error::RecvError::Closed) => break,
+                        };
                         if ev.method != "Runtime.bindingCalled" { continue; }
                         if ev.params.get("name").and_then(Value::as_str) != Some("__rigSend") { continue; }
                         if !me.active.load(Ordering::SeqCst) { continue; }
                         let cur = me.human.current_view().await;
-                        if ev.session.is_some() && cur.is_some() && ev.session != cur { continue; }
+                        if ev.session.is_none() || ev.session != cur { continue; }
                         let Some(payload) = ev.params.get("payload").and_then(Value::as_str) else { continue };
                         let Ok(p) = serde_json::from_str::<Value>(payload) else { continue };
                         match p.get("kind").and_then(Value::as_str) {
@@ -622,14 +701,7 @@ impl DomChannel {
                                 }
                             }
                             Some("installed") | Some("resync") => {
-                                if let Some(s) = cur {
-                                    // installed = 页面导航/刷新后序列化器
-                                    // 重新注入：新实例的观察者尚未启动，
-                                    // 只补快照会让增量静默死亡，必须先
-                                    // setup（内含 start() 补发）
-                                    me.setup_session(&s).await;
-                                    me.snapshot(&s).await;
-                                }
+                                me.resync().await;
                             }
                             _ => {}
                         }
@@ -638,14 +710,9 @@ impl DomChannel {
                         if !me.active.load(Ordering::SeqCst) { continue; }
                         let cur = me.human.current_view().await;
                         if cur != last_view {
-                            last_view = cur.clone();
-                            if let Some(s) = cur {
-                                me.setup_session(&s).await;
-                                me.snapshot(&s).await;
-                            }
+                            last_view = cur;
+                            me.resync().await;
                         }
-                        // 区域采集目标交给独立任务（F-01）
-                        *me.region_session.lock().await = last_view.clone();
                     }
                 }
             }
@@ -702,6 +769,9 @@ impl DomChannel {
                 continue;
             }
             if let Some(data) = self.browser.capture_region(session, x, y, w, h).await {
+                if self.human.current_view().await.as_deref() != Some(session) {
+                    return;
+                }
                 state.insert(key, (sig, std::time::Instant::now()));
                 // D04：只保留当前会话条目（旧会话的 id 会重排复用），
                 // 总量过大时整清（下轮重建，短暂无图但不錯贴）
@@ -716,15 +786,20 @@ impl DomChannel {
 
     /// 给会话装绑定与脚本（同一会话只装一次），并启动页内观察
     async fn setup_session(&self, session: &str) {
+        let mut current = self.setup_for.lock().await;
+        if current
+            .as_ref()
+            .is_some_and(|setup| setup.session == session)
         {
-            let done = self.setup_for.lock().await;
-            if done.as_deref() == Some(session) {
-                let _ = self
-                    .browser
-                    .eval_json(session, "window.__rigDom && window.__rigDom.start()")
-                    .await;
-                return;
-            }
+            let _ = self
+                .browser
+                .eval_json(session, "window.__rigDom && window.__rigDom.start()")
+                .await;
+            return;
+        }
+        if let Some(previous) = current.take() {
+            *self.region_session.lock().await = None;
+            self.stop_session(previous).await;
         }
         let cdp = &self.browser.cdp;
         let _ = cdp.call(Some(session), "Runtime.enable", json!({})).await;
@@ -736,19 +811,42 @@ impl DomChannel {
             )
             .await;
         let _ = cdp.call(Some(session), "Page.enable", json!({})).await;
-        let _ = cdp
+        let script = cdp
             .call(
                 Some(session),
                 "Page.addScriptToEvaluateOnNewDocument",
                 json!({"source": SCRIPT}),
             )
-            .await;
+            .await
+            .ok()
+            .and_then(|v| v.get("identifier")?.as_str().map(str::to_owned));
         let _ = self.browser.eval_json(session, SCRIPT).await;
         let _ = self
             .browser
             .eval_json(session, "window.__rigDom && window.__rigDom.start()")
             .await;
-        *self.setup_for.lock().await = Some(session.to_string());
+        *current = Some(DomSetup {
+            session: session.to_string(),
+            script,
+        });
+    }
+
+    async fn stop_session(&self, setup: DomSetup) {
+        let _ = self
+            .browser
+            .eval_json(&setup.session, "window.__rigDom && window.__rigDom.stop()")
+            .await;
+        if let Some(script) = setup.script {
+            let _ = self
+                .browser
+                .cdp
+                .call(
+                    Some(&setup.session),
+                    "Page.removeScriptToEvaluateOnNewDocument",
+                    json!({"identifier": script}),
+                )
+                .await;
+        }
     }
 
     /// 取一份全量快照并广播（DOM 版关键帧）

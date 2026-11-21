@@ -129,7 +129,7 @@ pub struct Metrics {
     /// 动作前单元素快速复核：确认跳过整页重采 / 退回整页快照的次数
     pub act_fast_hit: AtomicU64,
     pub act_fast_miss: AtomicU64,
-    /// observe(since_frame) 因无变化而未采集的次数
+    /// 已采集候选帧，但投影视图相同而输出空增量的次数
     pub observe_unchanged: AtomicU64,
     /// 帧泵：内容帧丢弃数（无唯一矩形/无干净底图/回退模式）
     pub pump_dropped: AtomicU64,

@@ -19,7 +19,7 @@ use ffmpeg_sys_next as sys;
 use tokio::sync::Mutex;
 
 use crate::encode::{CodecKind, EncoderConfig, VideoEncoder};
-use crate::human::HumanChannel;
+use crate::human::{CaptureLease, HumanChannel};
 
 /// null sink 名称（Chromium 以 PULSE_SINK 指向它，管线从 .monitor 抓音频）。
 pub const SINK_NAME: &str = "rigsink";
@@ -112,22 +112,22 @@ pub async fn ensure_virtual_sink() -> bool {
         .unwrap_or(false)
 }
 
-/// M01：RTC 连通后停 HLS 前的 grace——短暂抖动不断流，5s 后
-/// 仍连通才停，避免频繁起停。
-pub const HLS_RTC_GRACE: Duration = Duration::from_secs(5);
+/// HLS 客户端定期刷新列表或请求分片。超过此时间无有效请求即回收。
+const HLS_IDLE: Duration = Duration::from_secs(12);
 
 struct PipelineInner {
     dir: PathBuf,
     stop: Arc<AtomicBool>,
     handle: std::thread::JoinHandle<()>,
+    last_request: tokio::time::Instant,
+    _capture: CaptureLease,
 }
 
 /// HLS 合流管线：一个进程内编码/合流线程 + 切片目录。
 pub struct MediaPipeline {
     inner: Mutex<Option<PipelineInner>>,
     human: Arc<HumanChannel>,
-    /// M01 用户意图（要不要 AV）与实际运行分离：RTC healthy 时
-    /// HLS 默认不跑，只在连通数归零时兜底
+    /// 用户允许 HLS 播放。实际启动由播放列表请求触发。
     wanted: AtomicBool,
     /// M03 最近一次启动失败的原因（成功即清）：/channels 与 /health
     /// 如实回报，不再吞掉 start() 错误
@@ -151,13 +151,20 @@ impl MediaPipeline {
         }
     }
 
-    /// 启动合流线程（编码器在线程内等首帧尺寸后协商建立）。
-    pub async fn start(&self) -> Result<(), String> {
+    /// 持有管线锁期间启动或更新播放需求。
+    async fn request_playlist(self: &Arc<Self>) -> Result<(), String> {
         let mut guard = self.inner.lock().await;
-        if let Some(inner) = guard.as_ref() {
+        if !self.wanted() {
+            return Ok(());
+        }
+        if let Some(inner) = guard.as_mut() {
             if !inner.handle.is_finished() {
+                inner.last_request = tokio::time::Instant::now();
                 return Ok(());
             }
+        }
+        if let Some(old) = guard.take() {
+            Self::stop_pipeline(old).await;
         }
         let dir = std::env::temp_dir().join(format!("rig-edge-hls-{}", std::process::id()));
         let _ = tokio::fs::remove_dir_all(&dir).await;
@@ -168,6 +175,7 @@ impl MediaPipeline {
             .await
             .map_err(|e| format!("建 HLS 目录失败: {e}"))?;
         let stop = Arc::new(AtomicBool::new(false));
+        let capture = self.human.request_capture();
         let human = self.human.clone();
         let thread_dir = dir.clone();
         let thread_stop = stop.clone();
@@ -175,62 +183,60 @@ impl MediaPipeline {
             .name("rig-media".into())
             .spawn(move || pipeline_main(human, thread_dir, thread_stop))
             .map_err(|e| format!("启动合流线程失败: {e}"))?;
-        *guard = Some(PipelineInner { dir, stop, handle });
+        *guard = Some(PipelineInner {
+            dir,
+            stop: stop.clone(),
+            handle,
+            last_request: tokio::time::Instant::now(),
+            _capture: capture,
+        });
+
+        let weak = Arc::downgrade(self);
+        tokio::spawn(async move {
+            let mut expires = tokio::time::Instant::now() + HLS_IDLE;
+            loop {
+                tokio::time::sleep_until(expires).await;
+                let Some(media) = weak.upgrade() else { return };
+                let mut guard = media.inner.lock().await;
+                let Some(inner) = guard
+                    .as_ref()
+                    .filter(|inner| Arc::ptr_eq(&inner.stop, &stop))
+                else {
+                    return;
+                };
+                expires = inner.last_request + HLS_IDLE;
+                if tokio::time::Instant::now() >= expires {
+                    if let Some(inner) = guard.take() {
+                        Self::stop_pipeline(inner).await;
+                    }
+                    return;
+                }
+            }
+        });
         Ok(())
     }
 
-    pub async fn stop(&self) {
-        if let Some(inner) = self.inner.lock().await.take() {
-            inner.stop.store(true, Ordering::SeqCst);
-            let handle = inner.handle;
-            // M02：合流线程退出前已 join 音频线程；这里再给整个管线
-            // 10s 上限——Pulse 阻塞读极端不归时不把 /channels 挂死，
-            // detached 的线程靠 stop 标记在下个包到达时退出
-            let _ = tokio::time::timeout(
-                Duration::from_secs(10),
-                tokio::task::spawn_blocking(move || {
-                    let _ = handle.join();
-                }),
-            )
-            .await;
-            let _ = tokio::fs::remove_dir_all(&inner.dir).await;
-        }
+    async fn stop_pipeline(inner: PipelineInner) {
+        inner.stop.store(true, Ordering::SeqCst);
+        drop(inner._capture);
+        let handle = inner.handle;
+        // Pulse 阻塞读时不让通道开关无限等线程退出。
+        let _ = tokio::time::timeout(
+            Duration::from_secs(10),
+            tokio::task::spawn_blocking(move || {
+                let _ = handle.join();
+            }),
+        )
+        .await;
+        let _ = tokio::fs::remove_dir_all(&inner.dir).await;
     }
 
-    /// M01 用户意图入口：要 AV → 记下意图，无 RTC 连通才起 HLS；
-    /// 不要 AV → 记下意图并停 HLS。调用方传入当前 RTC 连通数。
-    pub async fn apply_wanted(&self, av: bool, rtc_connected: usize) {
+    pub async fn apply_wanted(&self, av: bool) {
+        let mut guard = self.inner.lock().await;
         self.wanted.store(av, Ordering::SeqCst);
-        if av {
-            self.start_for_fallback(rtc_connected).await;
-        } else {
-            self.stop().await;
-        }
-    }
-
-    /// M01：RTC 归零后的兜底启动——用户要 AV 且确无连通才起。
-    pub async fn start_for_fallback(&self, rtc_connected: usize) {
-        if !hls_should_run(self.wanted.load(Ordering::SeqCst), rtc_connected) {
-            return;
-        }
-        self.start_or_record().await;
-    }
-
-    /// M01：RTC 连通后的多余编码清理——用户要 AV 也停 HLS
-    /// （RTC 音视频双轨独立于 HLS，不受影响）。
-    pub async fn stop_for_rtc(&self) {
-        if self.wanted.load(Ordering::SeqCst) && self.running().await {
-            eprintln!("[media] RTC 已连通：停 HLS 兜底编码（用户 AV 意图保留）");
-            self.stop().await;
-        }
-    }
-
-    async fn start_or_record(&self) {
-        match self.start().await {
-            Ok(()) => *self.last_error.lock().unwrap() = None,
-            Err(e) => {
-                eprintln!("[media] HLS 启动失败: {e}");
-                *self.last_error.lock().unwrap() = Some(e);
+        if !av {
+            if let Some(inner) = guard.take() {
+                Self::stop_pipeline(inner).await;
             }
         }
     }
@@ -248,22 +254,51 @@ impl MediaPipeline {
         )
     }
 
-    /// 读一个 HLS 文件：rendition ∈ {hevc, h264}，name 为平坦文件名。
-    pub async fn read_file(&self, rendition: &str, name: &str) -> Option<Vec<u8>> {
-        if !matches!(rendition, "hevc" | "h264")
+    /// 有效列表请求可启动输出。成功获取文件才续期，猜测不存在的分片不续期。
+    pub async fn read_file(self: &Arc<Self>, rendition: &str, name: &str) -> Option<Vec<u8>> {
+        if !offered_renditions().contains(&rendition)
             || name.contains('/')
             || name.contains('\\')
             || name.contains("..")
         {
             return None;
         }
-        // 只在锁内取目录，文件 IO 在锁外（R-20：此前持锁 await
-        // 读文件，慢盘会把 start/stop 一并堵住）
-        let dir = {
+        let playlist = name == "index.m3u8";
+        if playlist {
+            let status = self.request_playlist().await;
+            *self
+                .last_error
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                status.as_ref().err().cloned();
+            status.ok()?;
+        }
+        let (dir, pipeline) = {
             let guard = self.inner.lock().await;
-            guard.as_ref()?.dir.clone()
+            let inner = guard.as_ref()?;
+            (inner.dir.clone(), inner.stop.clone())
         };
-        tokio::fs::read(dir.join(rendition).join(name)).await.ok()
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+        loop {
+            let file = tokio::fs::read(dir.join(rendition).join(name)).await.ok();
+            if let Some(bytes) =
+                file.filter(|data| !playlist || data.windows(4).any(|bytes| bytes == b".m4s"))
+            {
+                let mut guard = self.inner.lock().await;
+                let inner = guard
+                    .as_mut()
+                    .filter(|inner| Arc::ptr_eq(&inner.stop, &pipeline))?;
+                inner.last_request = tokio::time::Instant::now();
+                return Some(bytes);
+            }
+            if !playlist
+                || pipeline.load(Ordering::SeqCst)
+                || tokio::time::Instant::now() >= deadline
+            {
+                return None;
+            }
+            tokio::time::sleep(Duration::from_millis(75)).await;
+        }
     }
 }
 
@@ -564,12 +599,6 @@ fn pipeline_main(human: Arc<HumanChannel>, dir: PathBuf, stop: Arc<AtomicBool>) 
     }
 }
 
-/// M01 纯策略：用户要 AV 且无 RTC 连通 → HLS 才该跑。
-/// RTC healthy 时 HLS 默认不跑（省一路 H.264 + 一路 AAC 编码）。
-fn hls_should_run(wanted: bool, rtc_connected: usize) -> bool {
-    wanted && rtc_connected == 0
-}
-
 /// yuv420 编码要求偶数尺寸：奇数边向下取偶（帧泵存 RGB 时已
 /// 凑偶，这里兜底任意来源）。
 fn even_dims(w: u32, h: u32) -> (u32, u32) {
@@ -770,16 +799,6 @@ fn audio_main(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// M01 策略表：只有“用户要 AV 且零 RTC 连通”才跑 HLS
-    #[test]
-    fn hls_runs_only_as_fallback() {
-        assert!(hls_should_run(true, 0));
-        assert!(!hls_should_run(true, 1));
-        assert!(!hls_should_run(true, 3));
-        assert!(!hls_should_run(false, 0));
-        assert!(!hls_should_run(false, 2));
-    }
 
     /// RIG_HLS_SINGLE 取值口径
     #[test]

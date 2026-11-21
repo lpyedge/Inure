@@ -3,19 +3,20 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use rig_proto::observation::{
     check_element_target, check_point_target, diff_observations, AbortReason, Action,
-    ActionRequest, ActionResult, ElementState, MouseButton, Observation, ObservationDelta,
+    ActionRequest, ActionResult, BBox, ElementState, MouseButton, Observation, ObservationDelta,
     ObserveMode, ObserveRequest, RejectReason, Target,
 };
 use tokio::sync::Mutex;
 
-use crate::browser::Browser;
+use crate::browser::{ActivePage, Browser, ViewState};
 use crate::exec::{ExecControl, ExecHandle};
 use crate::snapshot::{
-    build_observation, count_elements, estimate_tokens, render, strip_offscreen, trim_to_budget,
-    IdMap, LocateMap,
+    build_observation, count_elements, estimate_tokens, render, screenshot_masks, strip_offscreen,
+    trim_to_budget, IdMap, LocateMap,
 };
 
 /// execute 的失败：被接管中断（R-03：动作中段检查点命中）与
@@ -40,24 +41,36 @@ pub enum ObserveOut {
     Delta(ObservationDelta, String),
 }
 
-/// 一帧的完整状态：Observation 与其定位表必须来自同一次快照，
-/// 整体替换、整体读取（B4 帧原子性——此前两者分锁更新，并发时
-/// 可交错出「新画面配旧坐标表」的错位组合）。
-#[derive(Clone)]
+/// 一帧的观察与定位表必须来自同一次采集（B4 帧原子性）。
 struct FrameState {
     obs: Observation,
-    /// 与 obs 同快照的定位表（配对本体）：无元素目标的动作直接
-    /// 用存储帧校验+执行，读到的就是这一对，不会错位。
     locate: LocateMap,
-    /// 采集前后主文档 loaderId 一致时才记录（采集期间换页则为 None）：
-    /// 动作前快速复核据此确认“还是同一个文档”。
-    loader: Option<String>,
-    /// 采集完成时刻：拒绝时复用刚采的帧而不重采
-    at: std::time::Instant,
-    /// 采集**开始前**的变化日志序号与视口状态：之后无结构类通知且视口
-    /// 没动，页面就算“没变”（呈现一侧据此跳过采集，见 changes.rs）
+    context: PageContext,
     mark: u64,
-    view: Option<[f32; 4]>,
+    at: Instant,
+    warnings: Vec<String>,
+    validation: bool,
+}
+
+#[derive(Clone, PartialEq)]
+struct PageContext {
+    page: ActivePage,
+    loader: String,
+    view: ViewState,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct Projection {
+    include_offscreen: bool,
+    subtree: Option<String>,
+    budget_tokens: Option<u32>,
+}
+
+struct PresentedFrame {
+    obs: Observation,
+    context: PageContext,
+    mark: u64,
+    projection: Projection,
 }
 
 /// 把 CDP 结构类事件同步喂进变化日志（读泵内、先于其后的命令响应，
@@ -70,38 +83,61 @@ fn spawn_change_listener(browser: &Browser, log: Arc<crate::changes::ChangeLog>)
     }));
 }
 
-/// 以 `prev` 为基帧、`full` 为目标，生成增量输出（文本说明 + delta）。
-fn delta_out(prev: Observation, full: &Observation, include_offscreen: bool) -> ObserveOut {
-    let (base, target) = if include_offscreen {
-        (prev, full.clone())
-    } else {
-        let mut b = prev;
-        b.elements = strip_offscreen(std::mem::take(&mut b.elements));
-        let mut t = full.clone();
-        t.elements = strip_offscreen(std::mem::take(&mut t.elements));
-        (b, t)
-    };
-    let delta = diff_observations(&base, &target);
-    let text = format!(
-        "[增量观察：帧 {} → {}，upsert {} 个子树、移除 {} 个元素。增量本体在 delta 字段（HTTP）/ 第二个文本块（MCP）；base 不匹配或需要顺序时请重新完整 observe。]\n",
+fn delta_out(delta: ObservationDelta, note: Option<&str>) -> ObserveOut {
+    let mut text = format!(
+        "[增量观察：帧 {} → {}，更新 {} 个子树、移除 {} 个元素。]\n",
         delta.base_frame,
         delta.frame_id,
         delta.upserts.len(),
         delta.removed.len()
     );
+    if let Some(note) = note {
+        text.push_str(&format!("[{note}]\n"));
+    }
     ObserveOut::Delta(delta, text)
+}
+
+fn observation_deadline() -> tokio::time::Instant {
+    tokio::time::Instant::now() + Duration::from_secs(20)
+}
+
+fn project(
+    full: &Observation,
+    projection: &Projection,
+) -> Result<(Observation, Option<String>), String> {
+    let mut view = full.clone();
+    if let Some(id) = &projection.subtree {
+        let element = full
+            .find(id)
+            .ok_or_else(|| format!("subtree 元素不存在: {id}"))?;
+        view.elements = vec![element.clone()];
+    }
+    if !projection.include_offscreen {
+        view.elements = strip_offscreen(std::mem::take(&mut view.elements));
+    }
+    if let Some(budget) = projection.budget_tokens {
+        let before_est = estimate_tokens(&view);
+        if before_est > budget as usize {
+            let before_n = count_elements(&view);
+            view = trim_to_budget(&view, budget);
+            let note = format!(
+                "已按 budget_tokens={budget} 裁剪响应视图：元素 {before_n} → {}，估算 {before_est} → {} token（被裁元素凭 id 仍可操作，存储帧未动）",
+                count_elements(&view),
+                estimate_tokens(&view)
+            );
+            return Ok((view, Some(note)));
+        }
+    }
+    Ok((view, None))
 }
 
 pub struct AiChannel {
     browser: Arc<Browser>,
     ids: Mutex<IdMap>,
     frame: AtomicU64,
-    state: Mutex<Option<FrameState>>,
-    /// 最近若干帧的 Observation（帧号 → 帧，留 8 帧）：since_frame
-    /// 增量的基帧池。只留一帧不够——act 内部刷新与 observe 自身
-    /// 都会推进帧号，客户端的基帧隔一两帧就被冲掉。基帧不在池
-    /// 里就回完整视图让客户端重新定基。
-    history: Mutex<Vec<Observation>>,
+    state: Mutex<Option<Arc<FrameState>>>,
+    /// 最近 8 个已输出的结构化观察。动作内部校验帧不进入这个池。
+    history: Mutex<Vec<PresentedFrame>>,
     /// act 串行锁：同一时刻只执行一个动作，避免多客户端动作交错
     act_lock: Mutex<()>,
     /// request_id 幂等缓存（R-06）：终局结果（Done/Rejected）按
@@ -111,8 +147,7 @@ pub struct AiChannel {
     idem: Mutex<Vec<(String, std::time::Instant, ActionResult)>>,
     /// 人机交互模型的执行状态（与人通道共享，见 exec.rs）
     exec: Arc<ExecControl>,
-    /// 页面变化日志：监听浏览器的结构类通知，供“呈现”一侧判断页面
-    /// 变没变（与 act 解耦，见 changes.rs）
+    /// 结构类通知用于识别根导航及判断校验帧是否可复用。
     changes: Arc<crate::changes::ChangeLog>,
     /// 当前动作的意图标签（供 AI 指针显示），act 执行前设置
     pending_label: Mutex<Option<String>>,
@@ -151,57 +186,81 @@ impl AiChannel {
         self.frame.fetch_add(1, Ordering::SeqCst) + 1
     }
 
-    /// 拍一帧并原子替换当前状态；返回这一帧的 (Observation, LocateMap)
-    /// 配对——调用方拿到的永远是同一快照的两半。
-    ///
-    /// 提交单调性（R-05）：帧号在构建前领取、构建可并发，后完成
-    /// 的旧帧不得覆盖已提交的新帧——旧帧仍返回给自己的调用方
-    /// （它是一张真实快照），只是不安装为当前状态。
-    async fn observe_full(&self) -> Result<(Observation, LocateMap, Vec<String>), String> {
-        let fid = self.next_frame();
-        let loader0 = self.browser.main_loader_id().await.ok();
-        let mark = self.changes.mark();
-        let view = match self.browser.main().await {
-            Ok(m) => self.browser.view_state(&m).await.ok(),
-            Err(_) => None,
-        };
-        let (obs, locate, warnings) = {
-            let mut ids = self.ids.lock().await;
-            build_observation(&self.browser, &mut ids, fid).await?
-        };
-        let loader = match (&loader0, self.browser.main_loader_id().await) {
-            (Some(a), Ok(b)) if *a == b => Some(b),
-            _ => None,
-        };
-        {
-            let mut st = self.state.lock().await;
-            let newer = st.as_ref().map(|fs| fid > fs.obs.frame_id).unwrap_or(true);
-            if newer {
-                *st = Some(FrameState {
-                    obs: obs.clone(),
-                    locate: locate.clone(),
-                    loader,
-                    at: std::time::Instant::now(),
-                    mark,
-                    view,
-                });
-            }
-        }
-        // 本帧入历史池（留最近 8 帧）作后续增量的基帧
-        let mut hist = self.history.lock().await;
-        hist.push(obs.clone());
-        let excess = hist.len().saturating_sub(8);
-        if excess > 0 {
-            hist.drain(..excess);
-        }
-        drop(hist);
-        Ok((obs, locate, warnings))
+    async fn page_context(&self, page: ActivePage) -> Result<PageContext, String> {
+        let view = self.browser.view_state(&page.session).await?;
+        let loader = self.browser.loader_id(&page.session).await?;
+        Ok(PageContext { page, loader, view })
     }
 
-    pub async fn observe(&self) -> Result<(Observation, String), String> {
+    async fn document_is_current(&self, frame: &FrameState) -> bool {
+        let context = &frame.context;
+        self.browser.loader_id(&context.page.session).await.as_ref() == Ok(&context.loader)
+            && self.page_is_current(&context.page, frame.mark).await
+    }
+
+    async fn context_is_current(&self, frame: &FrameState) -> bool {
+        let context = &frame.context;
+        self.page_context(context.page.clone()).await.as_ref() == Ok(context)
+            && self.page_is_current(&context.page, frame.mark).await
+    }
+
+    async fn page_is_current(&self, page: &ActivePage, mark: u64) -> bool {
+        self.browser.active_page().await.as_ref() == Ok(page)
+            && !self.changes.root_navigated_since(mark, &page.session)
+    }
+
+    /// 固定主会话及坐标空间采集。采集跨过切页、根导航或视口变化时，
+    /// 丢弃候选帧并在同一请求截止时间内重采。
+    async fn observe_full(
+        &self,
+        deadline: tokio::time::Instant,
+        validation: bool,
+    ) -> Result<Arc<FrameState>, String> {
+        tokio::time::timeout_at(deadline, async {
+            let mut ids = self.ids.lock().await;
+            loop {
+                let page = self.browser.active_page().await?;
+                let mark = self.changes.mark();
+                let before = self.page_context(page.clone()).await;
+                let context = match before {
+                    Ok(context) => context,
+                    Err(_) if self.browser.active_page().await.as_ref() != Ok(&page) => continue,
+                    Err(e) => return Err(e),
+                };
+                let fid = self.next_frame();
+                let candidate =
+                    build_observation(&self.browser, &page.session, context.view, &mut ids, fid)
+                        .await;
+                let after = self.page_context(page.clone()).await;
+                let mut state = self.state.lock().await;
+                if !self.page_is_current(&page, mark).await
+                    || matches!(&after, Ok(after) if *after != context)
+                {
+                    continue;
+                }
+                after?;
+                let (obs, locate, warnings) = candidate?;
+                let frame = Arc::new(FrameState {
+                    obs,
+                    locate,
+                    context,
+                    mark,
+                    at: Instant::now(),
+                    warnings,
+                    validation,
+                });
+                *state = Some(frame.clone());
+                return Ok(frame);
+            }
+        })
+        .await
+        .map_err(|_| "观察超时：未能确认当前页面的完整快照".to_string())?
+    }
+
+    #[cfg(test)]
+    async fn observe(&self) -> Result<(Observation, String), String> {
         match self.observe_req(&ObserveRequest::default()).await? {
             ObserveOut::Full(obs, text, _) => Ok((obs, text)),
-            // 默认请求没有 since_frame，增量路径不会触发
             ObserveOut::Delta(..) => Err("内部错误：默认 observe 不应返回增量".into()),
         }
     }
@@ -211,230 +270,247 @@ impl AiChannel {
         self.exec.in_flight().await
     }
 
-    /// 带请求的观察：落实 ObserveRequest 全部字段。
-    /// mode/budget/subtree/include_offscreen 只作用于**响应
-    /// 副本**——存储帧保持全量，被裁掉/过滤的元素凭 id 仍可
-    /// 操作（act 走存储帧校验）。since_frame 命中历史池中的
-    /// 帧且 mode=Tree、无 subtree/budget 时回增量（基帧与
-    /// 目标帧按同一 include_offscreen 口径对齐，保证增量基
-    /// 就是客户端手里的那棵树）；其余情况回完整视图。
+    /// 裁剪只作用于输出视图，动作校验仍使用完整帧。
     pub async fn observe_req(&self, req: &ObserveRequest) -> Result<ObserveOut, String> {
-        let t0 = std::time::Instant::now();
+        let deadline = observation_deadline();
+        let t0 = Instant::now();
         let h = self.exec.begin_observe().await;
-        let r = self.observe_req_inner(req).await;
+        let r = self.observe_req_inner(req, deadline).await;
         crate::metrics::global().observe.record(t0.elapsed());
         if r.is_ok() {
-            // observe 成功 = 客户端已按接管后的新现实重新同步，
-            // 解除接管闩锁（R-01 配套口径）。只有本次 observe 领取的
-            // 句柄才能解闩：接管前在途旧 observe 的成功返回不算（C02）。
+            // 接管前已在途的观察不能解除接管后的闩锁（C02）。
             self.exec.note_observed(&h).await;
         }
         self.exec.end(h).await;
         r
     }
 
-    async fn observe_req_inner(&self, req: &ObserveRequest) -> Result<ObserveOut, String> {
-        // R-14：采集前记主文档 loaderId，采集后比对——期间发生
-        // 导航则快照与截图可能不是同一页，必须警告观察者
-        // 呈现一侧：带 since_frame 的增量请求，页面没变就不采集
-        if req.mode == ObserveMode::Tree && req.subtree.is_none() && req.budget_tokens.is_none() {
-            if let Some(since) = req.since_frame {
-                if let Some(out) = self.try_unchanged(since).await {
-                    return Ok(out);
+    async fn observe_req_inner(
+        &self,
+        req: &ObserveRequest,
+        deadline: tokio::time::Instant,
+    ) -> Result<ObserveOut, String> {
+        let frame = self.observe_full(deadline, false).await?;
+        self.present(&frame, req, deadline).await
+    }
+
+    /// 用客户端实际拿到的投影做差分；结果无法按现有增量契约重建时回整帧。
+    async fn present(
+        &self,
+        frame: &FrameState,
+        req: &ObserveRequest,
+        deadline: tokio::time::Instant,
+    ) -> Result<ObserveOut, String> {
+        let projection = Projection {
+            include_offscreen: req.include_offscreen,
+            subtree: req.subtree.clone(),
+            budget_tokens: req.budget_tokens,
+        };
+        let (view, note) = project(&frame.obs, &projection)?;
+        let mut warnings = frame.warnings.clone();
+        let image = if req.mode == ObserveMode::TreeImage {
+            match self.capture_marked(frame, &view, deadline).await {
+                Ok(png) => Some(png),
+                Err(warning) => {
+                    warnings.push(warning);
+                    None
                 }
             }
-        }
-        let loader0 = self.browser.main_loader_id().await.ok();
-        let (full, _, mut warn) = self.observe_full().await?;
-
-        // 增量路径（条件见 observe_req 文档）
-        if req.mode == ObserveMode::Tree && req.subtree.is_none() && req.budget_tokens.is_none() {
-            if let Some(since) = req.since_frame {
-                let prev = self
-                    .history
-                    .lock()
-                    .await
-                    .iter()
-                    .find(|o| o.frame_id == since)
-                    .cloned();
-                if let Some(prev) = prev {
-                    return Ok(delta_out(prev, &full, req.include_offscreen));
-                }
-            }
-        }
-
-        let mut view = full.clone();
-        if let Some(id) = &req.subtree {
-            let el = full
-                .find(id)
-                .ok_or_else(|| format!("subtree 元素不存在: {id}"))?
-                .clone();
-            view.elements = vec![el];
-        }
-        if !req.include_offscreen {
-            view.elements = strip_offscreen(std::mem::take(&mut view.elements));
-        }
-        let mut note = None;
-        if let Some(budget) = req.budget_tokens {
-            let before_n = count_elements(&view);
-            let before_est = estimate_tokens(&view);
-            if before_est > budget as usize {
-                view = trim_to_budget(&view, budget);
-                note = Some(format!(
-                    "已按 budget_tokens={budget} 裁剪响应视图：元素 {before_n} → {}，估算 {before_est} → {} token（被裁元素凭 id 仍可操作，存储帧未动）",
-                    count_elements(&view),
-                    estimate_tokens(&view)
-                ));
-            }
-        }
-        let mut text = render(&view);
-        if let Some(n) = note {
-            text.push_str(&format!("[{n}]\n"));
-        }
-        let mut image = if req.mode == ObserveMode::TreeImage {
-            let main = self.browser.main().await?;
-            let png = self.browser.screenshot_png(&main).await?;
-            // 打码取自完整快照（响应视图可能被子树/预算裁掉敏感字段），
-            // 描边编号取自响应视图
-            Some(draw_marks(&png, &view, &full)?)
         } else {
             None
         };
-        // R-14 收尾：采集期间主文档导航过 → 快照/截图不是同一页：
-        // 截图（遮罩可能错位）不交付，只留警告
-        if let (Some(a), Ok(b)) = (&loader0, self.browser.main_loader_id().await) {
-            if *a != b {
-                if image.take().is_some() {
-                    warn.push(
-                        "采集期间页面发生导航：截图已丢弃（遮罩无法确认对齐），请重新 observe"
-                            .to_string(),
-                    );
-                } else {
-                    warn.push("采集期间页面发生导航：快照可能不一致，请重新 observe".to_string());
+        let mut delta = None;
+        if req.mode != ObserveMode::Text {
+            let mut history = self.history.lock().await;
+            if req.mode == ObserveMode::Tree && warnings.is_empty() {
+                if let Some(base) = history.iter().find(|base| {
+                    Some(base.obs.frame_id) == req.since_frame
+                        && base.obs.frame_id < view.frame_id
+                        && base.context.page == frame.context.page
+                        && base.context.loader == frame.context.loader
+                        && base.context.view.same_space(&frame.context.view)
+                        && base.projection == projection
+                        && !self
+                            .changes
+                            .root_navigated_since(base.mark, &frame.context.page.session)
+                }) {
+                    if base.obs.elements == view.elements {
+                        crate::metrics::global()
+                            .observe_unchanged
+                            .fetch_add(1, Ordering::Relaxed);
+                        delta = Some(ObservationDelta {
+                            base_frame: base.obs.frame_id,
+                            frame_id: view.frame_id,
+                            upserts: Vec::new(),
+                            removed: Vec::new(),
+                        });
+                    } else {
+                        let candidate = diff_observations(&base.obs, &view);
+                        if base.obs.apply_delta(&candidate).as_ref() == Some(&view) {
+                            delta = Some(candidate);
+                        }
+                    }
+                }
+            }
+
+            if !history
+                .iter()
+                .any(|entry| entry.obs.frame_id == view.frame_id)
+            {
+                history.push(PresentedFrame {
+                    obs: view.clone(),
+                    context: frame.context.clone(),
+                    mark: frame.mark,
+                    projection,
+                });
+                if history.len() > 8 {
+                    history.remove(0);
                 }
             }
         }
-        // R-12：部分采集警告必须到达观察者，不静默
-        for w in &warn {
-            text.push_str(&format!("[⚠ {w}]\n"));
+        if let Some(delta) = delta {
+            return Ok(delta_out(delta, note.as_deref()));
+        }
+        let mut text = render(&view);
+        if let Some(note) = note {
+            text.push_str(&format!("[{note}]\n"));
+        }
+        for warning in warnings {
+            text.push_str(&format!("[⚠ {warning}]\n"));
         }
         Ok(ObserveOut::Full(view, text, image))
     }
 
-    /// 编号截圖：当前帧的合成图，交互元素描边+编号，敏感区域黑块打码。
-    pub async fn marked_screenshot(&self) -> Result<Vec<u8>, String> {
-        let (obs, _) = self.observe().await?;
-        let main = self.browser.main().await?;
-        let png = self.browser.screenshot_png(&main).await?;
-        draw_marks(&png, &obs, &obs)
+    async fn capture_marked(
+        &self,
+        frame: &FrameState,
+        view: &Observation,
+        deadline: tokio::time::Instant,
+    ) -> Result<Vec<u8>, String> {
+        tokio::time::timeout_at(deadline, async {
+            if !frame.warnings.is_empty() || !self.context_is_current(frame).await {
+                return Err("无法确认截图与快照对齐".into());
+            }
+            let context = &frame.context;
+            let session = &context.page.session;
+            let mark = self.changes.mark();
+            let masks = screenshot_masks(&self.browser, session, context.view.visual_offset)
+                .await
+                .map_err(|_| "无法确认截图的敏感区域")?;
+            let mut missing_mask = false;
+            frame.obs.each_element(&mut |el| {
+                if el.has(ElementState::Password) || el.has(ElementState::Sensitive) {
+                    missing_mask |= !frame
+                        .locate
+                        .get(&el.id)
+                        .is_some_and(|node| masks.regions.contains_key(node));
+                }
+            });
+            if missing_mask {
+                return Err("无法确认截图的敏感区域".into());
+            }
+            let png = self.browser.screenshot_png(session, context.view).await?;
+            let after = screenshot_masks(&self.browser, session, context.view.visual_offset)
+                .await
+                .map_err(|_| "无法确认截图的敏感区域")?;
+            if masks != after
+                || !self.context_is_current(frame).await
+                || self
+                    .changes
+                    .changed_in_sessions_since(mark, &masks.sessions)
+            {
+                return Err("截图期间页面、视口或敏感区域发生变化".into());
+            }
+            let scale = context.view.space.scale * context.view.visual_scale;
+            draw_marks(&png, view, scale, masks.regions.into_values())
+        })
+        .await
+        .map_err(|_| "截图超时".to_string())?
     }
 
-    pub async fn act(&self, req: ActionRequest) -> ActionResult {
-        let t0 = std::time::Instant::now();
-        // 接管闩锁：接管后未重新 observe 前，act 直接拒绝——
-        // 不进入执行态、不计在途（begin_act 在闩锁时不领取句柄）
-        let Some(h) = self.exec.begin_act().await else {
-            return ActionResult::Aborted {
-                reason: AbortReason::UserTakeover,
+    /// 编号截图：当前帧的合成图，交互元素描边+编号，敏感区域黑块打码。
+    pub async fn marked_screenshot(&self) -> Result<Vec<u8>, String> {
+        let deadline = observation_deadline();
+        let h = self.exec.begin_observe().await;
+        let result = async {
+            let frame = self.observe_full(deadline, false).await?;
+            let projection = Projection {
+                include_offscreen: false,
+                subtree: None,
+                budget_tokens: None,
             };
+            let (view, _) = project(&frame.obs, &projection)?;
+            self.capture_marked(&frame, &view, deadline).await
+        }
+        .await;
+        if result.is_ok() {
+            self.exec.note_observed(&h).await;
+        }
+        self.exec.end(h).await;
+        result
+    }
+
+    /// 页面状态类拒绝附带最新观察；状态获取失败时保留原拒绝理由。
+    pub async fn act_with_fresh(
+        &self,
+        req: ActionRequest,
+    ) -> (ActionResult, Result<Option<ObserveOut>, String>) {
+        let t0 = Instant::now();
+        let Some(h) = self.exec.begin_act().await else {
+            return (
+                ActionResult::Aborted {
+                    reason: AbortReason::UserTakeover,
+                },
+                Ok(None),
+            );
         };
-        let r = self.act_dedup(req, &h).await;
+        let _act_guard = self.act_lock.lock().await;
+        let started = Instant::now();
+        let req_frame = req.frame_id;
+        let result = self.act_dedup(req, &h).await;
         self.exec.end(h).await;
         crate::metrics::global().act.record(t0.elapsed());
-        r
-    }
-
-    /// 带“拒绝即附最新状态”的 act：被拒原因是页面状态不符（陈旧帧/
-    /// 元素不存在/不可交互/越界）时，程序自己把最新页面状态一并交回，
-    /// AI 不必再多走一轮 observe。请求帧还在历史池就只回增量（局部
-    /// 刷新、省带宽），否则回整帧；刚采的帧（<500ms）直接复用，不再
-    /// 重采。成功、中断、策略类拒绝不附带。取不到最新帧则只回拒绝本身。
-    pub async fn act_with_fresh(&self, req: ActionRequest) -> (ActionResult, Option<ObserveOut>) {
-        let req_frame = req.frame_id;
-        let r = self.act(req).await;
-        let state_related = matches!(
-            &r,
+        if !matches!(
+            result,
             ActionResult::Rejected {
                 reason: RejectReason::StaleFrame { .. }
                     | RejectReason::UnknownElement { .. }
                     | RejectReason::NotInteractable { .. }
                     | RejectReason::OutOfBounds
             }
-        );
-        if !state_related {
-            return (r, None);
+        ) {
+            return (result, Ok(None));
         }
-        let reusable = {
-            let st = self.state.lock().await;
-            st.as_ref()
-                .filter(|fs| fs.at.elapsed() < std::time::Duration::from_millis(500))
-                .map(|fs| fs.obs.clone())
+        let req = ObserveRequest {
+            since_frame: Some(req_frame),
+            ..ObserveRequest::default()
         };
-        let latest = match reusable {
-            Some(o) => o,
-            None => match self.observe_full().await {
-                Ok((o, _, _)) => o,
-                Err(_) => return (r, None),
-            },
-        };
-        let prev = self
-            .history
-            .lock()
-            .await
-            .iter()
-            .find(|o| o.frame_id == req_frame)
-            .cloned();
-        let out = match prev {
-            Some(prev) if prev.frame_id != latest.frame_id => delta_out(prev, &latest, false),
-            _ => {
-                let mut view = latest.clone();
-                view.elements = strip_offscreen(std::mem::take(&mut view.elements));
-                let text = render(&view);
-                ObserveOut::Full(view, text, None)
+        let deadline = observation_deadline();
+        let state = self.state.lock().await.clone();
+        let fresh = async {
+            if let Some(frame) = state {
+                if frame.validation
+                    && frame.at >= started
+                    && frame.at.elapsed() < Duration::from_millis(500)
+                    && frame.warnings.is_empty()
+                    && self.context_is_current(&frame).await
+                    && self.changes.since(frame.mark) == crate::changes::Change::None
+                {
+                    return self.present(&frame, &req, deadline).await;
+                }
             }
-        };
-        (r, Some(out))
+            self.observe_req_inner(&req, deadline).await
+        }
+        .await;
+        (
+            result,
+            fresh.map(Some).map_err(|_| "无法取得最新页面状态".into()),
+        )
     }
 
-    /// 呈现一侧的“没变”判断：调用方带的 since_frame 就是最新存储帧，
-    /// 且自该帧采集起 ①主文档没换 ②没有任何结构类通知 ③视口没滚动/缩放，
-    /// 则页面对 AI 可见的结构与几何都没变，回空增量，不再采集。
-    ///
-    /// 已知盲区（浏览器本身不通知）：不改 DOM 的纯视觉变化（CSS 动画、
-    /// :hover 显隐）。想要权威快照的调用方不带 since_frame 即可。
-    async fn try_unchanged(&self, since: u64) -> Option<ObserveOut> {
-        let st = self.state.lock().await.clone()?;
-        if st.obs.frame_id != since {
-            return None;
-        }
-        let loader = st.loader.as_ref()?;
-        let view0 = st.view?;
-        if self.changes.since(st.mark) != crate::changes::Change::None {
-            return None;
-        }
-        if &self.browser.main_loader_id().await.ok()? != loader {
-            return None;
-        }
-        let main = self.browser.main().await.ok()?;
-        if self.browser.view_state(&main).await.ok()? != view0 {
-            return None;
-        }
-        // 复查：取视口期间若又来了通知，不能算没变
-        if self.changes.since(st.mark) != crate::changes::Change::None {
-            return None;
-        }
-        crate::metrics::global()
-            .observe_unchanged
-            .fetch_add(1, Ordering::Relaxed);
-        Some(ObserveOut::Delta(
-            ObservationDelta {
-                base_frame: since,
-                frame_id: since,
-                upserts: Vec::new(),
-                removed: Vec::new(),
-            },
-            format!("[页面自帧 {since} 起无变化，未重新采集；增量为空。]\n"),
-        ))
+    #[cfg(test)]
+    async fn act(&self, req: ActionRequest) -> ActionResult {
+        self.act_with_fresh(req).await.0
     }
 
     /// 动作前的单元素快速复核：不重采整页，只向浏览器取目标元素自己的
@@ -450,24 +526,16 @@ impl AiChannel {
         if ids.is_empty() || req_frame != st.obs.frame_id {
             return false;
         }
-        let Some(loader) = &st.loader else {
-            return false;
-        };
-        let Ok(live_loader) = self.browser.main_loader_id().await else {
-            return false;
-        };
-        if &live_loader != loader {
+        if !self.document_is_current(st).await {
             return false;
         }
-        let Ok(main) = self.browser.main().await else {
-            return false;
-        };
+        let main = &st.context.page.session;
         let (vw, vh) = (st.obs.space.width, st.obs.space.height);
         for id in ids {
             let Some((session, backend)) = st.locate.get(*id) else {
                 return false;
             };
-            if *session != main {
+            if session != main {
                 return false; // 子帧需要帧偏移，第一版交给整页快照
             }
             let Some(stored) = st.obs.find(id) else {
@@ -508,7 +576,6 @@ impl AiChannel {
     /// id 不规范时也见过），照常执行并另存一条，不拿旧结果
     /// 糊弄。空 request_id 不参与去重
     async fn act_dedup(&self, req: ActionRequest, h: &ExecHandle) -> ActionResult {
-        let _act_guard = self.act_lock.lock().await;
         let key = if req.request_id.trim().is_empty() {
             None
         } else {
@@ -593,17 +660,10 @@ impl AiChannel {
             };
             c.fetch_add(1, Ordering::Relaxed);
         }
-        let fresh = if has_element && !fast_ok {
-            None
-        } else {
-            seen_state
-                .as_ref()
-                .map(|fs| (fs.obs.clone(), fs.locate.clone()))
-        };
-        let (current, locate) = match fresh {
-            Some(pair) => pair,
-            None => match self.observe_full().await {
-                Ok((o, l, _)) => (o, l),
+        let frame = match seen_state.as_ref().filter(|_| !has_element || fast_ok) {
+            Some(state) => state.clone(),
+            None => match self.observe_full(observation_deadline(), true).await {
+                Ok(frame) => frame,
                 Err(e) => {
                     return ActionResult::Rejected {
                         reason: RejectReason::PolicyDenied { detail: e },
@@ -611,6 +671,22 @@ impl AiChannel {
                 }
             },
         };
+        let current = &frame.obs;
+        if seen_state.as_ref().is_some_and(|seen| {
+            seen.obs.frame_id == req.frame_id
+                && (seen.context.page != frame.context.page
+                    || seen.context.loader != frame.context.loader
+                    || self
+                        .changes
+                        .root_navigated_since(seen.mark, &frame.context.page.session))
+        }) && !matches!(&req.action, Action::Navigate { .. })
+        {
+            return ActionResult::Rejected {
+                reason: RejectReason::StaleFrame {
+                    current_frame: current.frame_id,
+                },
+            };
+        }
         for t in req.action.targets() {
             match t {
                 Target::Element { id } => {
@@ -620,7 +696,7 @@ impl AiChannel {
                         None
                     };
                     if let Err(reason) =
-                        check_element_target(req.frame_id, seen_ref, &current, id, 2.0)
+                        check_element_target(req.frame_id, seen_ref, current, id, 2.0)
                     {
                         return ActionResult::Rejected { reason };
                     }
@@ -628,7 +704,7 @@ impl AiChannel {
                 Target::Point { x, y } => {
                     // Point 此前不做任何校验就执行（GPT review R-06）：
                     // 帧号必须与当前帧一致且坐标落在视口内
-                    if let Err(reason) = check_point_target(req.frame_id, &current, *x, *y) {
+                    if let Err(reason) = check_point_target(req.frame_id, current, *x, *y) {
                         return ActionResult::Rejected { reason };
                     }
                 }
@@ -654,16 +730,19 @@ impl AiChannel {
             _ => None,
         };
         if let Some(mode) = live_check {
-            match self.observe_full().await {
-                Ok((fresh, _, _)) => {
-                    let stale = match mode {
-                        Some((x, y)) => hit_element(&current, x, y) != hit_element(&fresh, x, y),
-                        None => focused_id(&current) != focused_id(&fresh),
-                    };
+            match self.observe_full(observation_deadline(), true).await {
+                Ok(fresh) => {
+                    let stale = frame.context != fresh.context
+                        || match mode {
+                            Some((x, y)) => {
+                                hit_element(current, x, y) != hit_element(&fresh.obs, x, y)
+                            }
+                            None => focused_id(current) != focused_id(&fresh.obs),
+                        };
                     if stale {
                         return ActionResult::Rejected {
                             reason: RejectReason::StaleFrame {
-                                current_frame: fresh.frame_id,
+                                current_frame: fresh.obs.frame_id,
                             },
                         };
                     }
@@ -677,7 +756,7 @@ impl AiChannel {
         }
 
         // 意图标签（AI 指针旁注）：元素取其无障碍名，缺失时用角色+id
-        *self.pending_label.lock().await = Some(action_label(&req.action, &current));
+        *self.pending_label.lock().await = Some(action_label(&req.action, current));
         // 中断检查点 1：校验后、执行前（接管可能在校验期间到达）
         if self.exec.aborted(h).await {
             *self.pending_label.lock().await = None;
@@ -685,7 +764,7 @@ impl AiChannel {
                 reason: AbortReason::UserTakeover,
             };
         }
-        let exec = self.execute(&req.action, &current, &locate, h).await;
+        let exec = self.execute(&req.action, &frame, h).await;
         *self.pending_label.lock().await = None;
         // 中断检查点 2：执行期间被接管 → 即使动作已落地也报 Aborted，
         // 调用方应重新观察（用户已经夺回控制，画面预期已变）
@@ -696,9 +775,7 @@ impl AiChannel {
         }
         match exec {
             // 操作与呈现解耦：act 只回答“动作有没有执行”，不再顺手整页重采。
-            // 页面因此变成什么样，由变化日志驱动、调用方按需
-            // observe(since_frame=本帧) 取增量（页面没变则空增量、不采集）。
-            // frame_id 是本动作所基于的校验帧。
+            // frame_id 是校验帧。观察增量使用客户端已应用的观察帧。
             Ok(note) => ActionResult::Done {
                 frame_id: current.frame_id,
                 note,
@@ -738,30 +815,64 @@ impl AiChannel {
             .ok_or_else(|| RejectReason::UnknownElement { id: id.to_string() })
     }
 
-    /// 元素中心点（会话本地坐标，供该会话的输入注入使用）。
-    /// 解析出落点的同时把 AI 活动记给人通道（指针位置/轨迹）。
-    async fn element_point(
+    async fn visible_element_point(
         &self,
+        frame: &FrameState,
+        id: &str,
         session: &str,
         backend: i64,
-        pulse: bool,
-    ) -> Result<(f32, f32), RejectReason> {
-        self.browser
-            .scroll_into_view(session, backend)
-            .await
-            .map_err(|e| RejectReason::PolicyDenied { detail: e })?;
-        tokio::time::sleep(std::time::Duration::from_millis(60)).await;
-        let q = self
+    ) -> Option<(f32, f32)> {
+        let space = frame.obs.space;
+        let (x, y) = frame.obs.find(id)?.bbox?.center();
+        if session != frame.context.page.session || !space.contains(x, y) {
+            return None;
+        }
+        let quad = self.browser.quads(session, backend).await.ok()??;
+        let (x, y) = BBox(quad).center();
+        let (x, y) = (x.round(), y.round());
+        if !space.contains(x, y) {
+            return None;
+        }
+        let hit = self
             .browser
-            .quads(session, backend)
+            .hit_backend_node(session, x as i32, y as i32)
             .await
-            .map_err(|e| RejectReason::PolicyDenied { detail: e })?
-            .ok_or_else(|| RejectReason::NotInteractable { id: String::new() })?;
-        let (x, y) = ((q[0] + q[2]) / 2.0, (q[1] + q[3]) / 2.0);
+            .ok()?;
+        (hit == backend).then_some((x, y))
+    }
+
+    /// 元素中心点使用会话本地坐标。中心当前可命中时可直接执行，
+    /// 其余情况照常滚入视口并等待重排。
+    async fn element_point(
+        &self,
+        frame: &FrameState,
+        id: &str,
+        pulse: bool,
+    ) -> Result<(String, f32, f32), RejectReason> {
+        let (session, backend) = self.locate_session_backend(&frame.locate, id).await?;
+        let (x, y) = if let Some(point) = self
+            .visible_element_point(frame, id, &session, backend)
+            .await
+        {
+            point
+        } else {
+            self.browser
+                .scroll_into_view(&session, backend)
+                .await
+                .map_err(|e| RejectReason::PolicyDenied { detail: e })?;
+            tokio::time::sleep(Duration::from_millis(60)).await;
+            let quad = self
+                .browser
+                .quads(&session, backend)
+                .await
+                .map_err(|e| RejectReason::PolicyDenied { detail: e })?
+                .ok_or_else(|| RejectReason::NotInteractable { id: String::new() })?;
+            BBox(quad).center()
+        };
         if let Some(label) = self.pending_label.lock().await.clone() {
             self.exec.record(x, y, &label, pulse).await;
         }
-        Ok((x, y))
+        Ok((session, x, y))
     }
 
     /// R-03 中断检查点：该 call 已被接管取消时返回 Aborted。
@@ -775,9 +886,20 @@ impl AiChannel {
         }
     }
 
+    async fn require_current_document(&self, frame: &FrameState) -> Result<(), ExecErr> {
+        if self.document_is_current(frame).await {
+            Ok(())
+        } else {
+            Err(RejectReason::StaleFrame {
+                current_frame: frame.obs.frame_id,
+            }
+            .into())
+        }
+    }
+
     async fn click_target(
         &self,
-        locate: &LocateMap,
+        frame: &FrameState,
         target: &Target,
         button: MouseButton,
         count: u8,
@@ -790,24 +912,16 @@ impl AiChannel {
             MouseButton::Middle => "middle",
         };
         let (session, x, y) = match target {
-            Target::Element { id } => {
-                let (s, b) = self.locate_session_backend(locate, id).await?;
-                let (x, y) = self.element_point(&s, b, true).await?;
-                (s, x, y)
-            }
+            Target::Element { id } => self.element_point(frame, id, true).await?,
             Target::Point { x, y } => {
-                let main = self
-                    .browser
-                    .main()
-                    .await
-                    .map_err(|e| RejectReason::PolicyDenied { detail: e })?;
                 if let Some(label) = self.pending_label.lock().await.clone() {
                     self.exec.record(*x, *y, &label, true).await;
                 }
-                (main, *x, *y)
+                (frame.context.page.session.clone(), *x, *y)
             }
         };
         let n = count.max(1) as u32;
+        self.require_current_document(frame).await?;
         self.live(h).await?;
         self.browser
             .mouse(
@@ -859,11 +973,16 @@ impl AiChannel {
     async fn execute(
         &self,
         action: &Action,
-        current: &Observation,
-        locate: &LocateMap,
+        frame: &FrameState,
         h: &ExecHandle,
     ) -> Result<Option<String>, ExecErr> {
         let denied = |e: String| ExecErr::Rejected(RejectReason::PolicyDenied { detail: e });
+        let current = &frame.obs;
+        let locate = &frame.locate;
+        let main = &frame.context.page.session;
+        if !matches!(action, Action::Navigate { .. } | Action::Click { .. }) {
+            self.require_current_document(frame).await?;
+        }
         // 入口检查覆盖单步动作；多步动作在各步之间另有检查点
         self.live(h).await?;
         match action {
@@ -872,17 +991,13 @@ impl AiChannel {
                 button,
                 count,
             } => self
-                .click_target(locate, target, *button, *count, h)
+                .click_target(frame, target, *button, *count, h)
                 .await
                 .map(|()| None),
             Action::Hover { target } => {
                 let (session, x, y) = match target {
-                    Target::Element { id } => {
-                        let (s, b) = self.locate_session_backend(locate, id).await?;
-                        let p = self.element_point(&s, b, false).await?;
-                        (s, p.0, p.1)
-                    }
-                    Target::Point { x, y } => (self.browser.main().await.map_err(denied)?, *x, *y),
+                    Target::Element { id } => self.element_point(frame, id, false).await?,
+                    Target::Point { x, y } => (main.clone(), *x, *y),
                 };
                 self.browser
                     .mouse(&session, "mouseMoved", x, y, None, None, None, None)
@@ -896,15 +1011,19 @@ impl AiChannel {
                 submit,
             } => {
                 if let Some(t) = target {
-                    self.click_target(locate, t, MouseButton::Left, 1, h)
-                        .await?;
+                    self.click_target(frame, t, MouseButton::Left, 1, h).await?;
                     tokio::time::sleep(std::time::Duration::from_millis(60)).await;
                 }
-                // 点选与输入之间是接管最易落下的窗口：输入前再查一次
+                // 点选可能触发导航或接管，输入前再查一次。
+                if target.is_some() {
+                    self.require_current_document(frame).await?;
+                }
                 self.live(h).await?;
-                let main = self.browser.main().await.map_err(denied)?;
                 // 输入落到当前焦点所在会话：优先用焦点元素所在会话
-                let session = self.focus_session(current, locate).await.unwrap_or(main);
+                let session = self
+                    .focus_session(current, locate)
+                    .await
+                    .unwrap_or_else(|| main.clone());
                 self.browser
                     .insert_text(&session, text)
                     .await
@@ -915,25 +1034,22 @@ impl AiChannel {
                 Ok(None)
             }
             Action::Key { key } => {
-                let main = self.browser.main().await.map_err(denied)?;
-                let session = self.focus_session(current, locate).await.unwrap_or(main);
+                let session = self
+                    .focus_session(current, locate)
+                    .await
+                    .unwrap_or_else(|| main.clone());
                 self.press_key(&session, key, h).await.map(|()| None)
             }
             Action::Scroll { target, dx, dy } => {
                 let (session, x, y) = match target {
-                    Some(Target::Element { id }) => {
-                        let (s, b) = self.locate_session_backend(locate, id).await?;
-                        let p = self.element_point(&s, b, false).await?;
-                        (s, p.0, p.1)
-                    }
+                    Some(Target::Element { id }) => self.element_point(frame, id, false).await?,
                     Some(Target::Point { x, y }) => {
                         // Point 目标滚其坐标处（GPT review R-15：此前被丢弃）
-                        (self.browser.main().await.map_err(denied)?, *x, *y)
+                        (main.clone(), *x, *y)
                     }
                     None => {
-                        let main = self.browser.main().await.map_err(denied)?;
-                        let (w, h, _) = self.browser.layout(&main).await.map_err(denied)?;
-                        (main, w / 2.0, h / 2.0)
+                        let (w, h, _) = self.browser.layout(main).await.map_err(denied)?;
+                        (main.clone(), w / 2.0, h / 2.0)
                     }
                 };
                 self.browser
@@ -1256,24 +1372,32 @@ fn digit_rows(d: u8) -> [[bool; 3]; 5] {
     rows
 }
 
-fn draw_marks(png: &[u8], obs: &Observation, full: &Observation) -> Result<Vec<u8>, String> {
+fn draw_marks(
+    png: &[u8],
+    obs: &Observation,
+    scale: f32,
+    masks: impl IntoIterator<Item = BBox>,
+) -> Result<Vec<u8>, String> {
     use image::{Rgba, RgbaImage};
     let img = image::load_from_memory(png).map_err(|e| format!("截圖解码失败: {e}"))?;
     let mut img = img.to_rgba8();
     let (iw, ih) = (img.width() as f32, img.height() as f32);
-    let scale = obs.space.scale.max(0.01);
-    // 若图像尺寸与逻辑尺寸*scale 对不上（截圖裁剪等），按实际比例换算
-    let fx = iw / (obs.space.width * scale).max(1.0) * scale;
-    let fy = ih / (obs.space.height * scale).max(1.0) * scale;
+    // 显式裁到视觉视口后，允许边缘像素取整造成的 1 px 误差。
+    if !scale.is_finite()
+        || (iw - obs.space.width * scale).abs() > 1.0
+        || (ih - obs.space.height * scale).abs() > 1.0
+    {
+        return Err("截图像素尺寸与视口不一致".into());
+    }
     let accent = Rgba([255, 64, 64, 255]);
     let black = Rgba([0, 0, 0, 255]);
 
     let to_px = |b: [f32; 4]| -> (i64, i64, i64, i64) {
         (
-            (b[0] * fx) as i64,
-            (b[1] * fy) as i64,
-            (b[2] * fx) as i64,
-            (b[3] * fy) as i64,
+            (b[0] * scale) as i64,
+            (b[1] * scale) as i64,
+            (b[2] * scale) as i64,
+            (b[3] * scale) as i64,
         )
     };
     let fill_rect = |img: &mut RgbaImage, x1: i64, y1: i64, x2: i64, y2: i64, c: Rgba<u8>| {
@@ -1284,11 +1408,6 @@ fn draw_marks(png: &[u8], obs: &Observation, full: &Observation) -> Result<Vec<u
         }
     };
 
-    // 敏感区域打码
-    for r in full.sensitive_regions() {
-        let (x1, y1, x2, y2) = to_px(r.0);
-        fill_rect(&mut img, x1, y1, x2, y2, black);
-    }
     // 交互元素描边 + 编号
     let mut draw_list: Vec<(String, [f32; 4])> = Vec::new();
     obs.each_element(&mut |e| {
@@ -1302,7 +1421,7 @@ fn draw_marks(png: &[u8], obs: &Observation, full: &Observation) -> Result<Vec<u
         let (x1, y1, x2, y2) = to_px(b);
         // 描边（2px）
         for t in 0..2 {
-            for x in x1..x2 {
+            for x in x1.max(0)..x2.min(img.width() as i64) {
                 if x >= 0 && (x as u32) < img.width() {
                     if y1 + t >= 0 && ((y1 + t) as u32) < img.height() {
                         img.put_pixel(x as u32, (y1 + t) as u32, accent);
@@ -1312,7 +1431,7 @@ fn draw_marks(png: &[u8], obs: &Observation, full: &Observation) -> Result<Vec<u
                     }
                 }
             }
-            for y in y1..y2 {
+            for y in y1.max(0)..y2.min(img.height() as i64) {
                 if y >= 0 && (y as u32) < img.height() {
                     if x1 + t >= 0 && ((x1 + t) as u32) < img.width() {
                         img.put_pixel((x1 + t) as u32, y as u32, accent);
@@ -1355,6 +1474,18 @@ fn draw_marks(png: &[u8], obs: &Observation, full: &Observation) -> Result<Vec<u
         }
     }
 
+    // 遮罩外扩取整，并在编号之后覆盖，保留完整的黑块。
+    for BBox([x1, y1, x2, y2]) in masks {
+        fill_rect(
+            &mut img,
+            (x1 * scale).floor() as i64,
+            (y1 * scale).floor() as i64,
+            (x2 * scale).ceil() as i64,
+            (y2 * scale).ceil() as i64,
+            black,
+        );
+    }
+
     let mut out = Vec::new();
     let mut cur = std::io::Cursor::new(&mut out);
     img.write_to(&mut cur, image::ImageFormat::Png)
@@ -1388,7 +1519,7 @@ mod tests {
             .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
             .unwrap();
 
-        let out = draw_marks(&png, &view, &full).unwrap();
+        let out = draw_marks(&png, &view, 1.0, full.sensitive_regions()).unwrap();
         let img = image::load_from_memory(&out).unwrap().to_rgba8();
         assert_eq!(img.get_pixel(30, 20).0, [0, 0, 0, 255], "敏感区域必须打码");
         assert_eq!(img.get_pixel(80, 80).0, [255, 255, 255, 255]);
@@ -1396,6 +1527,16 @@ mod tests {
 
     use futures_util::{SinkExt, StreamExt};
     use std::sync::atomic::AtomicUsize;
+
+    #[derive(Clone, Copy, Debug)]
+    enum ScreenshotCase {
+        Stable,
+        DocumentChanged,
+        ViewportChanged,
+        IdentityUnavailable,
+        SensitiveMoved,
+        GeometryUnavailable,
+    }
 
     /// 可编排的假 CDP 对端（报告测试#4 的失败注入能力）。
     /// HTTP 端点只服务 /json/version（返回跨端口的 ws 地址）；
@@ -1406,11 +1547,76 @@ mod tests {
     struct FakeCdp {
         ax_calls: AtomicUsize,
         ax_fail_from: usize,
+        navigate_on_first_ax: bool,
+        screenshot: Option<ScreenshotCase>,
+        screenshot_calls: AtomicUsize,
+        commands: std::sync::Mutex<Vec<String>>,
+        location_queries: std::sync::Mutex<Vec<(f64, f64)>>,
+        hit_backend: std::sync::atomic::AtomicI64,
     }
 
     impl FakeCdp {
         /// 返回 (是否为注入错误, result 主体)
         fn reply(&self, method: &str) -> (bool, serde_json::Value) {
+            use serde_json::json;
+            self.commands.lock().unwrap().push(method.to_string());
+            let captured = self.screenshot_calls.load(Ordering::SeqCst) > 0;
+            if let Some(case) = self.screenshot {
+                match (method, captured, case) {
+                    ("Page.getFrameTree", true, ScreenshotCase::IdentityUnavailable) => {
+                        return (true, json!(null));
+                    }
+                    ("Page.getFrameTree", true, ScreenshotCase::DocumentChanged) => {
+                        return (
+                            false,
+                            json!({"frameTree":{"frame":{"id":"F1","loaderId":"L2"}}}),
+                        );
+                    }
+                    ("Page.getLayoutMetrics", _, _) => {
+                        let resized = captured && matches!(case, ScreenshotCase::ViewportChanged);
+                        return (
+                            false,
+                            json!({"cssVisualViewport": {
+                                "clientWidth": if resized { 144 } else { 128 }, "clientHeight": 80,
+                                "pageX": 0, "pageY": 0, "offsetX": 0, "offsetY": 0, "scale": 1
+                            }}),
+                        );
+                    }
+                    ("DOM.getDocument", _, _) => {
+                        return (
+                            false,
+                            json!({"root":{
+                                "nodeName":"#document", "backendNodeId":1,
+                                "children":[{"nodeName":"INPUT", "backendNodeId":7,
+                                    "attributes":["type","password"]}]
+                            }}),
+                        );
+                    }
+                    ("DOM.getBoxModel", true, ScreenshotCase::GeometryUnavailable) => {
+                        return (false, json!({"model":{"border":[]}}));
+                    }
+                    ("DOM.getBoxModel" | "DOM.getContentQuads", _, _) => {
+                        let moved = captured && matches!(case, ScreenshotCase::SensitiveMoved);
+                        let x = if moved { 70.25 } else { 10.25 };
+                        let quad = [x, 10.25, x + 40.25, 10.25, x + 40.25, 30.5, x, 30.5];
+                        return (false, json!({"model":{"border":quad}, "quads":[quad]}));
+                    }
+                    ("Page.captureScreenshot", _, _) => {
+                        use base64::Engine;
+                        self.screenshot_calls.fetch_add(1, Ordering::SeqCst);
+                        let img = image::RgbaImage::from_pixel(128, 80, image::Rgba([255; 4]));
+                        let mut png = Vec::new();
+                        image::DynamicImage::ImageRgba8(img)
+                            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+                            .unwrap();
+                        return (
+                            false,
+                            json!({"data":base64::engine::general_purpose::STANDARD.encode(png)}),
+                        );
+                    }
+                    _ => {}
+                }
+            }
             match method {
                 "Browser.getVersion" => (
                     false,
@@ -1427,28 +1633,56 @@ mod tests {
                             "clientHeight": 800.0,
                             "pageX": 0.0,
                             "pageY": 0.0,
+                            "offsetX": 0.0,
+                            "offsetY": 0.0,
+                            "scale": 1.0,
                         },
                     }),
                 ),
                 "Runtime.evaluate" => (false, serde_json::json!({"result": {"value": 1.0}})),
-                "Page.getFrameTree" => (
+                "DOM.getDocument" => (
                     false,
-                    serde_json::json!({
-                        "frameTree": {"frame": {"id": "F1", "loaderId": "L1"}},
-                    }),
+                    json!({"root":{"nodeName":"#document","backendNodeId":1}}),
                 ),
+                "DOM.getContentQuads" => (
+                    false,
+                    json!({"quads":[[10.0,10.0,110.0,10.0,110.0,50.0,10.0,50.0]]}),
+                ),
+                "DOM.getNodeForLocation" => (
+                    false,
+                    json!({"backendNodeId":self.hit_backend.load(Ordering::SeqCst)}),
+                ),
+                "Page.getFrameTree" => {
+                    let loader =
+                        if self.navigate_on_first_ax && self.ax_calls.load(Ordering::SeqCst) > 0 {
+                            "L2"
+                        } else {
+                            "L1"
+                        };
+                    (
+                        false,
+                        serde_json::json!({
+                            "frameTree": {"frame": {"id": "F1", "loaderId": loader}},
+                        }),
+                    )
+                }
                 "Accessibility.getFullAXTree" => {
                     let n = self.ax_calls.fetch_add(1, Ordering::SeqCst) + 1;
                     if n >= self.ax_fail_from {
                         (true, serde_json::Value::Null)
                     } else {
+                        let name = if self.navigate_on_first_ax && n == 1 {
+                            "old"
+                        } else {
+                            "B"
+                        };
                         (
                             false,
                             serde_json::json!({"nodes": [
                                 {"nodeId": "1", "role": {"value": "RootWebArea"},
                                  "name": {"value": ""}, "childIds": ["2"]},
                                 {"nodeId": "2", "role": {"value": "button"},
-                                 "name": {"value": "B"}, "backendDOMNodeId": 7},
+                                 "name": {"value": name}, "backendDOMNodeId": 7},
                             ]}),
                         )
                     }
@@ -1459,10 +1693,20 @@ mod tests {
     }
 
     /// 起一个假 CDP（HTTP + WS 双端口），返回供 attach 的 http base。
-    async fn spawn_fake_cdp(ax_fail_from: usize) -> String {
+    async fn spawn_fake_cdp(
+        ax_fail_from: usize,
+        navigate_on_first_ax: bool,
+        screenshot: Option<ScreenshotCase>,
+    ) -> (String, Arc<FakeCdp>) {
         let fake = Arc::new(FakeCdp {
             ax_calls: AtomicUsize::new(0),
             ax_fail_from,
+            navigate_on_first_ax,
+            screenshot,
+            screenshot_calls: AtomicUsize::new(0),
+            commands: std::sync::Mutex::new(Vec::new()),
+            location_queries: std::sync::Mutex::new(Vec::new()),
+            hit_backend: std::sync::atomic::AtomicI64::new(7),
         });
         // WS 端
         let ws_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1491,6 +1735,17 @@ mod tests {
                         ) else {
                             continue;
                         };
+                        if method == "DOM.getNodeForLocation" {
+                            let x = v
+                                .pointer("/params/x")
+                                .and_then(serde_json::Value::as_f64)
+                                .unwrap_or(f64::NAN);
+                            let y = v
+                                .pointer("/params/y")
+                                .and_then(serde_json::Value::as_f64)
+                                .unwrap_or(f64::NAN);
+                            fake.location_queries.lock().unwrap().push((x, y));
+                        }
                         let (is_err, body) = fake.reply(method);
                         let resp = if is_err {
                             serde_json::json!({"id": id, "error": {"message": "injected failure"}})
@@ -1540,15 +1795,61 @@ mod tests {
                 let _ = stream.write_all(resp.as_bytes()).await;
             }
         });
-        format!("http://127.0.0.1:{http_port}")
+        (format!("http://127.0.0.1:{http_port}"), fake)
     }
 
     async fn attach_fake(ax_fail_from: usize) -> (Arc<Browser>, AiChannel) {
-        let base = spawn_fake_cdp(ax_fail_from).await;
+        let (base, _) = spawn_fake_cdp(ax_fail_from, false, None).await;
         let browser = Browser::attach(&base).await.expect("假 CDP 应能 attach");
         let exec = Arc::new(ExecControl::default());
         let ch = AiChannel::new(browser.clone(), vec![], exec);
         (browser, ch)
+    }
+
+    #[tokio::test]
+    async fn screenshot_requires_stable_identity_viewport_and_sensitive_geometry() {
+        for case in [
+            ScreenshotCase::Stable,
+            ScreenshotCase::DocumentChanged,
+            ScreenshotCase::ViewportChanged,
+            ScreenshotCase::IdentityUnavailable,
+            ScreenshotCase::SensitiveMoved,
+            ScreenshotCase::GeometryUnavailable,
+        ] {
+            for mode in [ObserveMode::TreeImage, ObserveMode::Tree] {
+                let (base, _) = spawn_fake_cdp(usize::MAX, false, Some(case)).await;
+                let browser = Browser::attach(&base).await.unwrap();
+                let ch = AiChannel::new(browser, vec![], Arc::new(ExecControl::default()));
+                let result = if mode == ObserveMode::TreeImage {
+                    let req = ObserveRequest {
+                        mode,
+                        ..Default::default()
+                    };
+                    let ObserveOut::Full(_, text, png) = ch.observe_req(&req).await.unwrap() else {
+                        panic!("tree_image 应保留观察树");
+                    };
+                    assert!(text.contains("# frame"), "失败时应保留文本: {case:?}");
+                    if png.is_none() {
+                        assert!(text.contains("截图"), "失败应有诊断: {case:?} {text}");
+                    }
+                    png.ok_or(text)
+                } else {
+                    ch.marked_screenshot().await
+                };
+                if matches!(case, ScreenshotCase::Stable) {
+                    let png = result.expect("稳定页面应交付图像");
+                    let img = image::load_from_memory(&png).unwrap().to_rgba8();
+                    for y in 10..31 {
+                        for x in 10..51 {
+                            assert_eq!(img.get_pixel(x, y).0, [0, 0, 0, 255], "像素 {x},{y}");
+                        }
+                    }
+                    assert_eq!(img.get_pixel(90, 40).0, [255; 4]);
+                } else {
+                    assert!(result.is_err(), "观察后变化应拒绝图像: {case:?}");
+                }
+            }
+        }
     }
 
     fn click_point(frame_id: u64, x: f32, y: f32) -> ActionRequest {
@@ -1562,6 +1863,90 @@ mod tests {
                 count: 1,
             },
         }
+    }
+
+    fn click_element(frame_id: u64, id: String) -> ActionRequest {
+        ActionRequest {
+            request_id: "element-hit-test".to_string(),
+            frame_id,
+            lease: None,
+            action: Action::Click {
+                target: Target::Element { id },
+                button: MouseButton::Left,
+                count: 1,
+            },
+        }
+    }
+
+    /// 可見元素中心即時命中同一 backend 時不必執行 CDP 捲動或固定等待。
+    #[tokio::test]
+    async fn visible_element_center_hit_skips_scroll_command() {
+        let (base, fake) = spawn_fake_cdp(usize::MAX, false, None).await;
+        let browser = Browser::attach(&base).await.expect("假 CDP attach");
+        let ch = AiChannel::new(browser, vec![], Arc::new(ExecControl::default()));
+        let (obs, _) = ch.observe().await.expect("首帧观察");
+        let button = obs
+            .elements
+            .iter()
+            .flat_map(|e| e.children.iter())
+            .find(|e| e.role == "button")
+            .expect("假 AX 樹應有按鈕");
+        let result = ch.act(click_element(obs.frame_id, button.id.clone())).await;
+        assert!(
+            matches!(result, ActionResult::Done { .. }),
+            "按鈕點擊應通過既有動作校驗: {result:?}"
+        );
+
+        let commands = fake.commands.lock().unwrap();
+        assert!(
+            commands
+                .iter()
+                .any(|method| method == "DOM.getNodeForLocation"),
+            "應在元素中心執行即時命中校驗，實際命令: {commands:?}"
+        );
+        assert!(
+            !commands
+                .iter()
+                .any(|method| method == "DOM.scrollIntoViewIfNeeded"),
+            "中心命中相同 backendNodeId 時不可呼叫 scrollIntoViewIfNeeded: {commands:?}"
+        );
+        drop(commands);
+        let points = fake.location_queries.lock().unwrap();
+        assert_eq!(points.len(), 1, "應只查詢一次元素中心命中: {points:?}");
+        assert!(
+            (points[0].0 - 60.0).abs() < 0.01 && (points[0].1 - 30.0).abs() < 0.01,
+            "命中查詢應使用按鈕中心 (60,30): {points:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mismatched_element_center_hit_keeps_scroll_command() {
+        let (base, fake) = spawn_fake_cdp(usize::MAX, false, None).await;
+        fake.hit_backend.store(8, Ordering::SeqCst);
+        let browser = Browser::attach(&base).await.expect("假 CDP attach");
+        let ch = AiChannel::new(browser, vec![], Arc::new(ExecControl::default()));
+        let (obs, _) = ch.observe().await.expect("首帧观察");
+        let button = obs
+            .elements
+            .iter()
+            .flat_map(|e| e.children.iter())
+            .find(|e| e.role == "button")
+            .expect("假 AX 树应有按钮");
+        let result = ch.act(click_element(obs.frame_id, button.id.clone())).await;
+        assert!(matches!(result, ActionResult::Done { .. }), "{result:?}");
+        let commands = fake.commands.lock().unwrap();
+        let hit = commands
+            .iter()
+            .position(|method| method == "DOM.getNodeForLocation")
+            .unwrap();
+        let scroll = commands
+            .iter()
+            .position(|method| method == "DOM.scrollIntoViewIfNeeded")
+            .unwrap();
+        assert!(
+            hit < scroll,
+            "中心命中其他节点后应回到滚动路径: {commands:?}"
+        );
     }
 
     /// 操作与呈现解耦：act 不再做动作后整页刷新。Done 携带的是动作所基于
@@ -1601,7 +1986,7 @@ mod tests {
         let (_browser, ch) = attach_fake(usize::MAX).await;
         let (obs, _) = ch.observe().await.expect("首帧观察应建成");
         let f1 = obs.frame_id;
-        // 请求帧号不在历史池 → StaleFrame + 整帧；刚采的帧复用，不重采
+        // 请求帧号不在历史池 → StaleFrame + 整帧；旧观察不能用于拒绝回包
         let (r, fresh) = ch.act_with_fresh(click_point(f1 + 100, 10.0, 10.0)).await;
         assert!(
             matches!(
@@ -1612,9 +1997,9 @@ mod tests {
             ),
             "实际: {r:?}"
         );
-        match fresh.expect("陈旧拒绝应附最新状态") {
+        match fresh.unwrap().expect("陈旧拒绝应附最新状态") {
             ObserveOut::Full(o, text, _) => {
-                assert_eq!(o.frame_id, f1, "刚采的帧应被复用而非重采");
+                assert!(o.frame_id > f1, "旧观察帧需要重新采集");
                 assert!(!text.is_empty());
             }
             ObserveOut::Delta(..) => panic!("请求帧不在历史池，应回整帧"),
@@ -1622,14 +2007,14 @@ mod tests {
         // 帧过期（>500ms）→ 重采出更新的帧
         tokio::time::sleep(std::time::Duration::from_millis(600)).await;
         let (_, fresh) = ch.act_with_fresh(click_point(f1 + 100, 10.0, 10.0)).await;
-        match fresh.unwrap() {
+        match fresh.unwrap().unwrap() {
             ObserveOut::Full(o, _, _) => assert!(o.frame_id > f1, "过期应重采"),
             ObserveOut::Delta(..) => panic!("应回整帧"),
         }
         // 请求帧在历史池且已不是最新 → 回增量
         let (cur, _) = ch.observe().await.unwrap();
         let (_, fresh) = ch.act_with_fresh(click_point(f1, 10.0, 10.0)).await;
-        match fresh.unwrap() {
+        match fresh.unwrap().unwrap() {
             ObserveOut::Delta(d, _) => {
                 assert_eq!(d.base_frame, f1);
                 assert!(d.frame_id >= cur.frame_id);
@@ -1642,7 +2027,7 @@ mod tests {
             .act_with_fresh(click_point(cur.frame_id, 10.0, 10.0))
             .await;
         assert!(matches!(r, ActionResult::Done { .. }), "实际: {r:?}");
-        assert!(fresh.is_none(), "成功动作不应附带");
+        assert!(fresh.unwrap().is_none(), "成功动作不应附带");
     }
 
     fn since_req(since: u64) -> ObserveRequest {
@@ -1653,25 +2038,99 @@ mod tests {
         }
     }
 
-    /// 呈现一侧：页面自帧采集起没有任何结构类通知、视口没动 → 带
-    /// since_frame 的 observe 回空增量、不再采集；一旦有通知就必须重新采集。
+    /// 静态页也会采集；空增量应用后仍可作为下一次观察的基准。
     #[tokio::test]
     async fn observe_since_returns_empty_delta_when_unchanged() {
         let (_browser, ch) = attach_fake(usize::MAX).await;
-        let (obs, _) = ch.observe().await.expect("首帧观察应建成");
-        let f1 = obs.frame_id;
-        match ch.observe_req(&since_req(f1)).await.unwrap() {
-            ObserveOut::Delta(d, _) => {
-                assert_eq!((d.base_frame, d.frame_id), (f1, f1), "没变不应产生新帧");
-                assert!(d.upserts.is_empty() && d.removed.is_empty());
+        let (mut obs, _) = ch.observe().await.expect("首帧观察应建成");
+        for _ in 0..2 {
+            match ch.observe_req(&since_req(obs.frame_id)).await.unwrap() {
+                ObserveOut::Delta(d, _) => {
+                    assert!(d.frame_id > obs.frame_id, "候选帧应完成采集");
+                    assert!(d.upserts.is_empty() && d.removed.is_empty());
+                    obs = obs.apply_delta(&d).expect("空增量应能应用");
+                }
+                ObserveOut::Full(..) => panic!("没变应回空增量"),
             }
-            ObserveOut::Full(..) => panic!("没变应回空增量"),
         }
-        // 来了一条结构类通知 → 不能再当没变，必须重新采集出新帧
-        ch.changes.record("", crate::changes::Hit::Nodes(vec![1]));
-        match ch.observe_req(&since_req(f1)).await.unwrap() {
-            ObserveOut::Delta(d, _) => assert!(d.frame_id > f1, "有变化应重新采集"),
-            ObserveOut::Full(..) => panic!("应回增量"),
-        }
+        let (mut full, _) = ch.observe().await.unwrap();
+        full.frame_id = obs.frame_id;
+        assert_eq!(full, obs);
+    }
+
+    #[tokio::test]
+    async fn observation_requires_matching_subtree_and_budget() {
+        let (_browser, ch) = attach_fake(usize::MAX).await;
+        let (obs, _) = ch.observe().await.unwrap();
+        let mut req = ObserveRequest {
+            subtree: Some(obs.elements[0].id.clone()),
+            budget_tokens: Some(60),
+            ..ObserveRequest::default()
+        };
+        let ObserveOut::Full(base, _, _) = ch.observe_req(&req).await.unwrap() else {
+            panic!("首个投影应回整帧");
+        };
+        req.since_frame = Some(base.frame_id);
+        let ObserveOut::Delta(delta, _) = ch.observe_req(&req).await.unwrap() else {
+            panic!("相同投影应回增量");
+        };
+        assert!(base.apply_delta(&delta).is_some());
+
+        req.budget_tokens = Some(70);
+        assert!(matches!(
+            ch.observe_req(&req).await.unwrap(),
+            ObserveOut::Full(..)
+        ));
+        req.budget_tokens = Some(60);
+        req.subtree = None;
+        assert!(matches!(
+            ch.observe_req(&req).await.unwrap(),
+            ObserveOut::Full(..)
+        ));
+    }
+
+    #[tokio::test]
+    async fn rejection_preserves_reason_when_observation_fails() {
+        let (_browser, ch) = attach_fake(2).await;
+        let (obs, _) = ch.observe().await.unwrap();
+        let (result, fresh) = ch
+            .act_with_fresh(click_point(obs.frame_id + 1, 10.0, 10.0))
+            .await;
+        assert_eq!(
+            result,
+            ActionResult::Rejected {
+                reason: RejectReason::StaleFrame {
+                    current_frame: obs.frame_id
+                }
+            }
+        );
+        assert_eq!(fresh.err().as_deref(), Some("无法取得最新页面状态"));
+    }
+
+    #[tokio::test]
+    async fn observation_rebases_after_switching_away_and_back() {
+        let (browser, ch) = attach_fake(usize::MAX).await;
+        let (obs, _) = ch.observe().await.unwrap();
+        let page = browser.main().await.unwrap();
+        browser.set_main("other").await;
+        browser.set_main(&page).await;
+        assert!(matches!(
+            ch.observe_req(&since_req(obs.frame_id)).await.unwrap(),
+            ObserveOut::Full(..)
+        ));
+    }
+
+    #[tokio::test]
+    async fn observation_discards_candidate_if_document_changes_during_capture() {
+        let (base, _) = spawn_fake_cdp(usize::MAX, true, None).await;
+        let browser = Browser::attach(&base).await.unwrap();
+        let ch = AiChannel::new(browser, vec![], Arc::new(ExecControl::default()));
+        let (obs, text) = ch.observe().await.unwrap();
+        assert_eq!(obs.frame_id, 2);
+        assert!(text.contains("B") && !text.contains("old"));
+        let state = ch.state.lock().await;
+        let frame = state.as_ref().unwrap();
+        assert_eq!(frame.context.loader, "L2");
+        assert_eq!(frame.obs.frame_id, obs.frame_id);
     }
 }

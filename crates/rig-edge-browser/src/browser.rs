@@ -28,11 +28,33 @@ pub struct SessionInfo {
     pub parent: Option<String>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ActivePage {
+    pub session: String,
+    generation: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ViewState {
+    pub space: rig_proto::observation::Space,
+    pub page_origin: [f32; 2],
+    pub visual_offset: [f32; 2],
+    pub visual_scale: f32,
+}
+
+impl ViewState {
+    pub fn same_space(&self, other: &Self) -> bool {
+        self.space == other.space
+            && self.visual_offset == other.visual_offset
+            && self.visual_scale == other.visual_scale
+    }
+}
+
 pub struct Browser {
     pub cdp: Arc<Cdp>,
     child: Mutex<Option<tokio::process::Child>>,
     pub sessions: Mutex<HashMap<String, SessionInfo>>,
-    main_session: Mutex<Option<String>>,
+    main_session: Mutex<(Option<String>, u64)>,
     /// 规范化后的 UA（去掉 Headless 字样，版本取自浏览器自身）：
     /// 每个页面会话挂载时以 Emulation.setUserAgentOverride 套用。
     /// 带 Headless 的 UA 是最廉价的机器人信号，多家站点据此拒绝
@@ -353,7 +375,7 @@ impl Browser {
             cdp,
             child: Mutex::new(child),
             sessions: Mutex::new(HashMap::new()),
-            main_session: Mutex::new(None),
+            main_session: Mutex::new((None, 0)),
             ua: Mutex::new(None),
             ua_meta: Mutex::new(None),
             accept_lang: Mutex::new(None),
@@ -493,8 +515,8 @@ impl Browser {
                                     b.sessions.lock().await.insert(sid.clone(), t);
                                     if is_page {
                                         let mut main = b.main_session.lock().await;
-                                        if main.is_none() {
-                                            *main = Some(sid.clone());
+                                        if main.0.is_none() {
+                                            *main = (Some(sid.clone()), main.1 + 1);
                                         }
                                     }
                                     // 跨进程 iframe 的目标挂在页面会话下，不在浏览器级：
@@ -571,8 +593,8 @@ impl Browser {
                                     // 主会话消失时清空，避免 main() 长期指向
                                     // 死会话；后续挂靠/视图切换会重新设定
                                     let mut main = b.main_session.lock().await;
-                                    if main.as_deref() == Some(sid) {
-                                        *main = None;
+                                    if main.0.as_deref() == Some(sid) {
+                                        *main = (None, main.1 + 1);
                                     }
                                 }
                             }
@@ -600,7 +622,7 @@ impl Browser {
 
         // 等主页面会话出现
         for _ in 0..60 {
-            if browser.main_session.lock().await.is_some() {
+            if browser.main_session.lock().await.0.is_some() {
                 return Ok(browser);
             }
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
@@ -609,20 +631,24 @@ impl Browser {
     }
 
     pub async fn main(&self) -> CdpResult<String> {
-        self.main_session
-            .lock()
-            .await
-            .clone()
-            .ok_or_else(|| "无主页面会话".to_string())
+        Ok(self.active_page().await?.session)
+    }
+
+    pub async fn active_page(&self) -> CdpResult<ActivePage> {
+        let main = self.main_session.lock().await;
+        let session = main.0.clone().ok_or("无主页面会话".to_string())?;
+        Ok(ActivePage {
+            session,
+            generation: main.1,
+        })
     }
 
     /// 主文档的 loaderId（每次导航换新）：采集前后的页面代次
     /// 探针（R-14）——两次不同即期间发生过导航
-    pub async fn main_loader_id(&self) -> CdpResult<String> {
-        let main = self.main().await?;
+    pub async fn loader_id(&self, session: &str) -> CdpResult<String> {
         let v = self
             .cdp
-            .call(Some(&main), "Page.getFrameTree", json!({}))
+            .call(Some(session), "Page.getFrameTree", json!({}))
             .await?;
         v.pointer("/frameTree/frame/loaderId")
             .and_then(Value::as_str)
@@ -633,7 +659,10 @@ impl Browser {
     /// 把主会话切到指定页面会话。人通道切换活动标签时调用：
     /// AI 通道的观察/动作对象始终跟随人正在看的标签（§7/B4）。
     pub async fn set_main(&self, session: &str) {
-        *self.main_session.lock().await = Some(session.to_string());
+        let mut main = self.main_session.lock().await;
+        if main.0.as_deref() != Some(session) {
+            *main = (Some(session.to_string()), main.1 + 1);
+        }
     }
 
     pub async fn shutdown(&self) {
@@ -659,12 +688,15 @@ impl Browser {
 
     // ── 页面门面 ─────────────────────────────────────────────
 
-    pub async fn ax_tree(&self, session: &str) -> CdpResult<Value> {
-        let r = self
+    pub async fn ax_tree(&self, session: &str) -> CdpResult<Vec<Value>> {
+        let mut r = self
             .cdp
             .call(Some(session), "Accessibility.getFullAXTree", json!({}))
             .await?;
-        Ok(r.get("nodes").cloned().unwrap_or(Value::Null))
+        match r.get_mut("nodes").map(Value::take) {
+            Some(Value::Array(nodes)) => Ok(nodes),
+            _ => Ok(Vec::new()),
+        }
     }
 
     /// 单节点 AX（不取亲属）：动作前快速复核用，字段口径与
@@ -723,11 +755,50 @@ impl Browser {
                 json!({"depth": -1, "pierce": true}),
             )
             .await?;
+        let root = r
+            .get("root")
+            .filter(|node| node.is_object())
+            .ok_or("DOM.getDocument 无根节点")?;
         let mut map = HashMap::new();
-        if let Some(root) = r.get("root") {
-            collect_dom(root, &mut map);
-        }
+        collect_dom(root, &mut map);
         Ok(map)
+    }
+
+    /// 截图打码使用完整边框。四个角都必须是有效的视口坐标。
+    pub async fn border_bounds(&self, session: &str, backend: i64) -> CdpResult<[f32; 4]> {
+        let r = self
+            .cdp
+            .call(
+                Some(session),
+                "DOM.getBoxModel",
+                json!({"backendNodeId": backend}),
+            )
+            .await?;
+        let points = r
+            .pointer("/model/border")
+            .and_then(Value::as_array)
+            .filter(|p| p.len() == 8)
+            .ok_or("DOM.getBoxModel 无完整边框")?;
+        let mut bounds = [
+            f32::INFINITY,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::NEG_INFINITY,
+        ];
+        for (i, point) in points.iter().enumerate() {
+            let v = point
+                .as_f64()
+                .map(|v| v as f32)
+                .filter(|v| v.is_finite())
+                .ok_or("DOM.getBoxModel 无有效边框坐标")?;
+            let axis = i % 2;
+            bounds[axis] = bounds[axis].min(v);
+            bounds[axis + 2] = bounds[axis + 2].max(v);
+        }
+        if bounds[0] >= bounds[2] || bounds[1] >= bounds[3] {
+            return Err("DOM.getBoxModel 边框退化".into());
+        }
+        Ok(bounds)
     }
 
     pub async fn root_frame_id(&self, session: &str) -> CdpResult<String> {
@@ -798,7 +869,11 @@ impl Browser {
     /// 视口口径（dbg33 探针实测：覆盖全部有布局盒的节点、
     /// 坐标与逐节点 quads 一致）。失败返回空表，调用方回落
     /// 逐节点 quads，不改变语义
-    pub async fn geometry_map(&self, session: &str) -> std::collections::HashMap<i64, [f32; 4]> {
+    pub async fn geometry_map(
+        &self,
+        session: &str,
+        origin: Option<[f32; 2]>,
+    ) -> HashMap<i64, [f32; 4]> {
         let mut out: std::collections::HashMap<i64, [f32; 4]> = std::collections::HashMap::new();
         let Ok(r) = self
             .cdp
@@ -811,24 +886,24 @@ impl Browser {
         else {
             return out;
         };
-        // 本会话滚动偏移（文档坐标 → 视口坐标）
-        let (px, py) = match self
-            .cdp
-            .call(Some(session), "Page.getLayoutMetrics", json!({}))
-            .await
-        {
-            Ok(m) => {
-                let vv = m.get("cssVisualViewport");
-                (
-                    vv.and_then(|v| v.get("pageX"))
+        let [px, py] = match origin {
+            Some(origin) => origin,
+            None => {
+                let layout = self
+                    .cdp
+                    .call(Some(session), "Page.getLayoutMetrics", json!({}))
+                    .await;
+                let scroll = |key| {
+                    layout
+                        .as_ref()
+                        .ok()
+                        .and_then(|m| m.get("cssVisualViewport"))
+                        .and_then(|v| v.get(key))
                         .and_then(Value::as_f64)
-                        .unwrap_or(0.0) as f32,
-                    vv.and_then(|v| v.get("pageY"))
-                        .and_then(Value::as_f64)
-                        .unwrap_or(0.0) as f32,
-                )
+                        .unwrap_or(0.0) as f32
+                };
+                [scroll("pageX"), scroll("pageY")]
             }
-            Err(_) => (0.0, 0.0),
         };
         let Some(docs) = r.get("documents").and_then(Value::as_array) else {
             return out;
@@ -920,34 +995,22 @@ impl Browser {
         Ok(Some([x1, y1, x2, y2]))
     }
 
-    /// 视口状态 [pageX, pageY, 宽, 高]（CSS 像素）：滚动与缩放没有任何
-    /// DOM 通知，呈现一侧靠它单独判断“视口动没动”（见 changes.rs）。
-    pub async fn view_state(&self, session: &str) -> CdpResult<[f32; 4]> {
+    /// 快照使用的坐标空间和视觉视口。
+    pub async fn view_state(&self, session: &str) -> CdpResult<ViewState> {
         let r = self
             .cdp
             .call(Some(session), "Page.getLayoutMetrics", json!({}))
             .await?;
         let vv = r
             .get("cssVisualViewport")
-            .ok_or_else(|| "getLayoutMetrics 无 cssVisualViewport".to_string())?;
-        let f = |k: &str| vv.get(k).and_then(Value::as_f64).unwrap_or(0.0) as f32;
-        Ok([f("pageX"), f("pageY"), f("clientWidth"), f("clientHeight")])
-    }
-
-    /// (CSS 视口宽, 高, devicePixelRatio)
-    pub async fn layout(&self, session: &str) -> CdpResult<(f32, f32, f32)> {
-        let r = self
-            .cdp
-            .call(Some(session), "Page.getLayoutMetrics", json!({}))
-            .await?;
-        let vp = r
-            .get("cssVisualViewport")
             .ok_or("getLayoutMetrics 无 cssVisualViewport")?;
-        let w = vp.get("clientWidth").and_then(Value::as_f64).unwrap_or(0.0) as f32;
-        let h = vp
-            .get("clientHeight")
-            .and_then(Value::as_f64)
-            .unwrap_or(0.0) as f32;
+        let f = |key: &str| {
+            vv.get(key)
+                .and_then(Value::as_f64)
+                .map(|v| v as f32)
+                .filter(|v| v.is_finite())
+                .ok_or_else(|| format!("cssVisualViewport 无有效 {key}"))
+        };
         let d = self
             .cdp
             .call(
@@ -956,11 +1019,30 @@ impl Browser {
                 json!({"expression": "devicePixelRatio", "returnByValue": true}),
             )
             .await?;
-        let dpr = d
-            .pointer("/result/value")
-            .and_then(Value::as_f64)
-            .unwrap_or(1.0) as f32;
-        Ok((w, h, dpr))
+        let space = rig_proto::observation::Space {
+            width: f("clientWidth")?,
+            height: f("clientHeight")?,
+            scale: d
+                .pointer("/result/value")
+                .and_then(Value::as_f64)
+                .ok_or("无法取得 devicePixelRatio")? as f32,
+        };
+        let visual_scale = f("scale")?;
+        if !space.is_valid() || visual_scale <= 0.0 {
+            return Err("视口坐标空间无效".into());
+        }
+        Ok(ViewState {
+            space,
+            page_origin: [f("pageX")?, f("pageY")?],
+            visual_offset: [f("offsetX")?, f("offsetY")?],
+            visual_scale,
+        })
+    }
+
+    /// (CSS 视口宽, 高, devicePixelRatio)
+    pub async fn layout(&self, session: &str) -> CdpResult<(f32, f32, f32)> {
+        let space = self.view_state(session).await?.space;
+        Ok((space.width, space.height, space.scale))
     }
 
     /// 执行 JS 并返回结果值（awaitPromise）。用于剪贴板读回等页面侧异步 API。
@@ -989,6 +1071,21 @@ impl Browser {
                 json!({"origin": origin, "permissions": ["clipboardReadWrite", "clipboardSanitizedWrite"]}),
             )
             .await;
+    }
+
+    /// 当前 CSS 视口坐标实际命中的 DOM 节点。
+    pub async fn hit_backend_node(&self, session: &str, x: i32, y: i32) -> CdpResult<i64> {
+        let hit = self
+            .cdp
+            .call(
+                Some(session),
+                "DOM.getNodeForLocation",
+                json!({"x": x, "y": y, "ignorePointerEventsNone": false}),
+            )
+            .await?;
+        hit.get("backendNodeId")
+            .and_then(Value::as_i64)
+            .ok_or_else(|| "命中未返回节点".to_string())
     }
 
     pub async fn scroll_into_view(&self, session: &str, backend: i64) -> CdpResult<()> {
@@ -1113,13 +1210,20 @@ impl Browser {
         Ok(())
     }
 
-    pub async fn screenshot_png(&self, session: &str) -> CdpResult<Vec<u8>> {
+    pub async fn screenshot_png(&self, session: &str, view: ViewState) -> CdpResult<Vec<u8>> {
         let r = self
             .cdp
             .call(
                 Some(session),
                 "Page.captureScreenshot",
-                json!({"format": "png", "fromSurface": true}),
+                json!({
+                    "format": "png", "fromSurface": true,
+                    "clip": {
+                        "x": view.page_origin[0], "y": view.page_origin[1],
+                        "width": view.space.width, "height": view.space.height,
+                        "scale": view.visual_scale,
+                    }
+                }),
             )
             .await?;
         let b64 = r

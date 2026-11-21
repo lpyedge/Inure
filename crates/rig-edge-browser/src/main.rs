@@ -231,8 +231,7 @@ struct ChannelState {
     av_available: bool,
     /// 人通道启动失败原因（R-11）；正常时为 null
     human_error: Option<String>,
-    /// M01 用户 AV 意图（要不要 AV）：RTC healthy 时 HLS 可以不跑，
-    /// 意图保留、连通数归零即兜底启动
+    /// 是否允许 HLS 播放。管线有有效播放请求时运行。
     av_wanted: bool,
     /// M03 HLS 运行态：running / idle / failed（供排障，不抛异常）
     media_state: String,
@@ -435,8 +434,7 @@ async fn main() {
         token,
     });
     app.human.set_gate_display(ai_default, human_default).await;
-    // M01：RTC 连通数变化自动联动 HLS（连通 grace 后停、归零起兜底）
-    app.rtc.set_hls_policy(&app.media);
+    app.human.manage_capture();
     if human_default {
         if let Err(e) = app.human.start().await {
             // R-11：启动失败如实降级——gate 不报已启用，错误可查
@@ -446,10 +444,7 @@ async fn main() {
             app.human.set_gate_display(ai_default, false).await;
         }
         if av_default && av_capable {
-            // M01：--av 只记用户意图；RTC 无连通才起 HLS，不 blind 启动
-            app.media
-                .apply_wanted(true, app.rtc.connected_count())
-                .await;
+            app.media.apply_wanted(true).await;
         }
     }
 
@@ -609,7 +604,8 @@ async fn health(State(app): State<Arc<App>>) -> Json<serde_json::Value> {
         "last_frame_age_ms": app.human.last_frame_age_ms(),
         "exec_in_flight": app.ai.exec_in_flight().await,
         "rtc_connected": app.rtc.connected_count(),
-        "rtc_want": app.rtc.want_count(),
+        "rtc_video_want": app.rtc.video_want_count(),
+        "rtc_audio_want": app.rtc.audio_want_count(),
         "dc_pending_bytes": app.rtc.dc_pending_bytes(),
         "dom_viewers": app.dom.viewer_count(),
         "media": {
@@ -692,11 +688,7 @@ async fn apply_gate_flags(app: &Arc<App>, ai: Option<bool>, human: Option<bool>)
                 }
             }
         } else if !h && cur {
-            // M01：关人通道同时清除 AV 意图，否则 RTC 断开会把 HLS
-            // 又拉起来（人通道都没了，兜底无意义）
-            app.media
-                .apply_wanted(false, app.rtc.connected_count())
-                .await;
+            app.media.apply_wanted(false).await;
             let _ = app.human.stop().await;
             app.gate_human.store(false, Ordering::SeqCst);
         }
@@ -718,16 +710,8 @@ async fn set_channels(
 ) -> Json<ChannelState> {
     apply_gate_flags(&app, set.ai, set.human).await;
     if let Some(av) = set.av {
-        // M01：用户意图与实际运行分离——RTC healthy 时 HLS 默认不跑，
-        // 只在连通数归零时兜底；M03：失败原因进 ChannelState，不再吞掉
-        if av && app.av_capable && app.gate_human.load(Ordering::SeqCst) {
-            app.media
-                .apply_wanted(true, app.rtc.connected_count())
-                .await;
-        } else if !av {
-            app.media
-                .apply_wanted(false, app.rtc.connected_count())
-                .await;
+        if !av || app.av_capable && app.gate_human.load(Ordering::SeqCst) {
+            app.media.apply_wanted(av).await;
         }
     }
     let av = app.media.running().await;
@@ -867,13 +851,14 @@ async fn act(State(app): State<Arc<App>>, Json(req): Json<ActionRequest>) -> Res
     // 被拒（页面状态不符）时附带最新一帧，调用方不必再补一次 observe
     let (result, fresh) = app.ai.act_with_fresh(req).await;
     match fresh {
-        Some(ObserveOut::Delta(delta, text)) => {
+        Ok(Some(ObserveOut::Delta(delta, text))) => {
             Json(json!({"result": result, "delta": delta, "text": text})).into_response()
         }
-        Some(ObserveOut::Full(obs, text, _)) => {
+        Ok(Some(ObserveOut::Full(obs, text, _))) => {
             Json(json!({"result": result, "observation": obs, "text": text})).into_response()
         }
-        None => Json(json!({"result": result})).into_response(),
+        Err(text) => Json(json!({"result": result, "text": text})).into_response(),
+        Ok(None) => Json(json!({"result": result})).into_response(),
     }
 }
 
@@ -932,50 +917,59 @@ fn frame_message(f: &human::FrameMsg) -> Message {
     Message::Binary(buf.into())
 }
 
-/// D01/D02：单连接订阅记账——`acquire_*`/`release_*` 各自幂等，
-/// 重复 start/stop 不改变远端计数；真正的释放只发生在父作用域
-/// （`ws_session` 尾部），任一侧任务先结束（含 abort）都不丢清理。
+/// 本连接是否显示 DOM，同时决定 WS 与 RTC 的镜像路由。
 #[derive(Debug, Default)]
 struct ConnSubs {
-    dom_held: bool,
-    jpeg_held: bool,
+    dom_held: Arc<AtomicBool>,
 }
 
 impl ConnSubs {
-    fn new() -> Self {
-        // JPEG 需求连接建立即持有（视频模式默认）；DOM 按需进入
-        ConnSubs {
-            dom_held: false,
-            jpeg_held: true,
-        }
+    fn acquire_dom(&self) -> bool {
+        !self.dom_held.swap(true, Ordering::SeqCst)
     }
-    /// 进入 DOM：未持有才返回 true（调用方据此调一次 viewer_start）
-    fn acquire_dom(&mut self) -> bool {
-        if self.dom_held {
-            false
-        } else {
-            self.dom_held = true;
-            true
-        }
+
+    fn release_dom(&self) -> bool {
+        self.dom_held.swap(false, Ordering::SeqCst)
     }
-    /// 退出 DOM：持有才返回 true（调用方据此调一次 viewer_stop）
-    fn release_dom(&mut self) -> bool {
-        if self.dom_held {
-            self.dom_held = false;
-            true
-        } else {
-            false
-        }
+}
+
+fn rtc_tracks(v: &serde_json::Value) -> rtc::TrackDemand {
+    let wanted = |key| {
+        v.get(key)
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(true)
+    };
+    rtc::TrackDemand {
+        video: wanted("video"),
+        audio: wanted("audio"),
     }
-    /// 释放 JPEG 需求：持有才返回 true（调用方据此调一次 demand_add(-1)）
-    fn release_jpeg(&mut self) -> bool {
-        if self.jpeg_held {
-            self.jpeg_held = false;
-            true
-        } else {
-            false
+}
+
+async fn first_viewer_frame(
+    app: &App,
+    frames: &mut tokio::sync::broadcast::Receiver<(browser::ActivePage, human::FrameMsg)>,
+) -> Option<human::FrameMsg> {
+    let first = tokio::time::timeout(std::time::Duration::from_millis(150), async {
+        loop {
+            match frames.recv().await {
+                Ok((page, frame)) if app.browser.active_page().await.as_ref() == Ok(&page) => {
+                    return Some(frame);
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
+                _ => {}
+            }
         }
+    })
+    .await;
+    if let Ok(Some(frame)) = first {
+        return Some(frame);
     }
+    let (page, frame) =
+        tokio::time::timeout(std::time::Duration::from_secs(1), app.human.first_frame())
+            .await
+            .ok()??;
+    *frames = frames.resubscribe();
+    (app.browser.active_page().await.as_ref() == Ok(&page)).then_some(frame)
 }
 
 async fn ws_session(app: Arc<App>, socket: WebSocket, remote: std::net::SocketAddr) {
@@ -992,27 +986,22 @@ async fn ws_session(app: Arc<App>, socket: WebSocket, remote: std::net::SocketAd
                 .await;
         }
     }
-    // 先回放最近一帧，新观看者立刻看到当前画面
-    if let Some(f) = app.human.last_frame().await {
-        let _ = sink.send(frame_message(&f)).await;
-    }
+    // 订阅先于声明需求，让首帧可以直接接收。
     let mut frames = app.human.subscribe();
+    let mut jpeg_lease = Some(app.human.request_capture());
+    let (jpeg_mode, mut jpeg_watch) = tokio::sync::watch::channel(true);
     let mut notices = app.human.subscribe_notices();
     let mut dom_msgs = app.dom.subscribe();
     let app2 = app.clone();
+    let send_app = app.clone();
     // D01/D02：本连接的订阅记账（跨两个任务共享，释放只在父作用域）。
-    // JPEG 需求连接建立即持有，见 ConnSubs::new。
-    let subs = Arc::new(std::sync::Mutex::new(ConnSubs::new()));
+    let subs = Arc::new(ConnSubs::default());
+    let dom_wanted = subs.dom_held.clone();
     let subs2 = subs.clone();
     // 本连接的 transport 模式：RTC 连通后置 true，发送侧停发 WS 帧
     // （广播照常接收只丢弃）；RTC 断开/关闭自动恢复 WS 帧
     let rtc_active = Arc::new(AtomicBool::new(false));
     let rtc_on = rtc_active.clone();
-    // 本连接当前是否需要 WS JPEG 帧：只由观看端的 jpeg-demand 决定
-    // （前台 DOM/RTC/HLS 显示时为 false）。后台 DOM 感知订阅不影响它，
-    // 否则 RTC 回退到 canvas 时画面会停在旧帧。
-    let jpeg_want = Arc::new(AtomicBool::new(true));
-    let jpeg_want_tx = jpeg_want.clone();
     // 本连接的 rig-dom 数据通道已打开时，DOM 消息改走 DC：
     // 发送侧跳过 WS 文本副本（会话任务用自己的订阅经 DC 送达）
     let dom_dc_open = Arc::new(AtomicBool::new(false));
@@ -1022,8 +1011,13 @@ async fn ws_session(app: Arc<App>, socket: WebSocket, remote: std::net::SocketAd
     let exec_ghost = app.exec.clone();
     let human2 = app.human.clone();
     let mut send_task = tokio::spawn(async move {
-        // 连接建立先直发一份当前 chrome 状态（原生工具栏的初值；
-        // 后续变化经 notices 广播的 chrome-state 到达）
+        if let Some(f) = first_viewer_frame(&send_app, &mut frames).await {
+            let wanted = *jpeg_watch.borrow();
+            if wanted && sink.send(frame_message(&f)).await.is_err() {
+                return;
+            }
+        }
+        // 页面首帧后直发工具栏初值，后续由通知广播更新。
         let init_state = human2.state_json_string().await;
         if sink.send(Message::Text(init_state.into())).await.is_err() {
             return;
@@ -1056,13 +1050,26 @@ async fn ws_session(app: Arc<App>, socket: WebSocket, remote: std::net::SocketAd
                         ghost_last = msg;
                     }
                 },
-                f = frames.recv() => match f {
-                    Ok(f) => {
-                        if !jpeg_want_tx.load(Ordering::SeqCst) {
-                            // 观看端不消费 JPEG（DOM 镜像/视频元素在显示）
-                        } else if rtc_on.load(Ordering::SeqCst) {
-                            // RTC 接管画面：WS 帧停发（广播照常收，只丢弃）
-                        } else if sink.send(frame_message(&f)).await.is_err() {
+                changed = jpeg_watch.changed() => {
+                    if changed.is_err() { break; }
+                    let wanted = *jpeg_watch.borrow_and_update();
+                    if wanted && !rtc_on.load(Ordering::SeqCst) {
+                        frames = frames.resubscribe();
+                        if let Some(f) = first_viewer_frame(&send_app, &mut frames).await {
+                            let wanted = *jpeg_watch.borrow();
+                            if wanted && sink.send(frame_message(&f)).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                },
+                frame = frames.recv() => match frame {
+                    Ok((page, f)) => {
+                        let wanted = *jpeg_watch.borrow();
+                        if wanted && !rtc_on.load(Ordering::SeqCst)
+                            && send_app.browser.active_page().await.as_ref() == Ok(&page)
+                            && sink.send(frame_message(&f)).await.is_err()
+                        {
                             break;
                         }
                     }
@@ -1088,8 +1095,8 @@ async fn ws_session(app: Arc<App>, socket: WebSocket, remote: std::net::SocketAd
                 },
                 dm = dom_msgs.recv() => match dm {
                     Ok(text) => {
-                        if dom_dc_on.load(Ordering::SeqCst) {
-                            continue; // 已由本连接的数据通道送达
+                        if !dom_wanted.load(Ordering::SeqCst) || dom_dc_on.load(Ordering::SeqCst) {
+                            continue;
                         }
                         if sink.send(Message::Text(text.into())).await.is_err() {
                             break;
@@ -1101,15 +1108,18 @@ async fn ws_session(app: Arc<App>, socket: WebSocket, remote: std::net::SocketAd
             }
         }
     });
+    let (send_done, mut stop_recv) = tokio::sync::oneshot::channel::<()>();
     let mut recv_task = tokio::spawn(async move {
         let mut rtc_session: Option<rtc::SessionHandle> = None;
-        // F-03：本连接的 JPEG 需求记账——默认持有（视频模式），
-        // 观看端切到 RTC/DOM 时发 jpeg-demand{on:false} 释放，
-        // 连接结束时父作用域兜底释放（D02）
-        app2.human.jpeg_demand_add(1);
         // R-10：收包按帧型分发——Ping/Pong/Binary 不结束会话
         // （此前 while let 只认 Text，任意保活帧都会拆连接）
-        while let Some(msg) = stream.next().await {
+        loop {
+            let msg = tokio::select! {
+                biased;
+                _ = &mut stop_recv => break,
+                msg = stream.next() => msg,
+            };
+            let Some(msg) = msg else { break };
             let text = match msg {
                 Ok(Message::Text(t)) => t,
                 Ok(Message::Ping(_)) | Ok(Message::Pong(_)) | Ok(Message::Binary(_)) => continue,
@@ -1122,37 +1132,42 @@ async fn ws_session(app: Arc<App>, socket: WebSocket, remote: std::net::SocketAd
             match v.get("type").and_then(|t| t.as_str()) {
                 Some("jpeg-demand") => {
                     let on = v.get("on").and_then(|b| b.as_bool()).unwrap_or(true);
-                    // D01：同一连接重复开关只记一次账
-                    let op = {
-                        let mut s = subs2.lock().unwrap();
-                        if on && !s.jpeg_held {
-                            s.jpeg_held = true;
-                            1
-                        } else if !on && s.release_jpeg() {
-                            -1
-                        } else {
-                            0
-                        }
-                    };
-                    jpeg_want.store(on, Ordering::SeqCst);
-                    if op != 0 {
-                        app2.human.jpeg_demand_add(op);
+                    if on && jpeg_lease.is_none() {
+                        jpeg_lease = Some(app2.human.request_capture());
+                        jpeg_mode.send_replace(true);
+                    } else if !on && jpeg_lease.is_some() {
+                        jpeg_lease = None;
+                        jpeg_mode.send_replace(false);
                     }
                 }
                 Some("rtc-start") => {
                     rtc_session.take(); // drop 旧会话（其驱动任务随之退出）
                     let ip = candidate_ip(&app2, remote);
-                    rtc_session = Some(
-                        app2.rtc
-                            .start_session(
-                                out_tx.clone(),
-                                rtc_active.clone(),
-                                ip,
-                                Some(app2.dom.subscribe()),
-                                dom_dc_open.clone(),
-                            )
-                            .await,
-                    );
+                    rtc_session = Some(app2.rtc.start_session(
+                        out_tx.clone(),
+                        ip,
+                        app2.dom.subscribe(),
+                        rtc::ViewerTransport {
+                            video_active: rtc_active.clone(),
+                            dom_open: dom_dc_open.clone(),
+                            dom_wanted: subs2.dom_held.clone(),
+                        },
+                        rtc_tracks(&v),
+                    ));
+                }
+                Some("rtc-demand") => {
+                    if let Some(s) = &rtc_session {
+                        s.set_demand(rtc_tracks(&v)).await;
+                    }
+                }
+                Some("mode-summary") => {
+                    if let Some(request) = v.get("request").and_then(|v| v.as_u64()) {
+                        if let Some(mut summary) = app2.dom.mode_summary().await {
+                            summary["type"] = json!("mode-summary");
+                            summary["request"] = json!(request);
+                            let _ = out_tx.send(summary.to_string()).await;
+                        }
+                    }
                 }
                 Some("rtc-answer") => {
                     if let (Some(s), Some(sdp)) =
@@ -1171,21 +1186,19 @@ async fn ws_session(app: Arc<App>, socket: WebSocket, remote: std::net::SocketAd
                     rtc_session.take();
                 }
                 Some("dom-start") => {
-                    // D01：同一连接重复 dom-start 只订阅一次（自动感知+
-                    // 前台显示共用一份订阅，不重复发 START）
-                    let start = subs2.lock().unwrap().acquire_dom();
-                    if start {
+                    if subs2.acquire_dom() {
                         app2.dom.viewer_start().await;
                     }
                 }
                 Some("dom-stop") => {
-                    let stop = subs2.lock().unwrap().release_dom();
-                    if stop {
+                    if subs2.release_dom() {
                         app2.dom.viewer_stop().await;
                     }
                 }
                 Some("dom-resync") => {
-                    app2.dom.resync().await;
+                    if subs2.dom_held.load(Ordering::SeqCst) {
+                        app2.dom.resync().await;
+                    }
                 }
                 _ => {
                     // DOM 模式的输入带 dom:1，坐标是页面坐标，走直达分发
@@ -1201,12 +1214,11 @@ async fn ws_session(app: Arc<App>, socket: WebSocket, remote: std::net::SocketAd
                 }
             }
         }
-        // D02：本任务尾部不再做释放——发送侧先结束时本任务会被 abort，
-        // 尾部代码跑不到。释放统一由父作用域做（见 select 之后）。
     });
     tokio::select! {
         _ = &mut send_task => {
-            recv_task.abort();
+            // Let any in-flight subscription transition finish before cleanup.
+            let _ = send_done.send(());
             let _ = recv_task.await;
         }
         _ = &mut recv_task => {
@@ -1214,19 +1226,8 @@ async fn ws_session(app: Arc<App>, socket: WebSocket, remote: std::net::SocketAd
             let _ = send_task.await;
         }
     }
-    // D02 唯一释放点：任一侧先结束（含 abort），订阅都在这里释放一次。
-    // 连接断开时（关标签页/崩溃不会发 dom-stop）名额同样回收，否则
-    // 后来者的 dom-start 会被当成「后来者」而不再启动页内观察者。
-    // 守卫只在同步段持有（MutexGuard 不跨 await，保证 future Send）。
-    let (stop_dom, drop_jpeg) = {
-        let mut s = subs.lock().unwrap();
-        (s.release_dom(), s.release_jpeg())
-    };
-    if stop_dom {
+    if subs.release_dom() {
         app.dom.viewer_stop().await;
-    }
-    if drop_jpeg {
-        app.human.jpeg_demand_add(-1);
     }
 }
 
@@ -1321,7 +1322,7 @@ fn mcp_tools() -> serde_json::Value {
     json!([
         {
             "name": "observe",
-            "description": "观察当前页面：返回紧凑文本渲染与完整语义快照（Observation JSON）。动手前先观察，动作引用快照里的元素 id 与 frame_id。可选参数（ObserveRequest）：mode='text' 只回文本视图（最省）、'tree' 树+文本（默认）、'tree_image' 再附编号截图；budget_tokens 按预算裁剪响应视图（被裁元素仍可凭 id 操作）；subtree 只回某元素的子树；include_offscreen=true 才带视口外元素（默认不带）；since_frame 传上次帧号且仍可达时回增量（摘要+ObservationDelta JSON 两个文本块，用 apply_delta 更新本地树，base 不匹配时回完整快照）。",
+            "description": "观察当前页面：返回紧凑文本渲染与完整语义快照（Observation JSON）。动手前先观察，动作引用快照里的元素 id 与 frame_id。可选参数（ObserveRequest）：mode='text' 只回文本视图（最省）、'tree' 树+文本（默认）、'tree_image' 再附编号截图；budget_tokens 按预算裁剪响应视图（被裁元素仍可凭 id 操作）；subtree 只回某元素的子树；include_offscreen=true 才带视口外元素（默认不带）；since_frame 使用客户端最后收到并应用的观察帧号。页面、坐标空间与投影相容时回增量（摘要和 ObservationDelta JSON），否则回完整快照。",
             "inputSchema": {"type": "object", "properties": {"mode": {"type": "string", "enum": ["text", "tree", "tree_image"]}, "budget_tokens": {"type": "integer", "minimum": 0}, "subtree": {"type": "string"}, "since_frame": {"type": "integer", "minimum": 0}, "include_offscreen": {"type": "boolean"}}, "additionalProperties": false}
         },
         {
@@ -1426,16 +1427,20 @@ async fn mcp_call(app: &Arc<App>, params: &serde_json::Value) -> (serde_json::Va
                     ];
                     // 被拒时附最新帧文本视图（第二个文本块）
                     match fresh {
-                        Some(ObserveOut::Delta(delta, text)) => {
+                        Ok(Some(ObserveOut::Delta(delta, text))) => {
                             content.push(json!({"type": "text", "text": text}));
                             content.push(
                                 json!({"type": "text", "text": serde_json::to_string(&delta).unwrap_or_default()}),
                             );
                         }
-                        Some(ObserveOut::Full(_, text, _)) => {
+                        Ok(Some(ObserveOut::Full(obs, text, _))) => {
                             content.push(json!({"type": "text", "text": text}));
+                            content.push(
+                                json!({"type": "text", "text": serde_json::to_string(&obs).unwrap_or_default()}),
+                            );
                         }
-                        None => {}
+                        Err(text) => content.push(json!({"type": "text", "text": text})),
+                        Ok(None) => {}
                     }
                     (json!({"content": content, "isError": false}), taken)
                 }
@@ -1510,22 +1515,11 @@ mod tests {
     /// dom-start,dom-stop,close` 计数恰好回零，不多扣不少补。
     #[test]
     fn conn_subs_dom_is_idempotent_per_connection() {
-        let mut s = ConnSubs::new();
-        // 自动感知 + 前台显示两次进入：只有第一次真正订阅
+        let s = ConnSubs::default();
         assert!(s.acquire_dom());
         assert!(!s.acquire_dom());
-        // 显示退出但感知仍在：由调用方按“是否还有需求”决定；
-        // 守卫只保证配对——一次 release 后再次 release 不再扣
         assert!(s.release_dom());
         assert!(!s.release_dom());
         assert!(!s.release_dom());
-    }
-
-    /// D02：连接建立即持有 JPEG，释放恰好一次；重复释放不倒扣。
-    #[test]
-    fn conn_subs_jpeg_released_exactly_once() {
-        let mut s = ConnSubs::new();
-        assert!(s.release_jpeg());
-        assert!(!s.release_jpeg());
     }
 }

@@ -53,7 +53,7 @@ RIG 的**瀏覽器邊緣程序**：一個 Rust 二進位，與目標 Chromium �
 | `browser.rs` | Chromium 生命週期：自拉起（launch）或掛靠（attach）；頁面會話管理、截圖、鍵鼠原語、剪貼板授權 |
 | `snapshot.rs` | AX 快照引擎：全量樹遍歷、OOPIF 子幀掛接與坐標合成、ignored 透傳、generic 殼剪枝、穩定 id 分配、密碼子樹脫敏 |
 | `ai.rs` | AI 通道：observe（生成快照幀）/ act（陳舊校驗後執行 Action）/ 編號截圖 |
-| `human.rs` | 人通道：CDP screencast 幀分發（最近幀回放）、輸入事件注入、文本/圖片剪貼板橋 |
+| `human.rs` | 人通道：按需求啟停 CDP screencast、輸入事件注入、文本/圖片剪貼板橋 |
 | `media.rs` | 音視頻合流：PulseAudio 虛擬聲卡 + 進程內 libav 雙版本 HLS（見 §8） |
 | `encode.rs` | 進程內編碼層：libavcodec + hw_frames_ctx 運行時协商（硬編優先、軟編回落） |
 | `chrome.rs` | 瀏覽器 chrome 狀態：標籤/導航/尋找/解析度/通道閘門的狀態保存、`chrome-state` 推送 JSON 與地址輸入歸一化（觀看端原生 header 的數據源，見 §9.1） |
@@ -113,7 +113,7 @@ platform/arch——版本取 product 的真實完整版本，UA 串裡的是約�
 | `--allow-origin <origin>` | — | 追加允許 Navigate 的 origin（可重複給多次） |
 | `--no-ai` | — | AI 通道預設關閉（運行時仍可經 `/channels` 開啟） |
 | `--human` | — | 人通道預設開啟（不給則預設關閉，觀看頁無畫面） |
-| `--av` | — | 音視頻合流預設開啟（不給則預設關閉） |
+| `--av` | — | 預設允許 HLS 播放，首個有效播放列表請求啟動合流 |
 | `--token <secret>` | 環境變數 `RIG_EDGE_TOKEN` | 直連鑑權令牌（見 §6） |
 | `--tls-cert <path>` / `--tls-key <path>` | — | HTTPS 服務（須成對給）；檔案缺失時自動生成自簽名證書（SAN 含 localhost、127.0.0.1 與綁定 host），私鑰以 0600 原子建立落盤復用。**非回環監聽強制 TLS**（LIU 2026-11-20 裁定，整改第二期）：未給證書時自動生成自簽名（`~/.rig-edge/self-signed.{crt,key}`）並顯著提示——DOM 通道承載頁面欄位值，其安全性由傳輸加密保證（R-07 處置）；僅回環監聽可明文 |
 | `--stdio` | — | MCP stdio 前端模式（見 §7） |
@@ -132,11 +132,11 @@ platform/arch——版本取 product 的真實完整版本，UA 串裡的是約�
 | `/ready` | GET | 就緒探針（免鑑權、無敏感信息）：CDP 存活且至少一個會話 → 200，否則 503。與 /health（liveness）分離（R-19） |
 | `/channels` | GET | 查三通道狀態：`{"ai":bool,"human":bool,"av":bool,"av_available":bool}` |
 | `/channels` | POST | 設通道開關，請求體同上形狀（部分欄位可省略） |
-| `/observe` | POST | AI 觀察：請求體為 rig-proto 的 `ObserveRequest`（可空 `{}`）。回應組成由 `mode` 定：`text` 只回 `{"text"}`；`tree`（默認）回 `{"text", "observation"}`；`tree_image` 再加 `"image_png_base64"`。`budget_tokens` 按預算裁剪**響應視圖**（存儲幀不動、被裁元素憑 id 仍可操作，裁剪說明附在 text 末尾）；`subtree` 只回某元素子樹（id 不存在回 400）。`include_offscreen` 默認 false：視口外元素不進響應視圖（存儲幀保留、帶 Offscreen 狀態），true 才帶。`since_frame`：傳上次帧號且該幀仍在邊緣的基幀池（最近 8 幀）內、mode=tree 且無 subtree/budget 時，回 `{"delta": ObservationDelta, "text"}` 增量（基幀與目標幀按同一 include_offscreen 口徑對齊）；基幀不在池內回完整視圖重新定基 |
-| `/act` | POST | AI 動作：請求體為 rig-proto 的 `ActionRequest` JSON，回 `ActionResult` |
+| `/observe` | POST | AI 觀察：請求體為 rig-proto 的 `ObserveRequest`（可空 `{}`）。回應組成由 `mode` 定：`text` 只回 `{"text"}`；`tree`（默認）回 `{"text", "observation"}`；`tree_image` 再加 `"image_png_base64"`。`budget_tokens` 按預算裁剪**響應視圖**（存儲幀不動、被裁元素憑 id 仍可操作，裁剪說明附在 text 末尾）；`subtree` 只回某元素子樹（id 不存在回 400）。`include_offscreen` 默認 false：視口外元素不進響應視圖（存儲幀保留、帶 Offscreen 狀態），true 才帶。`since_frame` 使用客戶端最後套用的觀察幀。當 `mode=tree` 且分頁、文件、座標空間與輸出投影相容時，可回 `{"delta": ObservationDelta, "text"}`。基幀須在最近 8 個已輸出的結構化觀察內。無法重建目前視圖時回整幀 |
+| `/act` | POST | AI 動作：接受 `ActionRequest`，回 `{"result": ActionResult}`。頁面狀態類拒絕另附最新觀察及文字，或附無法取得最新狀態的說明 |
 | `/screenshot.png` | GET | 當前頁編號截圖（PNG；敏感元素區域黑塊遮罩） |
 | `/ws` | GET→WS | 人通道：下行 screencast 幀與狀態；上行輸入事件（見 §9） |
-| `/stream/{rend}/{name}` | GET | HLS 合流輸出：`rend` ∈ `hevc`/`h264`；`name` 為播放列表或分片名 |
+| `/stream/{rend}/{name}` | GET | HLS 播放列表與分片。有效列表請求可啟動合流，12 秒沒有有效請求即回收 |
 
 **通道閘門語義**：AI 關閉時 `/observe`、`/act`、`/screenshot.png` 回 409；
 人通道關閉時不推任何幀；AV 關閉時合流管線停機。三通道全關時僅控制介面可用。
@@ -169,7 +169,7 @@ AI 操作全走 stdio；人要看畫面時加 `--human`，HTTP 觀看頁並行�
 | 工具 | 入參 | 回覆 |
 |---|---|---|
 | `observe` | `ObserveRequest`（可省略；`mode`/`budget_tokens`/`subtree`，語義同 HTTP /observe） | text 內容塊：緊湊文本渲染（+ Observation JSON，`mode=text` 時不帶）；`mode=tree_image` 再加 image 內容塊（編號截圖） |
-| `act` | `ActionRequest` JSON（rig-proto） | text 內容塊：`ActionResult` JSON |
+| `act` | `ActionRequest` JSON（rig-proto） | `ActionResult` JSON 文本塊。頁面狀態類拒絕另附文字和 `Observation` 或 `ObservationDelta` JSON，如果無法採集則附診斷文字 |
 | `screenshot` | 無 | image 內容塊：base64 PNG（編號截圖，同 HTTP 的遮罩規則） |
 
 - **`request_id` 前端補全**：`ActionRequest.request_id` 是協議必填欄位，
@@ -284,6 +284,8 @@ libavutil/libswscale/libavdevice/libswresample。
   頁面發聲前的靜音。
 - 視頻：頁面 RGB 幀直餵編碼器（無 JPEG 代際損耗），100ms 節拍、
   無新幀則重複最近幀，保證恆定 10fps。
+- HLS 由有效播放列表請求啟動，無需 Viewer WebSocket。成功的列表與分片請求延長播放需求。
+  `av_wanted` 表示允許播放，`av` 表示管線正在運行。RTC 連線狀態由各觀看端處理，直連 HLS 仍可獨立播放。
 - 編碼：HEVC = libx265（veryfast、1.5Mbps、`hvc1` 標籤經 codecpar 寫入）；
   H.264 = libx264（veryfast、2.5Mbps）；關鍵幀間隔 20 幀（2 秒）；
   均 AAC 48kHz 128k。HLS fMP4：`hls_time 1`、列表 6 段、自動刪舊段；
@@ -362,20 +364,17 @@ find-text/find-next/find-prev/res-auto/res-fixed/toggle-ai/
 toggle-human（人通道只許在此關閉，重開走 /channels，與舊
 口徑一致）。
 
-**幀 = 純頁面**：幀泵不再合成——WS 幀流直接透傳 screencast
-原始 JPEG（零重編碼、無代際損耗；線格式不變：8 字節頭 +
-JPEG）；解碼出的 RGB 只供 RTC/HLS 編碼層。透傳後廣播零
-成本，F-03 的 JPEG 需求記賬對幀泵不再適用：每幀都記
-`last_frame` 並廣播，新連接回放最近幀立刻有畫面（舊實現靠
-同步循環重合成的副產物喂 last_frame，見 PITFALLS §30）。
-存 RGB 前奇數邊裁至偶數（yuv420p）。
+**整頁幀需求**。WebSocket JPEG、RTC 視訊與 HLS 播放各自登記需求。第一個需求到達時，
+邊緣先訂閱 CDP 事件，再開啟當前分頁的 screencast。最後一個需求釋放時停止採集並清空幀槽。
+靜態頁缺少即時首幀時，邊緣補取 JPEG 並核對分頁、文件與視口後交付。
+WebSocket 透傳原始 JPEG（8 字節頭 + JPEG）。只有編碼或貼圖需要 RGB 時才解碼，奇數邊裁至偶數。
 
 **幀分類（2026-11-20 補）**：screencast 在視頻播放頁會
 交替發「整頁幀」與「視頻區幀」（只有 video/canvas 元素
 畫面、元數據報元素尺寸，實測約佔 1/3）。幀泵按尺寸分流：
 寬高都達到整頁基準（見過的最大整頁尺寸）90% 的是整頁幀，
 走透傳並把 RGB 歸一化到基準尺寸（整頁幀自身有幾像素的
-高度變體）；更小的是內容幀——不廣播、不動 `last_frame`，
+高度變體）；更小的是內容幀，只供 RGB 貼圖，
 解碼後按 video/canvas 的視口矩形貼回最近整頁 RGB（矩形
 按內容尺寸查 CDP 並緩存，頁面滾動即失效），編碼層由此
 只見恒定尺寸的整頁幀。舊實現一律當整頁幀，RTC/HLS 編碼
@@ -411,10 +410,11 @@ click 都不產生（PITFALLS §36），缺省絕不能留空。觀看頁自身
 JSON 對象原樣透傳）完成协商。編碼全局一份：feeder 線程吃頁面
 RGB（`rgb_seq` 變化檢測）以低延遲 H.264 編碼後廣播訪問單元，
 多會話共享字節、各自 str0m 獨立封包；PLI 置共享強制關鍵幀
-標誌，BWE 估計回寫編碼碼率（300k–8M 鉗制）。按連接 transport
-模式：某連接的 RTC 連通後停發該連接的 WS 二進制幀（廣播照收
-丟棄），斷開或 `rtc-stop` 自動恢復——自適應階梯
-WebRTC → WS → HLS 的服務端一半。
+標誌，BWE 估計回寫編碼碼率（300k–8M 鉗制）。只有選用
+RTC 視訊且 ICE 連通的連線停收 WS JPEG。RTC 資料通道及 Opus
+音軌可在 DOM 模式獨立運作。觀看端用 `rtc-start` 或
+`rtc-demand` 的 `video`、`audio` 宣告各軌需求，邊緣以
+`rtc_video_want` 和 `rtc_audio_want` 記錄需求數。
 host 候選檔的 UDP 套接字**必須綁在通告的候選地址上**——綁
 通配地址時 str0m 以包 destination（0.0.0.0）與候選（具體 IP）
 匹配不上，STUN 請求被靜默丟棄、ICE 永不連通（實測教訓，
@@ -432,7 +432,7 @@ bench_frame_stages -- --ignored --nocapture`（解碼與兩種編碼
 解碼 30.3–30.4fps、0 丟幀。教訓全錄見 PITFALLS §27。
 
 **RTC 音頻軌**（Opus）：會話 offer 另帶一條 send-only 音頻
-m-line。音頻 feeder 與視頻 feeder 同啟停：從 rigsink 的
+m-line。首個音訊需求啟動音頻 feeder，最後一個離開後關閉採集。從 rigsink 的
 monitor 采集（與 HLS 的 AAC 管線共用 `open_pulse`，兩條管線
 可並行掛同一 monitor）、解碼重採樣至 48k 立體聲後以 libopus
 編碼（20ms 一幀、96kbps）廣播扇出，各會話按自己的 writer
@@ -466,18 +466,10 @@ offer 同時攜帶 host 與 srflx 候選；全 ICE 與真瀏覽器連通
 「雙端各連 Gateway」中繼檔屬軌道 T（Gateway 本體未建），
 本模塊的信令消息形態與之兼容，待軌道 T 立項後接入。
 
-觀看端接入（Phase 1c）：頁面 WS 連通即自動 `rtc-start`，
-連通後 video 元素顯示 RTC 流、canvas 隱藏，坐標換算隨顯示
-元素切換；8 秒未連通或 ICE failed 即關會話回退 WS canvas；
-disconnected 給 3 秒恢復窗，過期切回 canvas（服務端已同步
-恢復該連接的 WS 幀，畫面無縫接續）。影音呈現的優先級按
-LIU 2026-11-19 架構口徑（取代本節初版的 HLS 優先）：**WebRTC
-優先**——影音開啟時若 RTC 已連通（或 5 秒寬限內連通）即以
-RTC 的視頻+Opus 音頻呈現並解靜音；連不通才落 HLS（ffmpeg
-合流，最終兜底，落入後關 RTC 會話省編碼）；影音關閉時 HLS
-路拆 src、RTC 路回靜音視頻呈現。真觀看頁探針驗證：RTC 路
-video 真解碼非黑幀、禁用 RTCPeerConnection 時 canvas 路
-照常出圖。
+觀看頁以 WebRTC 優先呈現視訊。ICE 斷開時立即回到 WS JPEG，
+並留 3 秒給 ICE 恢復。8 秒內未建立 RTC 連線便關閉該會話。
+影音開啟且 RTC 不可用時，影片模式可啟用 HLS 合流兜底。HLS
+實際開始播放後才停收 JPEG。
 
 **實現筆記**（第五期，`chrome.rs` / `human.rs` / 觀看端）：
 
@@ -652,29 +644,15 @@ URL 絕對化；觀看端 applySnapshot 在新樹未連接時先放
 installed/resync 先 setup 再快照；WS 斷線補 viewer_stop
 且計數鉗下限；觀看端 pollAv 在 DOM 模式不再搶占退出。
 
-影音與 DOM 的往返（2026-11-20 補，定因見 PITFALLS
-§42）：domStart 關影音前記 avWasOn，三條退出路徑
-（domStop/exitDomDisplay/domFallback）統一經
-restoreAvAfterDom 把邊緣影音開回去，pollAv 既有分支
-隨後定型 avVia 並解靜音；vid 静音態收斂進 showDisplay
-（DOM 面顯示→靜音、視頻面顯示且 avVia 已定型→解靜
-音），不再散落在各遷移分支里靠觸發順序。舊行為：進一
-次 DOM 再回視頻，影音在邊緣保持關閉、vid 恒停在
-ontrack 初始靜音——有畫面有聲軌、就是沒聲。
+觀看端依 `/channels` 的 `av_wanted` 訂閱 RTC 音訊。RTC 音軌
+使用獨立音訊元素，DOM 模式仍可播放背景分頁的聲音。HLS 合流
+由各觀看頁在影片模式啟停，模式切換與回退期間都保留使用者的
+影音設定。
 
-分辨率跟隨滯後（2026-11-20 補，定因見 PITFALLS
-§43）：reportSize 首報立即發，其後改 900ms 安定滯後
-（尺寸不再變才發送、與已發值相同跳過）；窗口拖動/狀態
-切換期間的尺寸橫跳不再逐個追發，遠端視口與編碼器不
-跟著翻動（探針 8 次交替改尺寸只產生 1 次安定後重建）。
-
-影音卡死自愈（2026-11-20 補，定因見 PITFALLS §45）：
-pollAv 兜底分支——視頻模式下見邊緣 `av:false` 且
-`av_available` 就 POST 開回（DOM 模式不搶，互斥優先）。
-背景：關 AV 的效應在邊緣側持久，恢復代碼若沒在同一
-頁面生命週期跑到（舊版緩存頁、DOM 期間關標籤），邊緣
-恒關且觀看頁菜單無 AV 開關、用戶無從恢復。觀看頁與
-腳本響應一律 `Cache-Control: no-store`，防舊版續命。
+分辨率跟隨由舞台尺寸觸發 `resize`。首報立即發出，後續變更
+等待 900 ms 安定。邊緣透過同一 `request` 的 `viewport`
+回覆實際 CSS 視口，包含固定解析度或尺寸上限。觀看頁以此換算
+畫布和視訊上的輸入及幽靈指針位置，DOM 快照也帶有實際視口。
 
 幽靈指針（DOM 模式）：視頻模式下指針由邊緣合成進幀，
 DOM 模式無幀可合成——WS 發送側以 150ms 節拍輪詢執行
@@ -704,20 +682,12 @@ HTTP act 點擊後 ghost 到達且落點在目標中心 40px 內。
 - 視口變化（觀看端 resize 跟隨改了源頁面尺寸）會整體
   重排版：頁內脚本監聽 resize、防抖 350ms 後回
   `resync` 請邊緣重發快照，鏡像幾何以快照為準。
-- **自動模式（整改第四期 F-08）**：觀看端默認自動選模式，
-  只在進入時點裁決（連接建立 + 每次導航快照），不持續
-  回切監控（頁面中途變動態時區域子流仍可承載）；手動點
-  DOM 按鈕/菜單切換鎖定至下一次導航。裁決用快照統計：
-  視頻面積比、跨源/視頻區域比、canvas 面積比、可交互
-  元素數；組合判據（視頻 >10% 且交互 <3 → 視頻頁等）
-  的校準過程見 PITFALLS §29，裁決明細在觀看端
-  `window.__rigAuto`。自動退出 DOM 只退顯示不拆感知
-  會話（dom-stop 不發），下次導航快照可直接再進。
-- **本地即時反饋（整改第四期 F-07）**：視頻/畫布模式下
-  點擊漣漪、拖選矩形、滾動預覽平移在觀看端本地先行
-  呈現（真幀到達即歸位），只呈現操作意圖、不偽造結果
-  態；DOM 模式原生即時不介入。觀看端幀到達→上屏耗時
-  記於 `window.__rigPaint`（與 /health 分段計量互補）。
+- **自動模式**每秒向當前分頁請求一次 `mode-summary`，回傳
+  可見影片、區域及畫布面積比例與互動元素數（最多計至 3）。
+  觀看頁維持既有的組合判據與 3 秒遲滯，手動切換會鎖定到下次
+  導航或換分頁。只有實際顯示 DOM 的連線訂閱鏡像、差分及區域
+  畫面。換頁後停止原分頁的觀察者。最後一個 DOM 訂閱離開時，
+  同時回收差分和區域任務。判斷值可由 `window.__rigAuto` 查看。
 
 ## 10. 快照與動作語義（摘要）
 
@@ -735,22 +705,15 @@ HTTP act 點擊後 ghost 到達且落點在目標中心 40px 內。
 - 動作前複核與拒絕回包（2026-11-21）：含元素目標且請求幀即最新存儲幀時，先做**單元素快速複核**
   （只取該元素的 AX 節點/DOM 屬性/位置，與整頁構建共用 `snapshot::element_core`），一致則沿用存儲幀、
   省掉整頁重採；不一致/出錯/不適用（換文檔、目標在子幀）一律退回整頁快照裁決，快路徑自己從不判拒絕。
-  被拒（陳舊/不存在/不可交互/越界）時，邊緣自己附帶最新頁面狀態（請求幀在歷史池 → `delta`，否則整幀
-  `observation`，刷新不足 500ms 的幀複用不重採）。語義詳見 PERCEPTION.md §6.1。
-- 操作與呈現解耦（2026-11-21）：`act` 做完動作即返回，不再做動作後整頁刷新；`Done.frame_id` 為動作所基於的
-  校驗幀。頁面變化由 `changes.rs` 的變化日誌（CDP 讀泵同步記賬）驅動：`observe` 帶 `since_frame` 時，
-  自該幀起無結構類通知且視口未動 → 空增量、不採集。語義與盲區詳見 PERCEPTION.md §8。
-  解耦後實測（debug 構建，本地回環，單次運行各 20 次，頁面無副作用的按鈕）：小頁點擊 `act` p50 65.9ms（p95 66.3）；
-  大頁（約 550 元素）點擊 `act` p50 67.8ms（p95 68.6），隨後 `observe(since_frame)` 空增量 p50 2.2ms，兩者合計
-  70.1ms；小頁 no-op 點擊後 `observe(since)` p50 1.5ms。20/20 次動作前複核走快路徑、20/20 次 observe 走“沒變”。
-  **只覆蓋“點擊不引起頁面變化”的情形**；頁面確有變化時 `observe(since)` 的耗時未測（正確性由
-  `edge_observe_unchanged_vs_changed` 鎖定）。演進對照（同機同腳本）：小頁點擊 p50 130.0（改前）→101.1（單元素複核）→65.9（解耦）。
-  單元素複核版的實測（小頁）：小頁點擊 `act` p50 130.0→101.1ms（p95 131.2→103.6）；
-  大頁（約 550 個元素）20 次點擊全部命中快路徑（`fast_hit=20, fast_miss=0`），大頁點擊 p50 246.2ms
-  （改前未測，剩餘耗時主要是動作後那次整頁刷新）。
+  頁面狀態類拒絕會附狀態或採集失敗說明。本次動作的校驗幀須仍有效並在 500 ms 內才可複用。
+  詳見感知層設計 §6.1。 [PERCEPTION.md](PERCEPTION.md)
+- `Done.frame_id` 表示動作的校驗幀。需要更新時，`observe(since_frame)` 使用客戶端最後套用的觀察幀。
+  每次請求都採集候選，靜止頁回空增量並推進幀號。分頁、文件、座標空間或投影不相容時回整幀。
 - 密碼框整棵子樹脫敏（掩碼字符會經子文本節點洩漏，故按子樹清除，不做值替換）。
 - Navigate 受 origin 白名單約束（`--url` 的 origin + `--allow-origin` 追加）。
-- 截圖為編號 PNG，敏感元素（密碼框等）區域以黑塊遮罩，與快照編號對應。
+- `tree_image` 與獨立截圖共用採集、驗證及遮罩流程。編號取自回應投影，遮罩涵蓋完整觀察與 DOM 中識別的敏感欄位。
+  截圖前後核對文件、視口和敏感欄位的邊框。跨行程子幀含敏感欄位時遮罩其宿主框。無法確認時，
+  `tree_image` 保留文字與樹並附診斷，獨立截圖回錯誤。
 
 ### 10.1 Upload 動作（協議擴展，LIU 2026-11-19 批准；已實現）
 

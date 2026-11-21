@@ -11,6 +11,7 @@ use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+use base64::Engine;
 use futures_util::StreamExt;
 use serde_json::{json, Value};
 
@@ -39,7 +40,9 @@ document.getElementById('login').addEventListener('click', () => {
 const FORM_HTML: &str = r#"<!DOCTYPE html><html lang="zh"><head><meta charset="utf-8"><title>内层表单</title></head>
 <body style="margin:0">
 <label>姓名 <input id="name" type="text"></label>
-<button id="submit">提交</button>
+<button id="submit" onclick="document.getElementById('click-count').textContent = '点击次数：1'">提交</button>
+<p id="click-count">点击次数：0</p>
+<input type="password" aria-label="子帧密码" value="SYNTHETIC-IFRAME">
 </body></html>"#;
 
 const CANVAS_HTML: &str = r#"<!DOCTYPE html><html lang="zh"><head><meta charset="utf-8"><title>画布</title></head>
@@ -277,8 +280,22 @@ async fn edge_browser_end_to_end() {
         json!({"kind": "type", "target": {"by": "element", "id": user_id}, "text": "alice", "submit": false}),
     );
     assert_eq!(r["result"], "done", "输入用户名应成功: {r}");
+    let typed = observe_since(edge_port, frame1);
+    let base: rig_proto::observation::Observation = serde_json::from_value(obs1.clone()).unwrap();
+    let delta: rig_proto::observation::ObservationDelta =
+        serde_json::from_value(typed["delta"].clone()).expect("表单输入应支持局部差分");
+    let mut applied = base.apply_delta(&delta).unwrap();
+    assert_eq!(
+        applied.find(&user_id).unwrap().value.as_deref(),
+        Some("alice")
+    );
     let o2 = observe(edge_port);
     let frame2 = o2["observation"]["frame_id"].as_u64().unwrap();
+    applied.frame_id = frame2;
+    assert_eq!(
+        applied,
+        serde_json::from_value(o2["observation"].clone()).unwrap()
+    );
     let r = act(
         edge_port,
         frame2,
@@ -326,6 +343,16 @@ async fn edge_browser_end_to_end() {
     let submit = find_element(obs5, "button", "提交")
         .expect("跨源 iframe 内的提交按钮应被观察到")
         .clone();
+    assert_eq!(
+        find_element(
+            &json!({"elements": iframe_el["children"]}),
+            "button",
+            "提交"
+        )
+        .map(|button| button["id"].clone()),
+        Some(submit["id"].clone()),
+        "跨进程帧的提交按钮应挂在宿主 iframe 下"
+    );
     let ib = iframe_el["bbox"]
         .as_array()
         .expect("iframe 应有 bbox")
@@ -340,6 +367,51 @@ async fn edge_browser_end_to_end() {
         sx1 >= ix1 - 1.0 && sy1 >= iy1 - 1.0 && sx1 > 10.0,
         "内层按钮坐标应已合成到主帧坐标系：iframe@({ix1},{iy1}) button@({sx1},{sy1})"
     );
+
+    // OOPIF 元素首次使用必須走整頁校驗，Done 回校驗幀；客戶端仍以已交付幀查增量。
+    let public_frame = obs5["frame_id"].as_u64().unwrap();
+    let submit_id = submit["id"].as_str().unwrap();
+    let clicked = act(
+        edge_port,
+        public_frame,
+        json!({"kind":"click", "target":{"by":"element", "id":submit_id}}),
+    );
+    assert_eq!(
+        clicked["result"], "done",
+        "跨行程 iframe 點擊應成功: {clicked}"
+    );
+    let validation_frame = clicked["frame_id"].as_u64().unwrap();
+    assert_ne!(
+        validation_frame, public_frame,
+        "OOPIF 首次點擊應使用完整校驗幀: {clicked}"
+    );
+    let from_public = observe_since(edge_port, public_frame);
+    let after_click: rig_proto::observation::Observation =
+        if let Some(delta) = from_public.get("delta") {
+            let base: rig_proto::observation::Observation =
+                serde_json::from_value(obs5.clone()).unwrap();
+            base.apply_delta(&serde_json::from_value(delta.clone()).unwrap())
+                .expect("最后交付的观察应能应用差分")
+        } else {
+            serde_json::from_value(from_public["observation"].clone()).unwrap()
+        };
+    let mut had_click = false;
+    after_click.each_element(&mut |el| had_click |= el.name.as_deref() == Some("点击次数：1"));
+    assert!(had_click, "跨行程 iframe 应收到点击: {from_public}");
+    let from_unseen_validation = observe_since(edge_port, validation_frame);
+    assert!(
+        from_unseen_validation.get("observation").is_some()
+            && from_unseen_validation.get("delta").is_none(),
+        "未交付的 Done 校驗幀不可作為增量基準: {from_unseen_validation}"
+    );
+
+    let (status, png) = http(edge_port, "GET", "/screenshot.png", None);
+    assert_eq!(status, 200, "跨行程敏感字段的稳定页面应能截图");
+    let image = image::load_from_memory(&png).unwrap().to_rgba8();
+    let x = ((ix1 + ib[2].as_f64().unwrap()) / 2.0) as u32;
+    let y = ((iy1 + ib[3].as_f64().unwrap()) / 2.0) as u32;
+    assert_eq!(image.get_pixel(x, y).0, [0, 0, 0, 255]);
+    assert_ne!(image.get_pixel(5, 5).0, [0, 0, 0, 255]);
 
     // ── 3. canvas 页 + 编号截圖 ──────────────────────────────
     let frame5 = obs5["frame_id"].as_u64().unwrap();
@@ -545,7 +617,15 @@ async fn edge_av_and_image_clipboard() {
     let _ = &mut proc;
     let (_, ch) = http_json(av_port, "GET", "/channels", None);
     assert_eq!(ch["av_available"], true, "ffmpeg/PulseAudio 应就位: {ch}");
-    assert_eq!(ch["av"], true, "--av 应已启动合流管线: {ch}");
+    assert_eq!(ch["av_wanted"], true, "--av 應保留 AV 意圖: {ch}");
+    assert_eq!(ch["av"], false, "沒有播放請求時不應啟動合流管線: {ch}");
+    let (status, _) = http(av_port, "GET", "/stream/hevc/not-a-playlist.m3u8", None);
+    assert_eq!(status, 404, "無效播放路徑應被拒: {status}");
+    let (_, idle) = http_json(av_port, "GET", "/health", None);
+    assert_eq!(
+        idle["media"]["running"], false,
+        "無效播放路徑不可啟動 AV: {idle}"
+    );
     // 等 HLS 播放列表与第一个切片
     let deadline = Instant::now() + Duration::from_secs(60);
     let mut playlist = String::new();
@@ -560,6 +640,15 @@ async fn edge_av_and_image_clipboard() {
         assert!(Instant::now() < deadline, "HEVC 播放列表未就绪: {playlist}");
         tokio::time::sleep(Duration::from_millis(500)).await;
     };
+    let (_, active) = http_json(av_port, "GET", "/channels", None);
+    assert_eq!(
+        active["av_wanted"], true,
+        "播放請求不應清除 AV 意圖: {active}"
+    );
+    assert_eq!(
+        active["av"], true,
+        "有效播放列表請求應啟動合流管線: {active}"
+    );
     // H.264 版本与 HEVC 同进程双路输出，首段落盘可能稍晚——同样轮询等待
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
@@ -618,6 +707,20 @@ async fn edge_av_and_image_clipboard() {
         max_db > -40.0,
         "合流音频不应是静音（440Hz 音调应被虚拟声卡捕获），max_volume={max_db} dB"
     );
+    let deadline = Instant::now() + Duration::from_secs(18);
+    loop {
+        let (_, state) = http_json(av_port, "GET", "/channels", None);
+        let (_, health) = http_json(av_port, "GET", "/health", None);
+        if state["av"] == false && health["frame_size"] == json!([0, 0]) {
+            assert_eq!(state["av_wanted"], true, "播放停止后仍允许后续播放");
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "播放需求到期应回收管线与采集: {state} {health}"
+        );
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
     drop(proc);
 
     // ── 2. 图片粘贴（本地→远端）与复制读回（远端→本地）──
@@ -943,11 +1046,11 @@ async fn edge_stdio_mcp_and_attach() {
             "tools/call",
             json!({"name": "observe", "arguments": {}}),
         );
-        let text0 = o["result"]["content"][0]["text"].as_str().unwrap();
-        assert!(text0.contains("登录"), "observe 应看到登录页: {text0}");
         obs_json =
             serde_json::from_str(o["result"]["content"][1]["text"].as_str().unwrap()).unwrap();
         if let Some(el) = find_element(&obs_json, "textbox", "用户名") {
+            let text0 = o["result"]["content"][0]["text"].as_str().unwrap();
+            assert!(text0.contains("登录"), "observe 应看到登录页: {text0}");
             user_el = el.clone();
             break;
         }
@@ -962,6 +1065,18 @@ async fn edge_stdio_mcp_and_attach() {
     );
     let rtext = r["result"]["content"][0]["text"].as_str().unwrap();
     assert!(rtext.contains("done"), "act type 应成功: {rtext}");
+    let rejected = rpc(
+        &mut w,
+        "tools/call",
+        json!({"name": "act", "arguments": {"frame_id": frame + 1000, "action": {"kind": "type", "target": {"by": "element", "id": user_el["id"]}, "text": "should-not-appear", "submit": false}}}),
+    );
+    let content = rejected["result"]["content"].as_array().unwrap();
+    let result: Value = serde_json::from_str(content[0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(result["result"], "rejected");
+    assert_eq!(result["reason"]["code"], "stale_frame");
+    let fresh: Value = serde_json::from_str(content[2]["text"].as_str().unwrap()).unwrap();
+    let user = find_element(&fresh, "textbox", "用户名").expect("拒绝回包应附结构化新观察");
+    assert_eq!(user["value"], "alice", "过期动作不应执行输入");
     let shot = rpc(
         &mut w,
         "tools/call",
@@ -1525,18 +1640,29 @@ async fn edge_chrome_ui_and_takeover() {
         json!({"kind": "click", "target": {"by": "element", "id": tg_id}}),
     );
     assert_eq!(r["result"], "aborted", "闩锁中 act 应被拒: {r}");
-    // 页面解冻后核对：目标点击从未执行
+    // 用接管前的观察帧恢复同步，验证目标点击从未执行。
     tokio::time::sleep(Duration::from_millis(600)).await;
-    let o5 = observe(edge_port);
-    let text5 = o5["text"].as_str().unwrap_or("");
+    let o5 = observe_since(edge_port, f4);
+    let current = if let Some(delta) = o5.get("delta") {
+        let base: rig_proto::observation::Observation =
+            serde_json::from_value(o4["observation"].clone()).unwrap();
+        serde_json::to_value(
+            base.apply_delta(&serde_json::from_value(delta.clone()).unwrap())
+                .expect("接管后的差分应能应用"),
+        )
+        .unwrap()
+    } else {
+        o5["observation"].clone()
+    };
+    let text5 = current.to_string();
     assert!(text5.contains("已解冻"), "页面应已解冻，实际：{text5}");
     assert!(
         !text5.contains("已点击"),
         "被接管的点击不应落地，实际：{text5}"
     );
     // o5 的 observe 已重新同步 → 闩锁解除，再 act 应放行并落地
-    let f5 = o5["observation"]["frame_id"].as_u64().unwrap();
-    let tg2 = find_element(&o5["observation"], "button", "目标")
+    let f5 = current["frame_id"].as_u64().unwrap();
+    let tg2 = find_element(&current, "button", "目标")
         .expect("应有目标按钮")
         .clone();
     let tg2_id = tg2["id"].as_str().unwrap().to_string();
@@ -1552,6 +1678,26 @@ async fn edge_chrome_ui_and_takeover() {
         text6.contains("已点击"),
         "恢复后的点击应落地，实际：{text6}"
     );
+
+    let f6 = o6["observation"]["frame_id"].as_u64().unwrap();
+    ws_send!(json!({"type":"resize", "w":800, "h":600}));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut since = f6;
+    loop {
+        let response = observe_since(edge_port, since);
+        if response["observation"]["space"]["width"] == 800.0 {
+            assert!(response.get("delta").is_none(), "坐标空间变化应回整帧");
+            assert_eq!(response["observation"]["space"]["height"], 600.0);
+            break;
+        }
+        let frame = response
+            .get("delta")
+            .or_else(|| response.get("observation"))
+            .unwrap();
+        since = frame["frame_id"].as_u64().unwrap();
+        assert!(Instant::now() < deadline, "浏览器应应用新视口: {response}");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
     drop(ws);
 }
 
@@ -1876,6 +2022,19 @@ const UNCH_CLICK_HTML: &str = r#"<!DOCTYPE html><html lang="zh"><head><meta char
 <body><button id="chg" onclick="document.getElementById('lbl').textContent='已点击'">会改文字</button>
 <button id="nop">什么都不改</button><p id="lbl">未点击</p></body></html>"#;
 
+const UNCH_GEOMETRY_HTML: &str = r#"<!DOCTYPE html><html lang="zh"><head><meta charset="utf-8"><title>几何</title>
+<style>@keyframes slide { to { transform: translateX(150px); } }
+#move { position:absolute;left:20px;top:40px; }
+#move:focus { animation:slide 1ms forwards; }</style></head>
+<body><button id="move">移动按钮</button>
+</body></html>"#;
+
+const UNCH_NESTED_SCROLL_HTML: &str = r#"<!doctype html><meta charset="utf-8">
+<style>#scroller { width: 300px; height: 180px; overflow: auto; }
+#padding { height: 400px; }</style>
+<div id="scroller"><div id="padding"><button>嵌套滚动按钮</button></div></div>
+<script>setTimeout(() => document.getElementById('scroller').scrollTop = 100, 5000);</script>"#;
+
 fn observe_since(port: u16, since: u64) -> Value {
     let (s, v) = http_json(
         port,
@@ -1892,8 +2051,7 @@ fn unchanged_count(port: u16) -> u64 {
     h["changes"]["observe_unchanged"].as_u64().unwrap()
 }
 
-/// 呈现一侧：页面没变 → 回空增量且不采集；页面自己变了（无人操作）、
-/// 视口滚动了（浏览器对滚动不发任何通知）→ 必须重新采集并送出变化。
+/// 观察采集候选帧，反映静态、文字、滚动、动画、焦点与导航状态。
 #[tokio::test]
 async fn edge_observe_unchanged_vs_changed() {
     if std::env::var("RIG_EDGE_IT").is_err() {
@@ -1908,10 +2066,15 @@ async fn edge_observe_unchanged_vs_changed() {
         vec![
             ("/txt.html".to_string(), UNCH_TXT_HTML.to_string()),
             ("/scroll.html".to_string(), UNCH_SCROLL_HTML.to_string()),
+            (
+                "/nested.html".to_string(),
+                UNCH_NESTED_SCROLL_HTML.to_string(),
+            ),
             ("/click.html".to_string(), UNCH_CLICK_HTML.to_string()),
+            ("/geometry.html".to_string(), UNCH_GEOMETRY_HTML.to_string()),
         ],
     );
-    for page in ["txt.html", "scroll.html"] {
+    for page in ["txt.html", "scroll.html", "nested.html"] {
         let edge_port = free_port();
         let mut proc = spawn_edge(&[
             "--listen".into(),
@@ -1931,14 +2094,17 @@ async fn edge_observe_unchanged_vs_changed() {
             .unwrap();
         let before = unchanged_count(edge_port);
 
-        // ① 页面还没变：空增量，未采集
+        // ① 页面还没变：采集候选帧并回空增量
         let d = observe_since(edge_port, f);
-        assert_eq!(d["delta"]["frame_id"], f, "{page}: 没变不应产生新帧: {d}");
+        assert!(
+            d["delta"]["frame_id"].as_u64().unwrap() > f,
+            "{page}: 同投影仍應以候選觀察回覆: {d}"
+        );
         assert!(d["delta"]["upserts"].as_array().unwrap().is_empty());
         assert_eq!(
             unchanged_count(edge_port),
             before + 1,
-            "{page}: 应记一次未采集"
+            "{page}: 应记一次空增量"
         );
 
         // ② 页面自己变了/滚动了（无人操作）：必须重新采集并带出变化
@@ -1954,6 +2120,73 @@ async fn edge_observe_unchanged_vs_changed() {
             "{page}: 增量应带出变化: {d}"
         );
     }
+
+    // 無 CDP DOM 通知的 CSS 幾何變化仍須由候選觀察捕捉。
+    let edge_port = free_port();
+    let mut proc = spawn_edge(&[
+        "--listen".into(),
+        format!("127.0.0.1:{edge_port}"),
+        "--url".into(),
+        format!("http://127.0.0.1:{port}/geometry.html"),
+        "--width".into(),
+        "900".into(),
+        "--height".into(),
+        "600".into(),
+    ]);
+    wait_health(edge_port).await;
+    let _ = &mut proc;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let first = loop {
+        let observation = observe(edge_port);
+        if find_element(&observation["observation"], "button", "移动按钮").is_some() {
+            break observation;
+        }
+        assert!(Instant::now() < deadline, "几何夹具尚未就绪");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    let mut applied: rig_proto::observation::Observation =
+        serde_json::from_value(first["observation"].clone()).unwrap();
+    let frame = applied.frame_id;
+    let id = find_element(&first["observation"], "button", "移动按钮").unwrap()["id"]
+        .as_str()
+        .unwrap();
+    let before_x = applied.find(id).unwrap().bbox.unwrap().0[0];
+    let click = act(
+        edge_port,
+        frame,
+        json!({"kind":"click", "target":{"by":"element", "id":id}}),
+    );
+    assert_eq!(click["result"], "done");
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let response = observe_since(edge_port, applied.frame_id);
+        let delta: rig_proto::observation::ObservationDelta =
+            serde_json::from_value(response["delta"].clone())
+                .unwrap_or_else(|_| panic!("同文档几何变化应返回差分: {response}"));
+        applied = applied.apply_delta(&delta).expect("几何差分应能应用");
+        if applied.find(id).unwrap().bbox.unwrap().0[0] >= before_x + 149.0 {
+            break;
+        }
+        assert!(Instant::now() < deadline, "差分未反映按钮位移: {response}");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let full = observe(edge_port);
+    let expected: rig_proto::observation::Observation =
+        serde_json::from_value(full["observation"].clone()).unwrap();
+    applied.frame_id = expected.frame_id;
+    assert_eq!(applied, expected, "套用幾何差分後應與完整觀察一致");
+    let nav = act(
+        edge_port,
+        full["observation"]["frame_id"].as_u64().unwrap(),
+        json!({"kind":"navigate", "url":format!("http://127.0.0.1:{port}/txt.html")}),
+    );
+    assert_eq!(nav["result"], "done", "同分頁導航應成功: {nav}");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let after_nav = observe_since(edge_port, frame);
+    assert!(
+        after_nav.get("observation").is_some() && after_nav.get("delta").is_none(),
+        "跨文件 since_frame 必須回完整觀察: {after_nav}"
+    );
 
     // ── 操作与呈现解耦：act 做完即返回，页面因动作变成什么样按需取增量 ──
     let edge_port = free_port();
@@ -1978,15 +2211,35 @@ async fn edge_observe_unchanged_vs_changed() {
             .to_string()
     };
     let click = |id: &str| json!({"kind": "click", "target": {"by": "element", "id": id}});
-    // 点“什么都不改”：Done 指向校验帧；随后按需取增量 = 空，且未采集
-    let before = unchanged_count(edge_port);
+    // 點擊不改文字，但會改變焦點；since_frame 必須回報 Focused 狀態。
     let r = act(edge_port, f, click(&id_of("什么都不改")));
     assert_eq!(r["result"], "done", "{r}");
     assert_eq!(r["frame_id"], f, "Done 应指向动作所基于的校验帧: {r}");
-    tokio::time::sleep(Duration::from_millis(300)).await;
     let d = observe_since(edge_port, f);
-    assert_eq!(d["delta"]["frame_id"], f, "什么都没变不应产生新帧: {d}");
-    assert_eq!(unchanged_count(edge_port), before + 1, "应走“没变”不采集");
+    assert!(
+        d["delta"]["frame_id"].as_u64().unwrap() > f,
+        "焦點變化應推進候選幀: {d}"
+    );
+    assert!(
+        d["delta"]["upserts"].to_string().contains("focused"),
+        "差分應反映 focused: {d}"
+    );
+    let focused_full = observe(edge_port);
+    let focused_base: rig_proto::observation::Observation =
+        serde_json::from_value(obs["observation"].clone()).unwrap();
+    let focused_delta: rig_proto::observation::ObservationDelta =
+        serde_json::from_value(d["delta"].clone()).unwrap();
+    let mut focused_applied = focused_base
+        .apply_delta(&focused_delta)
+        .expect("焦點差分應可套用");
+    let focused_expected: rig_proto::observation::Observation =
+        serde_json::from_value(focused_full["observation"].clone()).unwrap();
+    focused_applied.frame_id = focused_expected.frame_id;
+    assert_eq!(
+        focused_applied, focused_expected,
+        "套用焦點差分後應與完整觀察一致"
+    );
+    let f = focused_full["observation"]["frame_id"].as_u64().unwrap();
     // 点“会改文字”：随后取增量必须带出文字变化
     let r = act(edge_port, f, click(&id_of("会改文字")));
     assert_eq!(r["result"], "done", "{r}");
@@ -2001,6 +2254,402 @@ async fn edge_observe_unchanged_vs_changed() {
             && d["delta"]["upserts"].to_string().contains("已点击"),
         "增量应带出新文字: {d}"
     );
+}
+
+/// 人通道開啟只允許觀看；沒有實際消費者時不應持續採集整頁畫面。
+#[tokio::test]
+async fn edge_human_zero_viewers_stops_full_frame_pump() {
+    if std::env::var("RIG_EDGE_IT").is_err() {
+        eprintln!("跳过：未设置 RIG_EDGE_IT");
+        return;
+    }
+    let _serial = SERIAL.lock().await;
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let anim = r#"<!DOCTYPE html><html><body style="margin:0"><div style="width:120px;height:120px;background:red;animation:turn 300ms linear infinite alternate"></div>
+<style>@keyframes turn {to {transform:translateX(180px)}}</style></body></html>"#;
+    let static_page = r#"<!doctype html><title>静态 B</title>
+<body style="background:#22cc44"><p>静态 B</p></body>"#;
+    serve(
+        listener,
+        vec![
+            ("/idle.html".into(), anim.into()),
+            ("/static.html".into(), static_page.into()),
+        ],
+    );
+    let edge_port = free_port();
+    let _proc = spawn_edge(&[
+        "--listen".into(),
+        format!("127.0.0.1:{edge_port}"),
+        "--url".into(),
+        format!("http://127.0.0.1:{port}/idle.html"),
+        "--human".into(),
+        "--width".into(),
+        "900".into(),
+        "--height".into(),
+        "600".into(),
+    ]);
+    wait_health(edge_port).await;
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    let first = http_json(edge_port, "GET", "/health", None).1;
+    assert_eq!(
+        first["human_running"], true,
+        "--human 應開啟可接入通道: {first}"
+    );
+    assert_eq!(
+        first["media"]["running"], false,
+        "未要求 AV 時不應啟動 HLS: {first}"
+    );
+    let counters = |health: &Value| {
+        [
+            health["pump"]["full"].as_u64().unwrap(),
+            health["latency"]["compose"]["count"].as_u64().unwrap(),
+            health["latency"]["encode"]["count"].as_u64().unwrap(),
+        ]
+    };
+    let baseline = counters(&first);
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let later = http_json(edge_port, "GET", "/health", None).1;
+    assert_eq!(
+        counters(&later),
+        baseline,
+        "零觀看者時整頁採集、解碼與編碼計數應停止增加: {first} → {later}"
+    );
+
+    use tokio_tungstenite::{tungstenite::Message, WebSocketStream};
+    async fn frame_within(
+        ws: &mut WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+        what: &str,
+    ) -> Vec<u8> {
+        let deadline = Instant::now() + Duration::from_secs(6);
+        loop {
+            assert!(Instant::now() < deadline, "{what}: 等不到整頁影格");
+            match tokio::time::timeout(Duration::from_millis(500), ws.next()).await {
+                Ok(Some(Ok(Message::Binary(frame)))) => return frame.to_vec(),
+                Ok(Some(Ok(_))) | Err(_) => continue,
+                other => panic!("{what}: WS 結束或失敗: {other:?}"),
+            }
+        }
+    }
+    async fn wait_full_stable(edge_port: u16) {
+        let deadline = Instant::now() + Duration::from_secs(8);
+        let mut stable = 0;
+        let mut previous = http_json(edge_port, "GET", "/health", None).1["pump"]["full"]
+            .as_u64()
+            .unwrap();
+        while stable < 4 {
+            assert!(
+                Instant::now() < deadline,
+                "最後一位觀看者離開後影格泵未停止"
+            );
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let now = http_json(edge_port, "GET", "/health", None).1["pump"]["full"]
+                .as_u64()
+                .unwrap();
+            if now == previous {
+                stable += 1;
+            } else {
+                stable = 0;
+                previous = now;
+            }
+        }
+    }
+    // 啟動中的連線立刻斷開，不得留下消費者需求。
+    let (early, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{edge_port}/ws"))
+        .await
+        .expect("早退觀看連線應可建立");
+    drop(early);
+    wait_full_stable(edge_port).await;
+    let (mut a, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{edge_port}/ws"))
+        .await
+        .unwrap();
+    let (mut b, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{edge_port}/ws"))
+        .await
+        .unwrap();
+    frame_within(&mut a, "A 接入").await;
+    frame_within(&mut b, "B 接入").await;
+    drop(a);
+    frame_within(&mut b, "A 離開後 B 仍接收").await;
+    let (mut c, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{edge_port}/ws"))
+        .await
+        .unwrap();
+    frame_within(&mut c, "C 接入").await;
+    drop(b);
+    frame_within(&mut c, "B 離開後 C 仍接收").await;
+    use futures_util::SinkExt;
+    for message in [
+        json!({"type":"jpeg-demand","on":false}),
+        json!({"type":"chrome","action":"new-tab"}),
+        json!({"type":"chrome","action":"navigate","url":format!("http://127.0.0.1:{port}/static.html")}),
+    ] {
+        c.send(Message::Text(message.to_string().into()))
+            .await
+            .unwrap();
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let observation = observe(edge_port);
+        if observation["text"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("静态 B")
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline, "无画面需求时应能切到静态标签页");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    drop(c);
+    wait_full_stable(edge_port).await;
+    let (mut reconnect, _) =
+        tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{edge_port}/ws"))
+            .await
+            .unwrap();
+    let frame = frame_within(&mut reconnect, "静态页首帧").await;
+    let mut decoder = Command::new("ffmpeg")
+        .args([
+            "-v",
+            "error",
+            "-f",
+            "mjpeg",
+            "-i",
+            "pipe:0",
+            "-vf",
+            "crop=2:2:450:300,format=rgb24",
+            "-frames:v",
+            "1",
+            "-f",
+            "rawvideo",
+            "pipe:1",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("用 FFmpeg 解码 Chromium 首帧");
+    decoder
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(&frame[8..])
+        .unwrap();
+    let pixel = decoder.wait_with_output().unwrap();
+    assert!(pixel.status.success() && pixel.stdout.len() >= 3);
+    assert!(
+        pixel.stdout[0] < 65 && pixel.stdout[1] > 170,
+        "重连首帧应来自绿色静态 B: {:?}",
+        &pixel.stdout[..3]
+    );
+    drop(reconnect);
+    wait_full_stable(edge_port).await;
+}
+
+/// Viewer 摘要不啟動完整 DOM 鏡像；視口回覆及 RTC 音視需求各自記帳。
+#[tokio::test(flavor = "multi_thread")]
+async fn edge_viewer_summary_viewport_and_rtc_audio_demand() {
+    if std::env::var("RIG_EDGE_IT").is_err() {
+        eprintln!("跳过：未设置 RIG_EDGE_IT");
+        return;
+    }
+    let _serial = SERIAL.lock().await;
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let page_port = listener.local_addr().unwrap().port();
+    let page = r#"<!doctype html><html><body style="margin:0"><video style="width:240px;height:120px;background:#123" aria-label="本地视频摘要"></video>
+<canvas width="200" height="100" style="background:#456"></canvas><button>摘要按钮</button>
+<div style="width:80px;height:50px;background:#789"></div></body></html>"#;
+    serve(listener, vec![("/summary.html".into(), page.into())]);
+    let edge_port = free_port();
+    let _proc = spawn_edge(&[
+        "--listen".into(),
+        format!("127.0.0.1:{edge_port}"),
+        "--url".into(),
+        format!("http://127.0.0.1:{page_port}/summary.html"),
+        "--human".into(),
+        "--av".into(),
+        "--width".into(),
+        "900".into(),
+        "--height".into(),
+        "600".into(),
+    ]);
+    wait_health(edge_port).await;
+
+    use futures_util::SinkExt;
+    use tokio_tungstenite::tungstenite::Message;
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{edge_port}/ws"))
+        .await
+        .unwrap();
+    ws.send(Message::Text(
+        json!({"type":"mode-summary", "request":1})
+            .to_string()
+            .into(),
+    ))
+    .await
+    .unwrap();
+    let (summary, saw_initial_viewport) = tokio::time::timeout(Duration::from_secs(8), async {
+        let mut saw_viewport = false;
+        loop {
+            match ws.next().await {
+                Some(Ok(Message::Text(text))) => {
+                    let v: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+                    if v["type"] == "hello" {
+                        assert_eq!(v["cssWidth"].as_f64(), Some(900.0), "初始視口寬度: {v}");
+                        assert_eq!(v["cssHeight"].as_f64(), Some(600.0), "初始視口高度: {v}");
+                        saw_viewport = true;
+                    }
+                    if v["type"] == "mode-summary" && v["request"] == 1 {
+                        break (v, saw_viewport);
+                    }
+                }
+                Some(Ok(_)) => {}
+                other => panic!("mode-summary WS 結束: {other:?}"),
+            }
+        }
+    })
+    .await
+    .expect("mode-summary 回覆超時");
+    assert!(saw_initial_viewport, "應收到初始 900x600 視口值");
+    for key in ["videoRatio", "canvasRatio", "regionRatio", "interactive"] {
+        assert!(summary[key].is_number(), "摘要缺少數值 {key}: {summary}");
+    }
+    assert!(
+        summary["interactive"].as_f64().unwrap() > 0.0,
+        "本機按鈕應計入互動摘要: {summary}"
+    );
+    let health = http_json(edge_port, "GET", "/health", None).1;
+    assert_eq!(health["dom_viewers"], 0, "摘要不得訂閱完整 DOM: {health}");
+    let drain_until = Instant::now() + Duration::from_millis(500);
+    while Instant::now() < drain_until {
+        if let Ok(Some(Ok(Message::Text(text)))) =
+            tokio::time::timeout(Duration::from_millis(100), ws.next()).await
+        {
+            let v: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+            assert_ne!(v["type"], "dom-snapshot", "摘要前不應收到 DOM 快照: {v}");
+        }
+    }
+    ws.send(Message::Text(
+        json!({"type":"dom-start"}).to_string().into(),
+    ))
+    .await
+    .unwrap();
+    let _snapshot = next_dom(&mut ws, "dom-snapshot", Duration::from_secs(12)).await;
+    ws.send(Message::Text(json!({"type":"dom-stop"}).to_string().into()))
+        .await
+        .unwrap();
+    let dom_deadline = Instant::now() + Duration::from_secs(5);
+    while http_json(edge_port, "GET", "/health", None).1["dom_viewers"] != 0 {
+        assert!(Instant::now() < dom_deadline, "dom-stop 應釋放快照訂閱");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    // 視口尺寸由 Viewer 明確要求，邊緣回覆實際套用值與同一 request id。
+    ws.send(Message::Text(
+        json!({"type":"resize", "request":2, "w":800, "h":500})
+            .to_string()
+            .into(),
+    ))
+    .await
+    .unwrap();
+    let resized = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(Ok(Message::Text(text))) = ws.next().await {
+                let v: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+                if v["type"] == "viewport" && v["request"] == 2 {
+                    break v;
+                }
+            }
+        }
+    })
+    .await
+    .expect("viewport 套用回覆超時");
+    assert_eq!(
+        resized["cssWidth"], 800,
+        "viewport 寬度應回實際套用值: {resized}"
+    );
+    assert_eq!(
+        resized["cssHeight"], 500,
+        "viewport 高度應回實際套用值: {resized}"
+    );
+
+    // RTC 僅要音訊時不應索取視頻；jpeg-demand 關閉後畫面採集應停止。
+    ws.send(Message::Text(
+        json!({"type":"jpeg-demand", "on":false}).to_string().into(),
+    ))
+    .await
+    .unwrap();
+    ws.send(Message::Text(
+        json!({"type":"rtc-start", "video":false, "audio":true})
+            .to_string()
+            .into(),
+    ))
+    .await
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(8);
+    loop {
+        let h = http_json(edge_port, "GET", "/health", None).1;
+        if h["rtc_video_want"] == 0 && h["rtc_audio_want"] == 1 {
+            break;
+        }
+        assert!(Instant::now() < deadline, "音訊單獨需求記帳錯誤: {h}");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let pump_after_audio = http_json(edge_port, "GET", "/health", None).1["pump"]["full"]
+        .as_u64()
+        .unwrap();
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(
+        http_json(edge_port, "GET", "/health", None).1["pump"]["full"]
+            .as_u64()
+            .unwrap(),
+        pump_after_audio,
+        "純音訊 RTC 不應保留整頁視頻採集"
+    );
+
+    ws.send(Message::Text(
+        json!({"type":"rtc-demand", "video":true, "audio":true})
+            .to_string()
+            .into(),
+    ))
+    .await
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(8);
+    loop {
+        let h = http_json(edge_port, "GET", "/health", None).1;
+        if h["rtc_video_want"] == 1 && h["rtc_audio_want"] == 1 {
+            break;
+        }
+        assert!(Instant::now() < deadline, "RTC 視頻需求未生效: {h}");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    ws.send(Message::Text(
+        json!({"type":"rtc-demand", "video":false, "audio":true})
+            .to_string()
+            .into(),
+    ))
+    .await
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(8);
+    loop {
+        let h = http_json(edge_port, "GET", "/health", None).1;
+        if h["rtc_video_want"] == 0 && h["rtc_audio_want"] == 1 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "關閉 RTC 視頻不得清除音訊需求: {h}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    ws.send(Message::Text(json!({"type":"rtc-stop"}).to_string().into()))
+        .await
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(8);
+    loop {
+        let h = http_json(edge_port, "GET", "/health", None).1;
+        if h["rtc_video_want"] == 0 && h["rtc_audio_want"] == 0 {
+            break;
+        }
+        assert!(Instant::now() < deadline, "停止 RTC 應釋放音視頻需求: {h}");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }
 
 /// 回归（审查 P1）：后台 DOM 感知订阅不得停发 WS JPEG 帧——
@@ -2389,7 +3038,20 @@ async fn edge_upload_action() {
     std::fs::write(&f1, b"hello-upload").unwrap();
     std::fs::write(&f2, b"second").unwrap();
 
-    let obs = observe(edge_port);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let obs = loop {
+        let candidate = observe(edge_port);
+        if find_by_name(&candidate["observation"], "上传文件").is_some()
+            && find_by_name(&candidate["observation"], "普通文本").is_some()
+        {
+            break candidate;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "观察应含文件框及文本框: {candidate}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
     let frame = obs["observation"]["frame_id"].as_u64().unwrap();
     let up = find_by_name(&obs["observation"], "上传文件").expect("观察应含文件框");
     let up_id = up["id"].as_str().unwrap().to_string();
@@ -2523,6 +3185,15 @@ document.getElementById('btn').addEventListener('click', () => {
 <div style="height:1500px"></div>
 <button id="bottomBtn">底部按钮</button>
 </body></html>"#;
+
+const SCREENSHOT_MASK_HTML: &str = r#"<!DOCTYPE html><html lang="zh"><head><meta charset="utf-8"><title>遮罩合成</title>
+<style>body{margin:0;min-height:120vh} main{padding:16px}
+#secret-wrap{margin:24px;background:#21e659;padding:24px}
+input[type=password]{display:block;width:180px;height:48px;padding:0;border:0;background:#f2d928;color:#111}
+#ax-hidden{position:absolute;left:360px;top:190px}</style></head>
+<body><main id="public" aria-label="公開區"><button>公開按鈕</button></main>
+<div id="secret-wrap"><input type="password" aria-label="合成密碼" value="SYNTHETIC-ONLY"></div>
+<input id="ax-hidden" type="password" aria-hidden="true" value="SYNTHETIC-ONLY"></body></html>"#;
 
 /// R-18：/observe 落实 ObserveRequest——mode（text/tree/tree_image
 /// 响应组成）、budget_tokens（响应副本裁剪、存储帧不动）、subtree。
@@ -2658,6 +3329,13 @@ async fn edge_observe_modes_budget() {
         serde_json::to_string(delta).unwrap().contains("计数:2"),
         "upsert 应含新计数 计数:2: {delta}"
     );
+    let (st, incompatible) =
+        observe_with(json!({"since_frame": frame_a, "include_offscreen": false}));
+    assert_eq!(st, 200);
+    assert!(
+        incompatible.get("observation").is_some() && incompatible.get("delta").is_none(),
+        "輸出投影不相容應回完整觀察: {incompatible}"
+    );
     // 基帧不存在 → 回完整视图；text 模式不走增量
     let (st, v) = observe_with(json!({"since_frame": 999999}));
     assert_eq!(st, 200, "未知基帧观察: {v}");
@@ -2671,6 +3349,179 @@ async fn edge_observe_modes_budget() {
         v.get("delta").is_none() && v.get("text").is_some(),
         "text 模式不走增量: {v}"
     );
+}
+
+/// 子樹投影排除密碼欄位時，HTTP 與 MCP 的 tree_image 仍以完整觀察遮罩，且編號一致。
+#[tokio::test]
+async fn edge_tree_image_masks_projected_out_secret_and_matches_mcp() {
+    if std::env::var("RIG_EDGE_IT").is_err() {
+        eprintln!("跳过：未设置 RIG_EDGE_IT");
+        return;
+    }
+    let _serial = SERIAL.lock().await;
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let origin = format!("http://127.0.0.1:{port}");
+    serve(
+        listener,
+        vec![("/mask.html".into(), SCREENSHOT_MASK_HTML.into())],
+    );
+
+    let edge_port = free_port();
+    let mut child = EdgeProc(
+        Command::new(env!("CARGO_BIN_EXE_rig-edge-browser"))
+            .args([
+                "--stdio",
+                "--human",
+                "--listen",
+                &format!("127.0.0.1:{edge_port}"),
+                "--url",
+                &format!("{origin}/mask.html"),
+                "--width",
+                "900",
+                "--height",
+                "700",
+            ])
+            .process_group(0)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("啟動 MCP 邊緣"),
+    );
+    wait_health(edge_port).await;
+    let (_, http_full) = http_json(edge_port, "POST", "/observe", Some(json!({})));
+    let secret = find_element(&http_full["observation"], "textbox", "合成密碼")
+        .expect("完整觀察應含合成密碼欄位");
+    assert!(
+        !http_full.to_string().contains("SYNTHETIC-ONLY"),
+        "合成密碼不得出現在觀察: {http_full}"
+    );
+    let secret_bbox = secret["bbox"]
+        .as_array()
+        .expect("密碼欄位應有 bbox")
+        .clone();
+    let main_id = find_by_name(&http_full["observation"], "公開區").unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let request = json!({"mode":"tree_image", "subtree":main_id});
+    let (status, http_image_out) = http_json(edge_port, "POST", "/observe", Some(request.clone()));
+    assert_eq!(status, 200, "HTTP tree_image 應成功: {http_image_out}");
+    assert!(
+        find_element(&http_image_out["observation"], "textbox", "合成密碼").is_none(),
+        "子樹投影應排除密碼欄位: {http_image_out}"
+    );
+    let http_png = base64::engine::general_purpose::STANDARD
+        .decode(
+            http_image_out["image_png_base64"]
+                .as_str()
+                .expect("HTTP 應返回 PNG"),
+        )
+        .unwrap();
+    let http_img = image::load_from_memory(&http_png).unwrap().to_rgba8();
+    let [x1, y1, x2, y2] = secret_bbox
+        .iter()
+        .map(|v| v.as_f64().unwrap())
+        .collect::<Vec<_>>()
+        .try_into()
+        .unwrap();
+    let (x1, y1, x2, y2) = (x1 as u32, y1 as u32, x2 as u32, y2 as u32);
+    for (left, top, right, bottom) in [(x1, y1, x2, y2), (360, 190, 540, 238)] {
+        for y in top..bottom {
+            for x in left..right {
+                assert_eq!(
+                    http_img.get_pixel(x, y).0,
+                    [0, 0, 0, 255],
+                    "敏感欄位像素 ({x},{y}) 必須為黑色"
+                );
+            }
+        }
+    }
+    let outside = http_img
+        .get_pixel(x1.saturating_sub(3), y1 + (y2 - y1) / 2)
+        .0;
+    assert!(
+        outside[1] > 150 && outside[0] < 80,
+        "敏感框外合成綠色背景應保留，避免整頁黑屏假通過: {outside:?}"
+    );
+
+    let mut stdin = child.0.stdin.take().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    let mut reader = std::io::BufReader::new(child.0.stdout.take().unwrap());
+    std::thread::spawn(move || {
+        use std::io::BufRead;
+        let mut line = String::new();
+        loop {
+            line.clear();
+            if reader.read_line(&mut line).unwrap_or(0) == 0 || tx.send(line.clone()).is_err() {
+                break;
+            }
+        }
+    });
+    let mut id = 0u64;
+    let mut rpc = |stdin: &mut std::process::ChildStdin, method: &str, params: Value| {
+        id += 1;
+        writeln!(
+            stdin,
+            "{}",
+            json!({"jsonrpc":"2.0", "id":id, "method":method, "params":params})
+        )
+        .unwrap();
+        stdin.flush().unwrap();
+        serde_json::from_str::<Value>(
+            &rx.recv_timeout(Duration::from_secs(25))
+                .expect("MCP 響應超時"),
+        )
+        .unwrap()
+    };
+    let _ = rpc(
+        &mut stdin,
+        "initialize",
+        json!({"protocolVersion":"2025-03-26", "capabilities":{}, "clientInfo":{"name":"mask-it", "version":"0"}}),
+    );
+    writeln!(
+        stdin,
+        "{}",
+        json!({"jsonrpc":"2.0", "method":"notifications/initialized"})
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    let result = rpc(
+        &mut stdin,
+        "tools/call",
+        json!({"name":"observe", "arguments":request}),
+    );
+    let content = result["result"]["content"].as_array().unwrap();
+    let mut mcp_view: Value = serde_json::from_str(content[1]["text"].as_str().unwrap()).unwrap();
+    mcp_view["frame_id"] = http_image_out["observation"]["frame_id"].clone();
+    assert_eq!(
+        http_image_out["observation"], mcp_view,
+        "相同投影的 HTTP/MCP Observation 應一致"
+    );
+    assert_eq!(content[2]["type"], "image");
+    let mcp_png = base64::engine::general_purpose::STANDARD
+        .decode(content[2]["data"].as_str().unwrap())
+        .unwrap();
+    let mcp_img = image::load_from_memory(&mcp_png).unwrap().to_rgba8();
+    assert_eq!(http_img.dimensions(), mcp_img.dimensions());
+    assert_eq!(
+        http_img.as_raw(),
+        mcp_img.as_raw(),
+        "HTTP 與 MCP 的標記、編號、遮罩像素應一致"
+    );
+    let (status, http_png) = http(edge_port, "GET", "/screenshot.png", None);
+    assert_eq!(status, 200);
+    let standalone = rpc(
+        &mut stdin,
+        "tools/call",
+        json!({"name":"screenshot","arguments":{}}),
+    );
+    let mcp_png = base64::engine::general_purpose::STANDARD
+        .decode(standalone["result"]["content"][0]["data"].as_str().unwrap())
+        .unwrap();
+    assert_eq!(http_png, mcp_png, "獨立截圖也應共用編號與遮罩");
+    drop(stdin);
 }
 
 const PERSIST_HTML: &str = r#"<!DOCTYPE html><html><head><meta charset="utf-8"><title>持久化测试页</title></head>
@@ -3111,15 +3962,19 @@ async fn edge_popup_keeps_view_frames() {
             h["last_frame_age_ms"].as_f64().unwrap_or(f64::MAX),
         )
     }
-    // 先确认动画页确实在持续出帧
-    tokio::time::sleep(Duration::from_secs(2)).await;
-    let (before, _) = frames_sent(edge_port).await;
-    assert!(before > 0, "开标签前应已有帧");
-
     use futures_util::SinkExt;
     let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{edge_port}/ws"))
         .await
         .expect("人通道 WS 应可连接");
+    // 实际观看后才有采集需求；先确认原动画标签已开始出帧。
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if frames_sent(edge_port).await.0 > 0 {
+            break;
+        }
+        assert!(Instant::now() < deadline, "开标签前应已有帧");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
     for (action, buttons) in [("move", 0), ("down", 1), ("up", 0)] {
         ws.send(tokio_tungstenite::tungstenite::Message::Text(
             format!(

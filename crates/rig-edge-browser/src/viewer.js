@@ -3,23 +3,16 @@ const cv = document.getElementById('cv'), ctx = cv.getContext('2d');
 const vid = document.getElementById('vid');
 const ime = document.getElementById('ime');
 const promptBox = document.getElementById('prompt');
-/* 当前帧的像素尺寸（第五期起为纯页面帧）；坐标换算以此为准 */
-let frameW = 1280, frameH = 800;
+/* 输入坐标使用边缘实际应用的 CSS 视口。 */
+let cssViewportW = 0, cssViewportH = 0;
+const rtcAudio = new Audio();
 /* 直连令牌：从本页 URL 的 ?token= 读出，透传给 WS 与文件取回 */
 const TOK = new URLSearchParams(location.search).get('token') || '';
 const TQ = TOK ? ('?token=' + encodeURIComponent(TOK)) : '';
 const fch = (u, o) => fetch(u + (TOK ? (u.includes('?') ? '&' : '?') + 'token=' + encodeURIComponent(TOK) : ''), o);
 const ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws' + TQ);
-let avOn = false;
-/* 进 DOM 前影音是否开着：domStart 会把影音关掉（互斥），退出
-   DOM 时据此恢复——不恢复则视频模式恒为无声的 RTC 呈现，
-   vid 停在 ontrack 的初始静音上（LIU 2026-11-20 实测无声定因） */
-let avWasOn = false;
-/* AV 呈现路径（架构口径：WebRTC 优先、HLS 最终兜底）：
-   avVia = 'rtc'（视频+Opus 音频走 RTC）| 'hls'（ffmpeg 合流）| null（待定） */
-let avVia = null, avWait = 0;
-/* U01：DOM 模式是否保留 RTC 声音（默认保留；HLS 无独立声轨，DOM 下静音） */
-let domAudio = true;
+let avWanted = false, avWait = 0;
+let hlsRequested = false, hlsPlaying = false;
 ws.binaryType = 'arraybuffer';
 let frameSeq = 0;
 ws.onmessage = (ev) => {
@@ -28,7 +21,6 @@ ws.onmessage = (ev) => {
        序号守卫：解码慢的旧帧不得覆盖已画的新帧 */
     const dv = new DataView(ev.data);
     const w = dv.getUint32(0, true), h = dv.getUint32(4, true);
-    frameW = w; frameH = h;
     const seq = ++frameSeq;
     const tArr = performance.now();
     /* F-09 观看端段：帧到达→解码上屏耗时（window.__rigPaint，
@@ -66,16 +58,12 @@ ws.onmessage = (ev) => {
   if (m.type === 'clipboard-text') { deliverLocalText(m.text || ''); }
   if (m.type === 'clipboard-image') { deliverLocalImage(m.data || ''); }
   if (m.type === 'image-at') { onImageAt(m.data || ''); }
-  if (m.type === 'rtc-offer' && pc) {
-    pc.setRemoteDescription({type:'offer', sdp: m.sdp})
-      .then(() => pc.createAnswer())
-      .then(a => pc.setLocalDescription(a).then(() => send({type:'rtc-answer', sdp: a.sdp})))
-      .catch(() => rtcStop());
+  if (m.type === 'hello' || (m.type === 'viewport' && m.request === resizeRequest)) {
+    applyViewport(m);
   }
-  if (m.type === 'rtc-state' && m.state === 'disconnected') {
-    /* 服务端视角断开且本地未连通：切回 canvas（WS 帧已由服务端恢复） */
-    if (!pc || pc.connectionState !== 'connected') { rtcOn = false; showDisplay(); }
-  }
+  if (m.type === 'mode-summary') applyModeSummary(m);
+  if (m.type === 'rtc-offer' && pc) acceptOffer(pc, m.sdp);
+  if (m.type === 'rtc-state' && m.state === 'disconnected' && pc) suspendRtc();
   if (m.type === 'dom-snapshot' || m.type === 'dom-delta' || m.type === 'dom-state' || m.type === 'dom-canvas' || m.type === 'dom-region' || m.type === 'dom-chunk') {
     __domStats.ws++; domFeed(m);
   }
@@ -111,6 +99,7 @@ function chunkSweep(now) {
   if (expired && domOn) send({type:'dom-resync'});
 }
 function domFeed(m) {
+  if (!domOn) return;
   if (m.type === 'dom-snapshot') regionEpochCheck(m.url);
   if (m.type !== 'dom-chunk') { handleDomMessage(m); return; }
   const now = Date.now();
@@ -146,7 +135,6 @@ function domFeed(m) {
   }
 }
 function handleDomMessage(m) {
-  if (m.type === 'dom-snapshot') onSnapAuto(m);
   if (m.type === 'dom-snapshot' && domOn) applySnapshot(m);
   if (m.type === 'dom-delta' && domOn) applyDelta(m);
   if (m.type === 'dom-canvas' && domOn) applyCanvas(m);
@@ -183,14 +171,13 @@ function applyCanvas(m) {
 function send(o) { if (ws.readyState === 1) ws.send(JSON.stringify(o)); }
 document.getElementById('pYes').onclick = () => { promptBox.style.display = 'none'; send({type:'takeover', yes:true}); ime.focus(); };
 document.getElementById('pNo').onclick = () => { promptBox.style.display = 'none'; send({type:'takeover', yes:false}); ime.focus(); };
-/* 坐标：以当前显示元素（canvas 或 video）的实际帧尺寸换算 */
+function frameRect() {
+  return (hlsPlaying || rtcOn ? vid : cv).getBoundingClientRect();
+}
 function toFrame(e) {
-  const useVid = avOn || rtcOn;
-  const el = useVid ? vid : cv;
-  const r = el.getBoundingClientRect();
-  const w = useVid ? (vid.videoWidth || frameW) : frameW;
-  const h = useVid ? (vid.videoHeight || frameH) : frameH;
-  return { x: (e.clientX - r.left) * (w / r.width), y: (e.clientY - r.top) * (h / r.height) };
+  const r = frameRect();
+  return { x: (e.clientX - r.left) * cssViewportW / Math.max(1, r.width),
+           y: (e.clientY - r.top) * cssViewportH / Math.max(1, r.height) };
 }
 /* ── F-07 本地即时反馈（仅视频/画布模式；DOM 模式原生即时）──
    点击涟漪、拖选框、滚动预览都在本地先行呈现，页面结果态
@@ -413,8 +400,8 @@ function openCtx(cx, cy, hit) {
   add('全选', () => sendKeyChord('a', 'KeyA'));
   add('自动模式：' + (modeAuto ? '开' : '关'), () => {
     modeAuto = !modeAuto;
-    wantDomAuto = modeAuto; syncDomSub();
-    if (modeAuto) { modeLock = false; flashHint('自动模式已开'); }
+    resetAutoMode();
+    if (modeAuto) { requestModeSummary(); flashHint('自动模式已开'); }
     else flashHint('自动模式已关');
   });
   /* 导航走 chrome 命令（双模式同一路；旧实现 DOM 模式走 nav
@@ -466,52 +453,45 @@ function copyMirrorSelection() {
 /* 分辨率跟随：把舞台区像素尺寸报给边缘（仅边缘处于「跟随窗口」
    模式时生效）。第五期起头部是文档流内的原生 DOM，舞台区就是
    远端视口的准确占位（不再手工扣条带高） */
-let rzTimer = 0, rzSentW = 0, rzSentH = 0;
+const stage = document.getElementById('stage');
+let resizeTimer = 0, resizeRequest = 0, resizeSent = null;
 function stageSize() {
   const dpr = window.devicePixelRatio || 1;
-  const st = document.getElementById('stage');
-  return [Math.max(320, Math.round(st.clientWidth * dpr)),
-          Math.max(240, Math.round(st.clientHeight * dpr))];
+  return [Math.max(320, Math.round(stage.clientWidth * dpr)),
+          Math.max(240, Math.round(stage.clientHeight * dpr))];
 }
 function reportSize() {
-  clearTimeout(rzTimer);
+  clearTimeout(resizeTimer);
+  if (ws.readyState !== 1) return;
   const [w, h] = stageSize();
-  if (w === rzSentW && h === rzSentH) return;
-  if (!rzSentW) { /* 首报立即发，边缘不必等安定窗才拿到真尺寸 */
-    rzSentW = w; rzSentH = h;
-    send({type:'resize', w, h});
-    return;
-  }
-  /* 900ms 安定滞后：窗口拖动/状态切换期间尺寸反复横跳时不追
-     发——远端视口、截帧基准与 RTC 编码器跟着每个中间尺寸翻
-     动，正是 LIU 2026-11-20 实测「视频模式还跳」的一环（生产
-     日志两尺寸交替重建编码器）；尺寸安定下来才报一次 */
-  rzTimer = setTimeout(() => {
-    const [w2, h2] = stageSize();
-    if (w2 === rzSentW && h2 === rzSentH) return;
-    rzSentW = w2; rzSentH = h2;
-    send({type:'resize', w: w2, h: h2});
-  }, 900);
+  if (resizeSent && w === resizeSent.w && h === resizeSent.h &&
+      (resizeSent.applied || performance.now() - resizeSent.at < 3000)) return;
+  const report = () => {
+    const request = ++resizeRequest;
+    resizeSent = {w, h, at: performance.now(), applied: false};
+    send({type:'resize', request, w, h});
+  };
+  if (!resizeSent) report();
+  else resizeTimer = setTimeout(report, 900); /* 窗口尺寸稳定后再触发远端重排。 */
 }
-addEventListener('resize', reportSize);
-reportSize();
-/* 尺寸心跳：边缘处理 resize 时若恰逢会话切换/瞬时失败会静默丢弃，而本端
-   已按「已发送」去重不再重发，远端视口就卡在旧尺寸（视频被缩小显示）。
-   每 3s 核对：舞台尺寸变了就走 reportSize，没变就重报一次；边缘只在视口真不一致时才应用 */
+function applyViewport(m) {
+  if (!(m.cssWidth > 0 && m.cssHeight > 0)) return;
+  cssViewportW = m.cssWidth; cssViewportH = m.cssHeight;
+  if (m.type === 'viewport' && resizeSent) resizeSent.applied = true;
+  if (domOn && mirMap.size) {
+    mirVW = cssViewportW; mirVH = cssViewportH;
+    layoutMirror();
+  }
+  placeGhost();
+}
+new ResizeObserver(reportSize).observe(stage);
+ws.addEventListener('open', reportSize);
 setInterval(() => {
-  const [w, h] = stageSize();
-  /* 只让「正被使用」的观看端发心跳：多个观看端（另一标签/设备）共用一个
-     边缘视口，后台页也心跳就会持续互相抢视口，视频随之忽大忽小 */
-  if (ws.readyState !== 1 || document.visibilityState !== 'visible' || !document.hasFocus()) return;
-  /* 舞台尺寸变了但没有窗口 resize 事件（头部/标签栏重排等）也要报 */
-  if (w !== rzSentW || h !== rzSentH) reportSize();
-  else send({type:'resize', w, h});
+  if (document.visibilityState === 'visible' && document.hasFocus()) reportSize();
 }, 3000);
-/* WebRTC 主路（Phase 1c；音频与优先级按 LIU 2026-11-19 口径修订）：
-   WS 开后即尝试 rtc-start，连通后 video 显示 RTC 流（服务端同步停发
-   本连接的 WS 帧）；失败/断开自动回退 canvas。AV 呈现 WebRTC 优先
-   （视频+Opus 音频），HLS（ffmpeg 合流）为最终兜底，见 pollAv。 */
-let pc = null, rtcOn = false, rtcTimer = 0;
+
+let pc = null, rtcOn = false, rtcSuspended = false, rtcTimer = 0;
+let rtcLastTracks = '';
 function showDisplay() {
   if (domOn) {
     /* 镜像填满舞台（头部是文档流内的原生工具栏，不占舞台）。
@@ -524,7 +504,7 @@ function showDisplay() {
     layoutMirror();
     vid.style.display = 'none'; cv.style.display = 'none';
     setPill(lastDomStat);
-  } else if (avOn || rtcOn) {
+  } else if (hlsPlaying || rtcOn) {
     ime.style.pointerEvents = '';
     vid.style.display = 'block'; cv.style.display = 'none';
     mir.style.display = 'none'; dpill.style.display = 'none';
@@ -534,149 +514,136 @@ function showDisplay() {
     mir.style.display = 'none'; dpill.style.display = 'none';
   }
   document.getElementById('domBtn').classList.toggle('on', domOn);
-  /* 静音态收敛到显示面：DOM 面显示 → 只有 RTC 音频保留时不静音
-     （U01：RTC 音轨与画面解耦，DOM 藏画面仍可听声；HLS 音频封在
-     流里、无独立声轨，DOM 下仍静音并明示）；
-     视频面显示且影音在播（avVia 已定型）→ 解静音。此前静音标志
-     散落在 pollAv/domStart 的迁移分支里，DOM→视频往返后 avVia
-     已定型、没有任何分支再触发解静音，vid 恒停在 ontrack 的初始
-     静音上（有声轨、无声、标签页无喇叭图标——LIU 2026-11-20
-     实测无声定因） */
-  if (domOn) vid.muted = !(domAudio && avVia === 'rtc');
-  else if (avVia) vid.muted = false;
   placeGhost();
+  syncRtcDemand();
   jdSend();
 }
-/* F-03：向边缘报告本连接的真实显示模式——只有 canvas 分支
-   （WS 帧流）在看 JPEG；RTC/HLS 视频元素与 DOM 镜像不消费
-   帧流，边缘据此跳过没人看的帧广播（第五期后帧为原始
-   screencast JPEG 透传，此记账决定广播与否） */
 function jdSend() {
-  const on = !domOn && !avOn && !rtcOn;
-  if (jdSend.last === on) return;
+  const on = !domOn && !hlsPlaying && !rtcOn;
+  if (ws.readyState !== 1 || jdSend.last === on) return;
   jdSend.last = on;
   send({type: 'jpeg-demand', on});
 }
+function syncRtcDemand(start = false) {
+  if (!pc) return;
+  const video = !domOn && !hlsRequested && !rtcSuspended;
+  const audio = avWanted && !hlsRequested;
+  const key = video + ':' + audio;
+  if (!start && key === rtcLastTracks) return;
+  rtcLastTracks = key;
+  send({type: start ? 'rtc-start' : 'rtc-demand', video, audio});
+}
+async function acceptOffer(peer, sdp) {
+  try {
+    await peer.setRemoteDescription({type:'offer', sdp});
+    const answer = await peer.createAnswer();
+    await peer.setLocalDescription(answer);
+    if (pc === peer) send({type:'rtc-answer', sdp:answer.sdp});
+  } catch (e) {
+    if (pc === peer) rtcStop();
+  }
+}
 function rtcStop() {
   clearTimeout(rtcTimer);
-  if (pc) { try { pc.close(); } catch (e) {} pc = null; }
-  rtcOn = false;
+  const peer = pc;
+  pc = null; rtcOn = false; rtcSuspended = false;
+  if (peer) peer.close();
   vid.srcObject = null;
-  /* D03：RTC 会话换代时清分片重组缓存——旧会话的残缺包不得
-     拼进新会话（可靠有序只在单会话内成立） */
+  rtcAudio.srcObject = null;
   chunkBuf.clear(); chunkBytes = 0;
+  avWait = Date.now();
   send({type:'rtc-stop'});
   showDisplay();
 }
+function suspendRtc() {
+  if (rtcSuspended) return;
+  rtcOn = false; rtcSuspended = true;
+  avWait = Date.now();
+  showDisplay();
+  clearTimeout(rtcTimer);
+  rtcTimer = setTimeout(rtcStop, 3000);
+}
 function rtcStart() {
-  /* ws 未就绪不建 pc：send 在 ws 未开时静默丢弃 rtc-start，pc 却已
-     创建，随后 ws open 回调的 rtcStart 因 pc 已存在直接返回——offer
-     永远不来，8s 后落到 HLS。pollAv 的 fetch 先于 ws 握手返回时必现 */
-  if (ws.readyState !== 1) return;
-  if (pc || avVia === 'hls' || !window.RTCPeerConnection) return;
-  pc = new RTCPeerConnection();
-  /* rig-dom 数据通道：DOM 模式下快照/差分优先走这里（可靠有序），
-     通道未开或断开时边缘自动回落 WS 文本，本页无感切换 */
-  pc.ondatachannel = (ev) => {
+  if (ws.readyState !== 1 || pc || hlsRequested || !window.RTCPeerConnection) return;
+  const peer = new RTCPeerConnection();
+  pc = peer;
+  peer.ondatachannel = (ev) => {
     if (ev.channel.label !== 'rig-dom') return;
     ev.channel.onmessage = (e) => {
+      if (pc !== peer || !domOn) return;
       try { __domStats.dc++; domFeed(JSON.parse(e.data)); } catch (err) {}
     };
   };
-  pc.ontrack = (ev) => {
-    /* 视频与音频分属不同 msid 流（rig / rig-audio），ev.streams[0]
-       只是本轨道所在的那条流：整体赋值会让后到的音频事件把只含
-       音频的流盖到 vid 上，视频轨被换走、画面恒黑而统计仍在解码
-       （2026-11-19 局域网实测定位）。改为把每条到达的轨道累加进
-       同一个本地 MediaStream。 */
-    if (!vid.srcObject) vid.srcObject = new MediaStream();
-    if (!vid.srcObject.getTracks().includes(ev.track)) vid.srcObject.addTrack(ev.track);
-    vid.muted = true; vid.play().catch(() => {});
+  peer.ontrack = (ev) => {
+    if (pc !== peer) return;
+    if (ev.track.kind === 'audio') {
+      rtcAudio.srcObject = new MediaStream([ev.track]);
+      resumeVid();
+    } else {
+      vid.muted = true;
+      vid.srcObject = new MediaStream([ev.track]);
+      vid.play().catch(() => {});
+    }
   };
-  pc.onicecandidate = (ev) => { if (ev.candidate) send({type:'rtc-candidate', candidate: ev.candidate.toJSON()}); };
-  pc.onconnectionstatechange = () => {
-    if (!pc) return;
-    if (pc.connectionState === 'connected') {
-      clearTimeout(rtcTimer); rtcOn = true;
-      /* M01 联动：RTC 连通后边缘 grace 停 HLS——若当前播的是 HLS，
-         必须跟到 RTC 上，否则 HLS 停后 vid 无声无画 */
-      if (avVia === 'hls') {
-        vid.pause(); vid.removeAttribute('src'); vid.load();
-        avVia = 'rtc'; vid.muted = false;
-      }
-      showDisplay();
-    } else if (pc.connectionState === 'disconnected') {
-      /* 给 ICE 3 秒恢复窗；服务端已恢复 WS 帧，过期未恢复则切回 canvas */
+  peer.onicecandidate = (ev) => {
+    if (pc === peer && ev.candidate) send({type:'rtc-candidate', candidate:ev.candidate.toJSON()});
+  };
+  peer.onconnectionstatechange = () => {
+    if (pc !== peer) return;
+    if (peer.connectionState === 'connected') {
       clearTimeout(rtcTimer);
-      rtcTimer = setTimeout(() => { if (pc && pc.connectionState !== 'connected') { rtcOn = false; showDisplay(); } }, 3000);
-    } else if (pc.connectionState === 'failed' || pc.connectionState === 'closed') {
+      rtcOn = true; rtcSuspended = false;
+      showDisplay();
+    } else if (peer.connectionState === 'disconnected') {
+      suspendRtc();
+    } else if (peer.connectionState === 'failed' || peer.connectionState === 'closed') {
       rtcStop();
     }
   };
-  send({type:'rtc-start'});
-  /* 8 秒内没连通视为此路不通，回退 WS 并关掉会话 */
-  clearTimeout(rtcTimer);
-  rtcTimer = setTimeout(() => { if (!rtcOn) rtcStop(); }, 8000);
+  syncRtcDemand(true);
+  showDisplay();
+  rtcTimer = setTimeout(rtcStop, 8000);
 }
-ws.addEventListener('open', () => rtcStart());
-/* 影音流开关在边缘菜单里；本页只轮询状态。AV 路径按架构口径
-   WebRTC 优先：RTC 已连通（或 5 秒内连通）就用 RTC 的视频+Opus
-   音频；连不通才落 HLS（ffmpeg 合流，最终兜底）。 */
+ws.addEventListener('open', rtcStart);
+
+/* HLS 合流只做视频面的兜底，等到开始播放后才离开 JPEG。 */
 function startHls() {
-  avVia = 'hls';
+  hlsRequested = true;
   rtcStop();
-  vid.muted = false;
-  vid.style.display = 'block'; cv.style.display = 'none';
-  /* 单 rendition 档（RIG_HLS_SINGLE）：只建了被提供的那路，
-     按提供表与自身解码能力选流，不再无条件试 hevc */
   const offered = window.__rigHls || ['hevc', 'h264'];
   const hevcOk = offered.includes('hevc') && window.MediaSource && MediaSource.isTypeSupported('video/mp4; codecs="hvc1.1.6.L93.B0, mp4a.40.2"');
+  vid.muted = false;
   vid.src = (hevcOk ? '/stream/hevc/index.m3u8' : '/stream/h264/index.m3u8') + TQ;
   vid.play().catch(() => {});
 }
+function stopHls() {
+  if (!hlsRequested) return;
+  hlsRequested = hlsPlaying = false;
+  vid.pause(); vid.removeAttribute('src'); vid.load();
+  avWait = Date.now();
+  showDisplay();
+}
+vid.addEventListener('playing', () => {
+  if (hlsRequested) { hlsPlaying = true; showDisplay(); }
+});
+vid.addEventListener('error', stopHls);
+
 async function pollAv() {
   try {
     const s = await (await fch('/channels')).json();
-    /* 单 rendition 档：HLS 输出版本表进全局，供 startHls 选流 */
     if (Array.isArray(s.hls_renditions)) window.__rigHls = s.hls_renditions;
-    /* M01/M03/U01：意图（av_wanted）与实际运行（av）分离——RTC healthy
-       时 HLS 可以停着（av=false）但意图仍在。以下分支一律按意图决策，
-       不再把“兜底编码被策略停掉”误判成“用户关了影音”而拆台 */
-    const want = !!s.av_wanted;
-    if (!want) domAvOffPending = false;
-    if (want && !avOn && !domOn) {
-      /* DOM 模式不再被影音抢占：DOM 与 RTC 本就共存（rig-dom
-         数据通道跑在 RTC 上），旧逻辑「AV 来了退出 DOM」只剩
-         误杀价值——6 秒保护窗一过，pollAv 会把用户好端端的
-         DOM 会话停掉，连带边缘停掉页内观察者，增量静默死亡 */
-      avOn = true;
+    if (avWanted !== !!s.av_wanted) {
+      avWanted = !!s.av_wanted;
       avWait = Date.now();
-      if (rtcOn) { avVia = 'rtc'; vid.muted = false; showDisplay(); }
-      else if (!pc) rtcStart();
-    } else if (want && avOn && !avVia) {
-      if (rtcOn) { avVia = 'rtc'; vid.muted = false; showDisplay(); }
-      else if (Date.now() - avWait > 5000) startHls();
-    } else if (!want && avOn) {
-      avOn = false;
-      if (avVia === 'hls') {
-        vid.pause(); vid.removeAttribute('src'); vid.load();
-      } else if (avVia === 'rtc') {
-        vid.muted = true; /* 回到无声的 RTC 视频呈现 */
+      syncRtcDemand();
+      if (avWanted) resumeVid();
+      else {
+        rtcAudio.pause();
+        if (hlsRequested) { stopHls(); rtcStart(); }
       }
-      avVia = null;
-      showDisplay();
-      if (!pc) rtcStart();
-    } else if (!want && !avOn && !domOn && !domAvOffPending && s.av_available) {
-      /* 影音被关掉后无人恢复的兜底自愈：关 AV 只有 domStart
-         一条路（菜单里根本没有 AV 开关），正常退出 DOM 时
-         restoreAvAfterDom 会开回来；但旧版观看页、标签页在
-         DOM 期间被关掉、bfcache 恢复的页面都不会跑那段恢复
-         ——边缘 AV 就此恒关，pollAv 旧逻辑只对 av:true 反应，
-         用户在界面上没有任何办法把声音开回来（2026-11-20
-         LIU 第六轮实测：生产 /channels 恒 av:false）。视频
-         模式下见到 av 关着且可用，就直接开回去；DOM 模式
-         由 domOn/domAvOffPending 两道闸守住，不与互斥打架 */
-      fch('/channels', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({av:true})}).catch(() => {});
+    }
+    if (avWanted && !domOn && !rtcOn && !pc && !hlsRequested && Date.now() - avWait > 5000) {
+      startHls();
     }
   } catch (e) {}
   setTimeout(pollAv, 2000);
@@ -756,159 +723,69 @@ function restoreMirFocus() {
     }
   } catch (e) {}
 }
-/* 进 DOM 时关影音的 POST 尚未在边缘落定的窗口标记：pollAv 在此
-   期间读到的 av:true 是旧状态，不能当作"菜单开了影音"而退出 DOM
-   （竞态实测：DOM 刚进即被自己的 pollAv 杀掉） */
-let domAvOffPending = false;
 let mirMap = new Map();
-/* ── F-08 模式自适应 ──────────────────────────────────────
-   默认开启：连接建立即起一个 DOM 感知会话（只收快照/差分、
-   不切换显示），每张快照按内容构成裁决显示模式——视频/大
-   区域/大画布为主 → 视频模式；其余（表单、文章、后台页）
-   → DOM 模式。用户手动切换（domBtn/退出）即锁定，锁定到
-   下一次导航（快照 URL 变化）为止；右键菜单可关自动模式 */
-let modeAuto = true, modeLock = false, lastSnapUrl = '';
-/* U03 自适应迟滞：临界比例 + 单快照抖动曾导致视频/DOM 反复横跳
-   （伴随 AV 开关）。自动裁决需持续 3s、且距上次自动切换
-   超过 3s 才执行（每页首次裁决立即生效）；手动锁定仍是最高优先级 */
-let autoWant = null, autoSince = 0, lastAutoSwitch = 0, autoTimer = 0, autoFlips = 0;
+let modeAuto = true, modeLock = false, modePage = '';
+let summaryRequest = 0, summaryPending = null;
+let autoWant = null, autoSince = 0, lastAutoSwitch = 0, autoFlips = 0;
 const AUTO_HOLD_MS = 3000, AUTO_MIN_INTERVAL_MS = 3000, AUTO_MAX_FLIPS = 2;
-function snapStats(tree, vw, vh) {
-  let region = 0, video = 0, canvas = 0, interactive = 0;
-  const walk = (n) => {
-    if (!n || n.t !== undefined) return;
-    const area = n.rect ? n.rect[0] * n.rect[1] : 0;
-    if (n.g === 'VIDEO') { region += area; video += area; }
-    else if (n.g === 'CANVAS') canvas += area;
-    else if (n.x) region += area;
-    if (['INPUT', 'TEXTAREA', 'SELECT', 'BUTTON', 'A'].includes(n.g)) interactive++;
-    for (const c of (n.c || [])) walk(c);
-  };
-  walk(tree);
-  const vp = Math.max(1, (vw || 1280) * (vh || 800));
-  return { region: region / vp, video: video / vp, canvas: canvas / vp, interactive };
+
+function resetAutoMode() {
+  modeLock = false;
+  summaryPending = null;
+  autoWant = null; autoFlips = 0; lastAutoSwitch = 0;
 }
-function onSnapAuto(m) {
-  if (m.url) {
-    if (lastSnapUrl && m.url !== lastSnapUrl) {
-      modeLock = false; /* 导航解锁 */
-      autoWant = null; autoFlips = 0; clearTimeout(autoTimer); /* 导航清零迟滞状态 */
-    }
-    lastSnapUrl = m.url;
-  }
-  if (!modeAuto || modeLock || !m.tree) return;
-  const st = snapStats(m.tree, m.w, m.h);
-  /* 判据口径（dbg35 实测校准）：纯面积阈值分不开「表单页嵌
-     小视频」（≈9%）与「视频页」（≈16%）——太近。改组合判据：
-     视频面积 >10% 且页面几乎没有可交互元素（<3）才算视频页；
-     表单页靠交互密度被救回 DOM，视频页交互稀少维持视频 */
-  const wantDom = !((st.video > 0.10 && st.interactive < 3) || st.region > 0.30 || st.canvas > 0.20);
-  window.__rigAuto = { ...st, wantDom, url: m.url || '' };
-  /* 迟滞按“裁决持续时间”而不是快照个数：静态页只推一次快照，
-     数快照会永远等不到第二次（审查整改引入的回归）。每页首次裁决
-     立即生效；同页内翻转需新裁决持续 AUTO_HOLD_MS 且距上次自动
-     切换 ≥ AUTO_MIN_INTERVAL_MS，期间由定时器复核，不依赖新快照 */
-  const now = Date.now();
+function requestModeSummary() {
+  if (!modeAuto || modeLock || !modePage || ws.readyState !== 1) return;
+  const now = performance.now();
+  if (summaryPending && now - summaryPending.at < 3000) return;
+  const request = ++summaryRequest;
+  summaryPending = {request, at: now};
+  send({type:'mode-summary', request});
+}
+function applyModeSummary(m) {
+  if (!summaryPending || m.request !== summaryPending.request) return;
+  summaryPending = null;
+  if (!modeAuto || modeLock) return;
+  const st = { video:m.videoRatio, region:m.regionRatio, canvas:m.canvasRatio, interactive:m.interactive };
+  const wantDom = m.supported && !((st.video > 0.10 && st.interactive < 3) || st.region > 0.30 || st.canvas > 0.20);
+  window.__rigAuto = {...st, wantDom, url:(hdrState.tabs[hdrState.active]?.url || '')};
+  const now = performance.now();
   const first = autoWant === null;
   if (wantDom !== autoWant) { autoWant = wantDom; autoSince = now; }
-  clearTimeout(autoTimer);
-  const need = first ? 0 : Math.max(AUTO_HOLD_MS - (now - autoSince),
-    AUTO_MIN_INTERVAL_MS - (now - lastAutoSwitch), 0);
-  if (need > 0) { autoTimer = setTimeout(() => onSnapAuto(m), need); return; }
-  /* 每次导航最多自动切 2 次（首判 + 一次校正，如 SPA 先出壳后出视频）：
-     B站/YouTube 的广告、播放器重排会让面积判据在阈值附近来回穿越，
-     不封顶就是「视频/DOM 反复切、画面忽大忽小」；之后交给用户手动 */
-  if (autoFlips >= AUTO_MAX_FLIPS) return;
-  if (wantDom && !domOn) {
-    autoFlips++;
-    lastAutoSwitch = now;
+  if (!first && (now - autoSince < AUTO_HOLD_MS || now - lastAutoSwitch < AUTO_MIN_INTERVAL_MS)) return;
+  if (autoFlips >= AUTO_MAX_FLIPS || wantDom === domOn) return;
+  autoFlips++;
+  lastAutoSwitch = now;
+  if (wantDom) {
     domStart(true); flashHint('自动模式：已切换到 DOM');
-  }
-  else if (!wantDom && domOn) {
-    autoFlips++;
-    lastAutoSwitch = now;
-    exitDomDisplay(); flashHint('自动模式：已切换到视频');
+  } else {
+    domStop(true); flashHint('自动模式：已切换到视频');
   }
 }
-/* 只退显示、不停会话（感知会话留着等下一次导航快照再裁决） */
-/* 退出 DOM 时恢复进 DOM 前的影音开关（domStart 关掉的那次）：
-   本地 avOn 保持 false，pollAv 下一轮看到边缘 av=true 会走
-   既有分支把 avVia 定型并解静音 */
-function restoreAvAfterDom() {
-  if (!avWasOn) return;
-  avWasOn = false;
-  fch('/channels', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({av:true})}).catch(() => {});
-}
-function exitDomDisplay() {
-  if (!domOn) return;
-  domOn = false;
-  wantDomShow = false; syncDomSub(); /* 自动感知订阅保留，见 syncDomSub */  mirFocusId = 0; mirFocusSel = null; mirFocusSig = null;
-  domAvOffPending = false;
-  hideGhost();
-  clearTimeout(domTimer);
-  restoreAvAfterDom();
-  showDisplay();
-  reportSize();
-}
-/* D01：DOM 订阅由“想要方”与“已订阅”两层状态收敛——后台自动感知
-   与前台显示共用一份订阅，重复进入只发一次 START，一方退出而
-   另一方仍需要时不发 STOP。服务端同连接二次幂等兜底。 */
-let domSub = false, wantDomShow = false, wantDomAuto = false;
-function syncDomSub() {
-  const want = wantDomShow || wantDomAuto;
-  if (want && !domSub) { domSub = true; send({type:'dom-start'}); }
-  else if (!want && domSub) { domSub = false; send({type:'dom-stop'}); }
-}
+setInterval(requestModeSummary, 1000);
+
 function domStart(auto) {
-  if (!auto) modeLock = true; /* 手动进入 = 锁定到下次导航 */
-  if (avOn) {
-    if (avVia === 'rtc') {
-      /* U01：RTC 音频与画面解耦——DOM 只藏画面不掐声。不断边缘 AV
-         意图（钉住 av:true，RTC 连通时 HLS 本就不会起），退出 DOM
-         时无需恢复；vid 由 showDisplay 按 domAudio 规则收敛 */
-      domAudio = true;
-      fch('/channels', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({av:true})}).catch(() => {});
-    } else {
-      /* 影音与 DOM 互斥，但用户点了 DOM 即以 DOM 为准：关影音再进
-         （pollAv 反向同理，菜单开影音会退出 DOM）。旧实现静默拒绝，
-         且提示写在视频模式下不可见的 dbar 里——点了等于没反应
-         （2026-11-20 实测定位）。关之前记下开着，退出时恢复。
-         HLS 音频封在合流里、无独立声轨，DOM 下暂无声音（明示）。 */
-      avWasOn = true;
-      fch('/channels', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({av:false})}).catch(() => {});
-      domAvOffPending = true;
-      setTimeout(() => { domAvOffPending = false; }, 6000);
-      avOn = false;
-      if (avVia === 'hls') {
-        vid.pause(); vid.removeAttribute('src'); vid.load();
-        flashHint('HLS 兜底下 DOM 暂无声音（切视频模式听声）');
-      }
-      avVia = null;
-    }
-  }
-  /* 不停 RTC：它现在是 DOM 的优先传输（rig-dom 数据通道）；
-     还没连就顺带拉起，数据先走 WS、通道开后无缝迁移 */
-  if (!pc) rtcStart();
+  if (!auto) modeLock = true;
+  if (domOn) return;
   domOn = true; domSeq = 0; mirMap = new Map();
-  wantDomShow = true; syncDomSub();
+  if (hlsRequested) stopHls();
   showDisplay();
-  reportSize();
+  send({type:'dom-start'});
+  rtcStart();
   setPill('等待快照…');
   clearTimeout(domTimer);
   domTimer = setTimeout(() => { if (domOn && !mirMap.size) domFallback('快照超时'); }, 8000);
 }
 function domStop(silent) {
   if (!domOn) return;
-  if (!silent) modeLock = true; /* 手动退出 = 锁定；静默回退（出错）不锁 */
+  if (!silent) modeLock = true;
   domOn = false;
+  send({type:'dom-stop'});
   mirFocusId = 0; mirFocusSel = null; mirFocusSig = null;
-  domAvOffPending = false;
+  chunkBuf.clear(); chunkBytes = 0;
   hideGhost();
   clearTimeout(domTimer);
-  wantDomShow = false; syncDomSub();
-  restoreAvAfterDom();
   showDisplay();
-  reportSize();
   if (!silent) rtcStart();
 }
 /* 幽灵指针叠加：边缘下发的是页面坐标，减去镜像当前滚动、
@@ -938,12 +815,9 @@ function ghostClient(x, y) {
     const k = mirVW ? r.width / mirVW : 1;
     return { x: r.left + (x - sx) * k, y: r.top + (y - sy) * k };
   }
-  const useVid = avOn || rtcOn;
-  const el = useVid ? vid : cv;
-  const r = el.getBoundingClientRect();
-  const iw = useVid ? (vid.videoWidth || frameW) : frameW;
-  const ih = useVid ? (vid.videoHeight || frameH) : frameH;
-  return { x: r.left + x * r.width / Math.max(1, iw), y: r.top + y * r.height / Math.max(1, ih) };
+  const r = frameRect();
+  return { x: r.left + x * r.width / Math.max(1, cssViewportW),
+           y: r.top + y * r.height / Math.max(1, cssViewportH) };
 }
 const trailPool = [];
 function placeGhost() {
@@ -1100,7 +974,7 @@ function applySnapshot(m) {
   const st = doc.createElement('style'); st.textContent = m.css || ''; head.appendChild(st);
   doc.replaceChild(root, doc.documentElement);
   mir.width = m.w || 1280; mir.height = m.h || 800;
-  mirVW = m.w || 0; mirVH = m.h || 0;
+  mirVW = m.w || cssViewportW; mirVH = m.h || cssViewportH;
   layoutMirror();
   syncAddr(m.url || '');
   attachMirrorInput(doc);
@@ -1166,6 +1040,8 @@ function attachMirrorInput(doc) {
   if (doc.__rigAttached) return;
   doc.__rigAttached = true;
   const cap = { capture: true };
+  doc.addEventListener('pointerdown', resumeVid, cap);
+  doc.addEventListener('keydown', resumeVid, cap);
   const pos = (e) => ({ x: Math.round(e.clientX), y: Math.round(e.clientY) });
   const editable = (t) => t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT' || t.isContentEditable);
   /* 焦点记忆：focusin 记下可编辑目标的 rig id（mirMap 反查，
@@ -1379,6 +1255,7 @@ function renderTabs(st) {
   });
 }
 function applyChromeState(m) {
+  const previous = hdrState;
   hdrState = m;
   window.__rigChrome = m;
   renderTabs(m);
@@ -1388,6 +1265,19 @@ function applyChromeState(m) {
   reloadBtn.title = m.loading ? '停止加载' : '重新加载';
   loadbar.classList.toggle('go', !!m.loading);
   const at = (m.tabs || [])[m.active || 0];
+  const page = m.active + ':' + (at?.url || '');
+  if (!modePage) {
+    modePage = page;
+    requestModeSummary();
+  } else if (page !== modePage || (m.loading && !previous?.loading)) {
+    modePage = page;
+    resetAutoMode();
+    requestModeSummary();
+  }
+  if (previous && (previous.res !== m.res || previous.active !== m.active)) {
+    resizeSent = null;
+    reportSize();
+  }
   syncAddr(at ? at.url : '');
   if (m.find) {
     findbar.classList.add('open');
@@ -1505,13 +1395,10 @@ document.addEventListener('keydown', (e) => {
 if (new URLSearchParams(location.search).get('dom') === '1') {
   ws.addEventListener('open', () => domStart());
 }
-/* F-08：自动模式默认起感知会话（快照到达后由 onSnapAuto 裁决
-   显示模式；视频页保持视频、表单/文章页自动进 DOM） */
-ws.addEventListener('open', () => { if (modeAuto && !wantDomAuto) { wantDomAuto = true; syncDomSub(); } });
-/* 自动播放策略：取消静音时若尚无用户手势，浏览器会把 vid 暂停，
-   画面冻在最后一帧；任何点击/按键即视为手势，在影音面上恢复播放 */
+/* 浏览器阻止有声自动播放时，通过观看者手势恢复音频。 */
 function resumeVid() {
-  if (vid.paused && avVia && vid.style.display !== 'none') vid.play().catch(() => {});
+  if (avWanted && rtcAudio.srcObject && rtcAudio.paused) rtcAudio.play().catch(() => {});
+  if (hlsRequested && vid.paused) vid.play().catch(() => {});
 }
 document.addEventListener('pointerdown', resumeVid, true);
 document.addEventListener('keydown', resumeVid, true);

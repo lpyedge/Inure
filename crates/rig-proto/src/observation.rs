@@ -793,8 +793,7 @@ pub enum AbortReason {
 pub enum ActionResult {
     /// 已执行；`frame_id` 是**动作所基于的校验帧**，不是动作之后的新帧。
     /// 操作与呈现解耦：act 只回答“动作有没有执行”，页面因动作变成什么样
-    /// 由调用方按需 `observe`（带 `since_frame = frame_id` 取增量；页面没变
-    /// 时回空增量、不重新采集）获得。
+    /// 由调用方按需 `observe` 获得。`since_frame` 使用客户端已应用的最后一个观察帧号。
     Done {
         frame_id: FrameId,
         /// 执行附注（如 Upload 目标是单选文件框、多余文件被截断），

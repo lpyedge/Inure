@@ -77,7 +77,8 @@ AI 与 Viewer 永远看不到物理像素。
 
 **不可信。** `content_trust` 在类型上只有 `Untrusted`。见 §11。
 
-**脱敏。** Observer 输出前必须调用 `redact_sensitive()`；图像/视频上用 `sensitive_regions()` 打码。
+**脱敏。** Observer 输出前必须调用 `redact_sensitive()`。AI 截图从完整观察确认敏感元素，
+以截图前后两次 DOM 边框核对绘制遮罩，覆盖 AX 忽略的敏感字段。遮罩使用视觉视口坐标向外取整并覆盖编号。
 
 **动作。** 引用元素（`Target::Element`）或裸坐标（`Target::Point`，仅当前帧有效，用于 canvas/像素兜底）。
 动作必须带 `frame_id`，启用 Lease 后必须带 `LeaseStamp{domain, epoch}`。
@@ -107,12 +108,15 @@ AI 与 Viewer 永远看不到物理像素。
   一致才直接沿用存储帧，省掉整页重采。
 - **快路径只确认、不裁决**：不一致、出错、或不适用（请求帧不是最新、已换文档、目标在子帧会话）
   一律退回整页快照，由原有校验决定接受或拒绝。因此不会多误拒，也不会放过变化。
-- 复核发生在 `scroll_into_view` 之前（滚动后位置本来就会变）。命中/退回次数见 `/health` 的
-  `act_precheck.fast_hit / fast_miss`。
-- **拒绝回包**：被拒原因为页面状态不符（`StaleFrame`、`UnknownElement`、`NotInteractable`、`OutOfBounds`）时，
-  响应在 `result` 之外由边缘附带最新页面状态，调用方不必再补一次 `observe`：请求帧仍在历史池 → `delta`
-  （增量）+ `text`；否则 `observation`（整帧）+ `text`。刚采的帧（<500ms）直接复用，不重采。
-  MCP 在拒绝时多附一个文本块（增量时再附一个 delta 块）。成功、`Aborted`、`PolicyDenied` 不附带。
+- 单元素复核的命中及回退次数见 `/health` 的 `act_precheck.fast_hit / fast_miss`。
+  执行时，主会话元素的新几何中心在视口内，且 `DOM.getNodeForLocation`
+  命中同一 `backendNodeId`，即可沿用该坐标，保留文档代次及接管检查。
+  其余元素沿用捲動和等待重排的路径。
+- **拒绝回包**：`StaleFrame`、`UnknownElement`、`NotInteractable`、`OutOfBounds` 附当前页面状态。
+  请求帧必须是已输出的结构化观察，并满足增量基准条件。否则回整帧。只有本次动作采集的校验帧，
+  在 500 ms 内且分頁、文档、视口仍相符、无后续结构通知时可复用。
+  HTTP 在 `result` 之外附 `text` 和 `delta` 或 `observation`。MCP 在动作结果后附文本和对应 JSON。
+  采集失败时仍回原拒绝原因，并附最新状态未取得的说明。成功、`Aborted`、`PolicyDenied` 仅回动作结果。
 
 ## 7. 人与 AI 的对应
 
@@ -169,7 +173,9 @@ RIG 仍然保留：权限分级（语义 `observe`/`control` 与透明 `cdp_full
 - 元素树：以 AX 树为主，用 `backendNodeId` 关联 DOMSnapshot 取盒模型；`backendNodeId` → `element id` 的映射由 Observer 维护，
   节点销毁后 id **不复用**（对应测试 `element_ids_are_stable_across_frames_and_never_reused`）。
 - 角色规范化：把 Chromium 的角色名映射到 `INTERACTIVE_ROLES` 等词表。
-- iframe：同进程 iframe 在同一棵树；跨进程 iframe（OOPIF）用 `Target.setAutoAttach` 逐会话获取，id 带 frame 前缀。
+- iframe：同进程 iframe 在同一棵树。跨进程 iframe（OOPIF）用
+  `Target.setAutoAttach` 逐会话获取，并把子树挂入持有其 `frameId` 的
+  宿主元素。跨会话匹配会排除子文档自己的根节点。
 - Shadow DOM、新标签页、`Page.javascriptDialogOpening`（弹窗）、下载都需要作为事件处理。
 - 输入：`Input.dispatchMouseEvent` / `dispatchKeyEvent` / `insertText`；坐标用 CSS 像素。点击前再校验一次目标位置。
 - 滚动到视口外元素：先 `DOM.scrollIntoViewIfNeeded` 再点击；这个动作也要走陈旧校验。
@@ -285,24 +291,19 @@ canvas 0%/63,671、100%/5,534；iframe 0%/70,842、0%/37,755。
 很薄的一层，提供 `observe` / `act` / `subscribe`（以及标注读取）。**渲染面向模型的文本时负责不可信内容的分隔与声明（§11）。**
 MCP 不是底层依赖：核心与 Observer 不依赖它。
 
-## 8. 操作与呈现解耦（2026-11-21）
+## 16. 操作与呈现解耦
 
-**原则**：操作（`act`）只回答“动作有没有执行”；页面因此变成什么样是**呈现**，由变化检测驱动，
-人/AI/页面自己引起的变化一视同仁。
-
-- **`act` 不再做动作后整页刷新**。`ActionResult::Done.frame_id` 是**动作所基于的校验帧**（不是动作之后的新帧）。
-  需要新状态时调用方 `observe`，带 `since_frame = Done.frame_id` 取增量。
-- **变化日志**（`changes.rs`）：CDP 读泵里同步把结构类通知（`DOM.attributeModified`/`childNodeInserted`/
-  `childNodeRemoved`/`characterDataModified`/`inlineStyleInvalidated`、`DOM.documentUpdated`、
-  `Page.frameNavigated`/`navigatedWithinDocument` 等）记入有界环形日志；基线被淘汰、变化节点过多按“整页变了”处理。
-  同步写入保证事件先于其后的命令响应被记账，没有异步队列也就没有溢出丢事件。
-- **`observe(since_frame)` 的“没变”判断**：`since_frame` 是最新存储帧，且自该帧采集起 ①主文档没换
-  ②无结构类通知 ③视口（pageX/pageY/宽/高）没变 → 回空增量（`frame_id == base_frame`），**不采集**
-  （`/health` 的 `changes.observe_unchanged` 计数）；否则重新采集并回增量/整帧。不带 `since_frame` 的 observe
-  始终是权威采集。
-- **实测依据**（真 Chromium 156，探针 9 场景）：文字/属性/插入/删除/整页跳转/pushState 都有通知且能定位节点；
-  文字变化表现为“删旧文本节点+插新文本节点”（父节点受影响）；**滚动没有任何通知**（所以另读视口状态）；
-  `Accessibility.nodesUpdated` 在所有条件下都未触发，不使用。
-- **已知盲区**：不改 DOM 的纯视觉变化（CSS 动画、`:hover` 显隐）浏览器不通知，“没通知”只代表 DOM 结构与属性
-  没变。需要最新几何的路径（动作前复核）自己现查；想要权威快照的调用方不带 `since_frame`。
-  局部变化目前仍整页重采（只在“没变/换页”两端省采集）；按节点局部补算留待量测后再做。
+- `act` 执行完即返回。`Done.frame_id` 表示动作所用的校验帧。调用 `observe` 时，`since_frame` 使用
+  客户端最近收到并应用的 `observation.frame_id` 或 `delta.frame_id`。动作内部校验帧单独留作校验。
+- 观察固定当前标签页及其帧树。采集完成后比对标签切换代次、主文档 loader 和视觉视口。发生变化则丢弃候选，
+  在原请求截止时间内重新采集。切走再切回也会产生新的标签切换代次。
+- `mode=tree` 的增量基准来自最近八个已输出的结构化观察。标签代次、主文档、坐标空间和输出投影都要相容。
+  投影涵盖 `include_offscreen`、`subtree` 和 `budget_tokens`。观察树无法由增量完整重建时回整帧。
+- 每次观察都采集候选，包括焦点、布局动画和滚动等可能缺少 CDP 结构通知的变化。投影视图相同则回空增量并推进帧号。
+  `/health` 的 `changes.observe_unchanged` 记录空增量次数。CDP 回包和 AX 节点数组直接移交给采集流程，
+  避免复制整棵树。几何采集复用已固定的主视口原点，子会话读取自身的偏移。结构通知用于文档代次和校验帧复用。
+- 静态页空增量实测（Intel i5-10400、Chromium 156.0.8078.4、本机 HTTP、debug、暖机 5 次后各 50 次，
+  对照 `d9f7361`）。单按钮页 p50/p95 从 1.10/1.94 ms 增至 4.62/5.27 ms，180 行按钮页从
+  1.65/2.08 ms 增至 106.75/109.95 ms。两个场景都回空增量。
+- `changes.rs` 在 CDP 读泵同步记录结构通知，识别根文档导航与校验帧复用条件。会话外的根导航不改变本页文档。
+  Chromium 探针发现文字变化可表现为删旧文本节点和插新节点，滚动没有结构通知，`Accessibility.nodesUpdated` 未触发。

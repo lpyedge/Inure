@@ -76,26 +76,29 @@ impl Cdp {
         tokio::spawn(async move {
             while let Some(Ok(msg)) = stream.next().await {
                 let Message::Text(text) = msg else { continue };
-                let Ok(v) = serde_json::from_str::<Value>(&text) else {
+                let Ok(mut v) = serde_json::from_str::<Value>(&text) else {
                     continue;
                 };
                 if let Some(id) = v.get("id").and_then(Value::as_u64) {
                     let res = if let Some(err) = v.get("error") {
                         Err(format!("CDP 错误: {err}"))
                     } else {
-                        Ok(v.get("result").cloned().unwrap_or(Value::Null))
+                        Ok(v.get_mut("result").map(Value::take).unwrap_or(Value::Null))
                     };
                     if let Some(p) = pending2.lock().await.remove(&id) {
                         let _ = p.tx.send(res);
                     }
                 } else if let Some(method) = v.get("method").and_then(Value::as_str) {
+                    let method = method.to_string();
+                    let session = v
+                        .get("sessionId")
+                        .and_then(Value::as_str)
+                        .map(str::to_string);
+                    let params = v.get_mut("params").map(Value::take).unwrap_or(Value::Null);
                     let ev = CdpEvent {
-                        session: v
-                            .get("sessionId")
-                            .and_then(Value::as_str)
-                            .map(str::to_string),
-                        method: method.to_string(),
-                        params: v.get("params").cloned().unwrap_or(Value::Null),
+                        session,
+                        method,
+                        params,
                     };
                     for t in taps2.lock().unwrap().iter() {
                         t(&ev);
@@ -177,7 +180,11 @@ impl Cdp {
             let mut map = self.pending.lock().await;
             // 在途上限（R-13）：对端僵死时不让 pending 无界增长
             if map.len() >= 512 {
-                return Err(format!("CDP 在途命令过多（{method}）"));
+                // 上层请求总截止可能取消等待，此时接收端已经关闭。
+                map.retain(|_, pending| !pending.tx.is_closed());
+                if map.len() >= 512 {
+                    return Err(format!("CDP 在途命令过多（{method}）"));
+                }
             }
             map.insert(id, Pending { tx });
         }

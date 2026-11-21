@@ -29,7 +29,6 @@ use ffmpeg_next as ff;
 use serde_json::json;
 use str0m::bwe::BweKind;
 use str0m::change::SdpAnswer;
-use str0m::channel::ChannelId;
 use str0m::format::Codec;
 use str0m::media::{Direction, MediaKind, MediaTime, Mid};
 use str0m::net::{Protocol, Receive};
@@ -68,13 +67,10 @@ pub struct RtcHub {
     human: Arc<HumanChannel>,
     au_tx: broadcast::Sender<Arc<Au>>,
     aud_tx: broadcast::Sender<Arc<AudPkt>>,
-    /// 想要媒体的会话数；归零时 feeder 释放编码器、不再编码
-    want: Arc<AtomicUsize>,
-    /// 已 ICE 连通的会话数（M01：HLS 兜底只在归零且用户要 AV 时跑；
-    /// RTC healthy 时默认停 HLS，不三路并行编码）
+    video_want: Arc<AtomicUsize>,
+    audio_want: Arc<AtomicUsize>,
+    /// 已 ICE 连通的会话数，供健康检查读取。
     connected: Arc<AtomicUsize>,
-    /// HLS 策略回调（App 装配时注入；None = 无 HLS，如单测）
-    hls_watch: std::sync::Mutex<Option<std::sync::Weak<crate::media::MediaPipeline>>>,
     /// O01：DC 待发队列当前字节数（跨会话累加，供 /health 观测背压）
     dc_pending_bytes: Arc<AtomicUsize>,
     /// 任一会话请求关键帧（PLI/新连通）即置位，feeder 消费后清零
@@ -116,10 +112,10 @@ impl RtcHub {
             human,
             au_tx,
             aud_tx,
-            want: Arc::new(AtomicUsize::new(0)),
+            video_want: Arc::new(AtomicUsize::new(0)),
+            audio_want: Arc::new(AtomicUsize::new(0)),
             connected: Arc::new(AtomicUsize::new(0)),
             dc_pending_bytes: Arc::new(AtomicUsize::new(0)),
-            hls_watch: std::sync::Mutex::new(None),
             force_key: Arc::new(AtomicBool::new(false)),
             bitrate: Arc::new(AtomicU64::new(START_BITRATE)),
             feeder: std::sync::Mutex::new(None),
@@ -129,13 +125,13 @@ impl RtcHub {
         })
     }
 
-    fn ensure_feeder(&self) {
-        {
+    fn ensure_feeders(&self, tracks: TrackDemand) {
+        if tracks.video {
             let mut slot = self.feeder.lock().unwrap();
             if slot.is_none() {
                 let human = self.human.clone();
                 let au_tx = self.au_tx.clone();
-                let want = self.want.clone();
+                let want = self.video_want.clone();
                 let force_key = self.force_key.clone();
                 let bitrate = self.bitrate.clone();
                 let epoch = self.epoch;
@@ -145,33 +141,33 @@ impl RtcHub {
                     .ok();
             }
         }
-        // 音频 feeder 与视频同启停（同一个 want 计数）：pulse 采集 →
-        // 解码 → 重采样 48k 立体声 → libopus 20ms 一帧广播
-        let mut slot = self.audio_feeder.lock().unwrap();
-        if slot.is_none() {
-            let aud_tx = self.aud_tx.clone();
-            let want = self.want.clone();
-            let epoch = self.epoch;
-            *slot = std::thread::Builder::new()
-                .name("rig-rtc-audio".into())
-                .spawn(move || audio_feeder_loop(want, aud_tx, epoch))
-                .ok();
+        if tracks.audio {
+            let mut slot = self
+                .audio_feeder
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if slot.is_none() {
+                let aud_tx = self.aud_tx.clone();
+                let want = self.audio_want.clone();
+                let epoch = self.epoch;
+                *slot = std::thread::Builder::new()
+                    .name("rig-rtc-audio".into())
+                    .spawn(move || audio_feeder_loop(want, aud_tx, epoch))
+                    .ok();
+            }
         }
-    }
-
-    /// App 装配时注入 HLS 策略：RTC 连通数变化时自动启停兜底编码，
-    /// 把“用户要 AV”（wanted）与“HLS 是否真在跑”（running）分开（M01）
-    pub fn set_hls_policy(&self, media: &Arc<crate::media::MediaPipeline>) {
-        *self.hls_watch.lock().unwrap() = Some(Arc::downgrade(media));
     }
 
     pub fn connected_count(&self) -> usize {
         self.connected.load(Ordering::SeqCst)
     }
 
-    /// O01：想要媒体的会话数（feeder 需求计数，供 /health）
-    pub fn want_count(&self) -> usize {
-        self.want.load(Ordering::SeqCst)
+    pub fn video_want_count(&self) -> usize {
+        self.video_want.load(Ordering::SeqCst)
+    }
+
+    pub fn audio_want_count(&self) -> usize {
+        self.audio_want.load(Ordering::SeqCst)
     }
 
     /// O01：DC 待发队列字节数（供 /health 观测 SCTP 背压）
@@ -179,55 +175,63 @@ impl RtcHub {
         self.dc_pending_bytes.load(Ordering::SeqCst)
     }
 
-    /// RTC 连通数变化时的 HLS 联动（M01）。连通数 >0 → HLS 是多余的
-    /// 并行编码，grace 后停掉（防抖动频繁起停）；归零 → 若用户要 AV
-    /// 立刻起 HLS 兜底。无 HLS（单测）时只记数。
-    fn on_rtc_count_changed(self: &Arc<Self>) {
-        let media = self
-            .hls_watch
-            .lock()
-            .unwrap()
-            .clone()
-            .and_then(|w| w.upgrade());
-        let Some(media) = media else { return };
-        let hub = self.clone();
-        if hub.connected_count() > 0 {
-            // grace：短暂抖动不断 HLS，5s 后仍连通才停
-            tokio::spawn(async move {
-                tokio::time::sleep(crate::media::HLS_RTC_GRACE).await;
-                if hub.connected_count() > 0 {
-                    media.stop_for_rtc().await;
-                }
-            });
-        } else {
-            let hub2 = hub.clone();
-            tokio::spawn(async move {
-                media.start_for_fallback(hub2.connected_count()).await;
-            });
-        }
-    }
-    /// active 是该连接的 transport 标志：RTC 连通置 true（main.rs 停发
-    /// 该连接的 WS 帧），断开/关闭置 false（恢复 WS 帧）。
-    /// 为一条观看连接开 RTC 会话：offer 经 out 推给观看端，answer/candidate
-    /// 由 main.rs 经返回的 handle 喂回。handle 被 drop 即会话终止。
-    pub async fn start_session(
+    /// 轨道可按显示面和音讯设置随时启停，保留连接及数据通道。
+    pub fn start_session(
         self: &Arc<Self>,
         out: mpsc::Sender<String>,
-        active: Arc<AtomicBool>,
         local_ip: IpAddr,
-        dom_rx: Option<broadcast::Receiver<String>>,
-        dom_open: Arc<AtomicBool>,
+        dom_rx: broadcast::Receiver<String>,
+        transport: ViewerTransport,
+        tracks: TrackDemand,
     ) -> SessionHandle {
-        self.ensure_feeder();
         let (cmd_tx, cmd_rx) = mpsc::channel::<Cmd>(8);
         let hub = self.clone();
         tokio::spawn(async move {
-            if let Err(e) = run_session(hub, out, active, local_ip, cmd_rx, dom_rx, dom_open).await
+            if let Err(e) = run_session(hub, out, local_ip, cmd_rx, dom_rx, transport, tracks).await
             {
                 eprintln!("[rtc] 会话异常退出: {e}");
             }
         });
         SessionHandle { cmd: cmd_tx }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub struct TrackDemand {
+    pub video: bool,
+    pub audio: bool,
+}
+
+pub struct ViewerTransport {
+    /// ICE 连通且本观看端选择 RTC 视频时为 true。
+    pub video_active: Arc<AtomicBool>,
+    pub dom_open: Arc<AtomicBool>,
+    pub dom_wanted: Arc<AtomicBool>,
+}
+
+#[derive(Default)]
+struct SessionDemand {
+    video: Option<(crate::human::CaptureLease, WantGuard)>,
+    audio: Option<WantGuard>,
+}
+
+impl SessionDemand {
+    fn update(&mut self, hub: &RtcHub, tracks: TrackDemand) {
+        hub.ensure_feeders(tracks);
+        if tracks.video && self.video.is_none() {
+            self.video = Some((
+                hub.human.request_capture(),
+                WantGuard::new(hub.video_want.clone()),
+            ));
+            hub.force_key.store(true, Ordering::SeqCst);
+        } else if !tracks.video {
+            self.video = None;
+        }
+        if tracks.audio && self.audio.is_none() {
+            self.audio = Some(WantGuard::new(hub.audio_want.clone()));
+        } else if !tracks.audio {
+            self.audio = None;
+        }
     }
 }
 
@@ -238,9 +242,14 @@ pub struct SessionHandle {
 enum Cmd {
     Answer(String),
     Candidate(String),
+    Demand(TrackDemand),
 }
 
 impl SessionHandle {
+    pub async fn set_demand(&self, tracks: TrackDemand) {
+        let _ = self.cmd.send(Cmd::Demand(tracks)).await;
+    }
+
     pub async fn answer(&self, sdp: String) {
         let _ = self.cmd.send(Cmd::Answer(sdp)).await;
     }
@@ -652,27 +661,22 @@ fn dc_chunk_frames(text: &str, next_id: &mut u64) -> Vec<String> {
         .collect()
 }
 
-async fn dom_recv(
-    rx: &mut Option<broadcast::Receiver<String>>,
-) -> Result<String, broadcast::error::RecvError> {
-    match rx {
-        Some(r) => r.recv().await,
-        None => std::future::pending().await,
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
 async fn run_session(
     hub: Arc<RtcHub>,
     out: mpsc::Sender<String>,
-    active: Arc<AtomicBool>,
     local_ip: IpAddr,
     mut cmd_rx: mpsc::Receiver<Cmd>,
-    mut dom_rx: Option<broadcast::Receiver<String>>,
-    dom_open: Arc<AtomicBool>,
+    mut dom_rx: broadcast::Receiver<String>,
+    transport: ViewerTransport,
+    tracks: TrackDemand,
 ) -> Result<(), String> {
-    let _want = WantGuard::new(hub.want.clone());
-    hub.force_key.store(true, Ordering::SeqCst);
+    let ViewerTransport {
+        video_active: active,
+        dom_open,
+        dom_wanted,
+    } = transport;
+    let mut demand = SessionDemand::default();
+    demand.update(&hub, tracks);
     // UDP 必须绑在通告的候选地址上：str0m 以收到包的 destination 与本地
     // 候选匹配，绑通配地址时 destination 是 0.0.0.0，与候选的具体 IP 对
     // 不上，STUN 绑定请求会被静默丢弃、ICE 永远连不通（实测教训）
@@ -727,11 +731,7 @@ async fn run_session(
     );
     // DOM 数据通道：与视频同一份 offer 声明（首条通道生成
     // m=application）。可靠有序正是 DOM 差分流要的语义。
-    let dom_cid: Option<ChannelId> = if dom_rx.is_some() {
-        Some(change.add_channel("rig-dom".to_string()))
-    } else {
-        None
-    };
+    let dom_cid = change.add_channel("rig-dom".to_string());
     let mut dc_open = false;
     let mut dc_chunk_id: u64 = 0;
     // DC 待发帧队列：Channel::write 在 SCTP 发送窗不足时返回
@@ -758,8 +758,7 @@ async fn run_session(
     let mut aud_rx = hub.aud_tx.subscribe();
     let mut buf = vec![0u8; 2048];
     let mut deadline = Instant::now() + Duration::from_millis(50);
-    // M01：本会话是否处于 ICE 连通（hub 连通计数的增减据此配对，
-    // 驱动 HLS 兜底的启停）
+    // 用本会话的 ICE 状态配对 hub 连通计数的增减。
     let mut connected_here = false;
     'session: loop {
         tokio::select! {
@@ -790,11 +789,15 @@ async fn run_session(
                         Err(e) => eprintln!("[rtc] candidate 解析失败: {e}"),
                     }
                 }
+                Some(Cmd::Demand(tracks)) => {
+                    demand.update(&hub, tracks);
+                    active.store(connected_here && tracks.video, Ordering::SeqCst);
+                }
                 None => break 'session,
             },
             a = au_rx.recv() => {
                 if let Ok(au) = a {
-                    if rtc.is_connected() {
+                    if demand.video.is_some() && rtc.is_connected() {
                         if let (Some(pt), Some(w)) = (pt, rtc.writer(mid)) {
                             let _ = w.write(pt, Instant::now(), MediaTime::from_90khz(au.pts90), au.data.clone());
                         }
@@ -803,7 +806,7 @@ async fn run_session(
             }
             a2 = aud_rx.recv() => {
                 if let Ok(pkt) = a2 {
-                    if rtc.is_connected() {
+                    if demand.audio.is_some() && rtc.is_connected() {
                         if let (Some(ap), Some(w)) = (aud_pt, rtc.writer(aud_mid)) {
                             // 48k 采样计数 → 微秒（str0m 按流时钟重标度）
                             let micros = pkt.pts48 * 1_000_000 / 48_000;
@@ -812,12 +815,12 @@ async fn run_session(
                     }
                 }
             }
-            d = dom_recv(&mut dom_rx) => {
+            d = dom_rx.recv() => {
                 // 通道开着才收；Lagged（订阅掉队）直接丢——观看端会
                 // 从 seq 缺口发 dom-resync 自行收敛，与视频关键帧同理。
                 // 收下只入队：实际发送在每轮循环末尾的排空段（发送窗
                 // 不足时 write 会拒绝，必须留队重试，不能在此直发）
-                if dc_open {
+                if dc_open && dom_wanted.load(Ordering::SeqCst) {
                     if let Ok(text) = d {
                         // T01：入队即做有界检查，旧代次整体丢弃 + 请求重同步
                         let now = Instant::now();
@@ -844,13 +847,11 @@ async fn run_session(
                     Event::IceConnectionStateChange(
                         IceConnectionState::Connected | IceConnectionState::Completed,
                     ) => {
-                        active.store(true, Ordering::SeqCst);
+                        active.store(demand.video.is_some(), Ordering::SeqCst);
                         hub.force_key.store(true, Ordering::SeqCst);
-                        // M01：首个连通会话把 HLS 兜底停掉（grace 防抖）
                         if !connected_here {
                             connected_here = true;
                             hub.connected.fetch_add(1, Ordering::SeqCst);
-                            hub.on_rtc_count_changed();
                         }
                         let _ = out.try_send(
                             json!({"type": "rtc-state", "state": "connected"}).to_string(),
@@ -861,17 +862,15 @@ async fn run_session(
                     // Disconnected 只切回 WS 帧兜底，会话保留待恢复
                     Event::IceConnectionStateChange(IceConnectionState::Disconnected) => {
                         active.store(false, Ordering::SeqCst);
-                        // M01：连通数归零 → 若用户要 AV 立刻起 HLS 兜底
                         if connected_here {
                             connected_here = false;
                             hub.connected.fetch_sub(1, Ordering::SeqCst);
-                            hub.on_rtc_count_changed();
                         }
                         let _ = out.try_send(
                             json!({"type": "rtc-state", "state": "disconnected"}).to_string(),
                         );
                     }
-                    Event::ChannelOpen(id, _) if Some(id) == dom_cid => {
+                    Event::ChannelOpen(id, _) if id == dom_cid => {
                         dc_open = true;
                         dom_open.store(true, Ordering::SeqCst);
                         // 缓冲排空事件作排空段的唤醒源（事件本身落默认臂，
@@ -881,7 +880,7 @@ async fn run_session(
                         }
                         eprintln!("[rtc] rig-dom 数据通道已打开，DOM 改走 DC");
                     }
-                    Event::ChannelClose(id) if Some(id) == dom_cid => {
+                    Event::ChannelClose(id) if id == dom_cid => {
                         dc_open = false;
                         dom_open.store(false, Ordering::SeqCst);
                         eprintln!("[rtc] rig-dom 数据通道关闭，DOM 回落 WS");
@@ -913,36 +912,36 @@ async fn run_session(
         // 该帧起留队等下一轮；窗随对端消费持续打开，循环的超时唤醒
         // 保证重试节奏。首版在此处直发并丢弃返回值，分片在窗满后
         // 被静默丢光（快照永远拼不齐，2026-11-20 实测）
-        if dc_open {
-            if let Some(cid) = dom_cid {
-                // T01：队首驻留超时说明消费端已跟不上，整队视为旧代次
-                if dc_pending.evict_stale(Instant::now()) {
-                    request_resync(&out, &mut last_resync, Instant::now());
-                }
-                while let Some(front) = dc_pending.front() {
-                    let accepted = match rtc.channel(cid) {
-                        Some(mut ch) => ch.write(false, front.as_bytes()),
-                        None => Ok(false),
-                    };
-                    match accepted {
-                        Ok(true) => {
-                            dc_pending.pop();
-                        }
-                        _ => break,
-                    }
-                }
-                // O01：背压 gauge（排空后）
-                hub.dc_pending_bytes
-                    .store(dc_pending.bytes(), Ordering::SeqCst);
+        if !dom_wanted.load(Ordering::SeqCst) {
+            dc_pending.clear();
+            hub.dc_pending_bytes.store(0, Ordering::SeqCst);
+        } else if dc_open {
+            // T01：队首驻留超时说明消费端已跟不上，整队视为旧代次
+            if dc_pending.evict_stale(Instant::now()) {
+                request_resync(&out, &mut last_resync, Instant::now());
             }
+            while let Some(front) = dc_pending.front() {
+                let accepted = match rtc.channel(dom_cid) {
+                    Some(mut ch) => ch.write(false, front.as_bytes()),
+                    None => Ok(false),
+                };
+                match accepted {
+                    Ok(true) => {
+                        dc_pending.pop();
+                    }
+                    _ => break,
+                }
+            }
+            // O01：背压 gauge（排空后）
+            hub.dc_pending_bytes
+                .store(dc_pending.bytes(), Ordering::SeqCst);
         }
     }
     active.store(false, Ordering::SeqCst);
     dom_open.store(false, Ordering::SeqCst);
-    // M01：连通中结束的会话同样减数（归零则 HLS 兜底接管）
+    // 连通中结束的会话也归还连通计数。
     if connected_here {
         hub.connected.fetch_sub(1, Ordering::SeqCst);
-        hub.on_rtc_count_changed();
     }
     let _ = out.try_send(json!({"type": "rtc-state", "state": "closed"}).to_string());
     Ok(())

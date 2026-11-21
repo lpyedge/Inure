@@ -1,17 +1,15 @@
-//! AI 通道核心：把全部会话的无障碍树拼成一帧 rig-proto Observation。
+//! AI 通道核心：把当前标签页及子帧会话的无障碍树拼成一帧 rig-proto Observation。
 //!
 //! 蓝图（G1 定调）：ab 式全量紧凑快照（不过滤视口）、稳定且不复用的元素 id、
 //! 跨进程 iframe 坐标合成、确定性剪枝、渲染前脱敏。本模块只做"观察"，
 //! 动作在 ai.rs。
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 
-use rig_proto::observation::{
-    Element, ElementState, Observation, ObservationSource, Origin, Space,
-};
+use rig_proto::observation::{BBox, Element, ElementState, Observation, ObservationSource, Origin};
 use serde_json::Value;
 
-use crate::browser::Browser;
+use crate::browser::{Browser, ViewState};
 use crate::cdp::CdpResult;
 
 /// (会话, 节点键) → 稳定元素 id。id 只增不复用。
@@ -101,11 +99,106 @@ fn frame_scope(
     scope
 }
 
+#[derive(PartialEq)]
+pub struct ScreenshotMasks {
+    pub sessions: HashSet<String>,
+    pub regions: BTreeMap<(String, i64), BBox>,
+}
+
+/// 在观测的会话范围内复核 DOM 声明的敏感节点，包括 AX 忽略的节点。
+/// 跨进程子帧用祖先宿主的边框保守遮盖，避免仅靠平移近似 CSS 变换。
+pub async fn screenshot_masks(
+    browser: &Browser,
+    main: &str,
+    visual_offset: [f32; 2],
+) -> CdpResult<ScreenshotMasks> {
+    let (scope, sessions) = {
+        let map = browser.sessions.lock().await;
+        if !map.contains_key(main) {
+            return Err("截图会话已分离".into());
+        }
+        let mut scope = frame_scope(&map, main);
+        scope.retain(|session| {
+            map.get(session)
+                .is_some_and(|info| matches!(info.target_type.as_str(), "page" | "iframe"))
+        });
+        let mut sessions = Vec::new();
+        for session in &scope {
+            if session == main {
+                continue;
+            }
+            let mut owner = session.as_str();
+            loop {
+                let parent = map
+                    .get(owner)
+                    .and_then(|info| info.parent.as_deref())
+                    .ok_or("截图子帧无宿主会话")?;
+                if parent == main {
+                    break;
+                }
+                owner = parent;
+            }
+            sessions.push((session.clone(), owner.to_string()));
+        }
+        (scope, sessions)
+    };
+    let to_visual = |b: [f32; 4]| {
+        BBox([
+            b[0] - visual_offset[0],
+            b[1] - visual_offset[1],
+            b[2] - visual_offset[0],
+            b[3] - visual_offset[1],
+        ])
+    };
+    let root = browser.dom_map(main).await?;
+    let mut masks = BTreeMap::new();
+    for (&node, (_, attrs, _)) in &root {
+        if sensitive_state(attrs).is_some() {
+            masks.insert(
+                (main.to_string(), node),
+                to_visual(browser.border_bounds(main, node).await?),
+            );
+        }
+    }
+    let mut host_bounds = HashMap::new();
+    for (session, owner) in sessions {
+        let dom = browser.dom_map(&session).await?;
+        let sensitive: Vec<i64> = dom
+            .iter()
+            .filter_map(|(&node, (_, attrs, _))| sensitive_state(attrs).map(|_| node))
+            .collect();
+        if sensitive.is_empty() {
+            continue;
+        }
+        let bounds = if let Some(bounds) = host_bounds.get(&owner) {
+            *bounds
+        } else {
+            let frame = browser.root_frame_id(&owner).await?;
+            let (&host, _) = root
+                .iter()
+                .find(|(_, (_, _, id))| id.as_deref() == Some(frame.as_str()))
+                .ok_or("无法确认敏感子帧的遮罩位置")?;
+            let bounds = to_visual(browser.border_bounds(main, host).await?);
+            host_bounds.insert(owner, bounds);
+            bounds
+        };
+        for node in sensitive {
+            masks.insert((session.clone(), node), bounds);
+        }
+    }
+    Ok(ScreenshotMasks {
+        sessions: scope,
+        regions: masks,
+    })
+}
+
 /// 构建一帧 Observation。第三个返回值是**部分采集警告**
 /// （R-12）：次级 frame 采集失败不再静默吞掉，调用方必须把
 /// 警告呈现给观察者；主 frame 失败直接返回 Err
 pub async fn build_observation(
     browser: &Browser,
+    main: &str,
+    view: ViewState,
     ids: &mut IdMap,
     frame_id: u64,
 ) -> CdpResult<(Observation, LocateMap, Vec<String>)> {
@@ -114,14 +207,14 @@ pub async fn build_observation(
     let t_all = std::time::Instant::now();
     let (cdp_calls0, cdp_us0) = browser.cdp.call_stats();
     let (quads_n0, quads_us0) = crate::metrics::global().quads.totals();
-    let main = browser.main().await?;
-    let (vw, vh, dpr) = browser.layout(&main).await?;
+    let space = view.space;
+    let (vw, vh) = (space.width, space.height);
 
     // 只收集主页面会话及其 OOPIF 后代的数据：其他顶层标签的会话
     // 不进快照（多标签时 AI 看到的必须与人当前看的标签一致）
     let session_ids: Vec<String> = {
         let map = browser.sessions.lock().await;
-        let scope = frame_scope(&map, &main);
+        let scope = frame_scope(&map, main);
         map.iter()
             .filter(|(sid, info)| {
                 (info.target_type == "page" || info.target_type == "iframe") && scope.contains(*sid)
@@ -134,7 +227,7 @@ pub async fn build_observation(
     let t_axdom = std::time::Instant::now();
     for sid in session_ids {
         let nodes = match browser.ax_tree(&sid).await {
-            Ok(v) => v.as_array().cloned().unwrap_or_default(),
+            Ok(nodes) => nodes,
             Err(e) => {
                 if sid == main {
                     return Err(format!("主 frame AX 采集失败: {e}"));
@@ -154,14 +247,19 @@ pub async fn build_observation(
             warnings.push(format!("frame {sid} 的 DOM 映射失败（{e}），位置可能缺失"));
             Default::default()
         });
-        let root_frame = browser.root_frame_id(&sid).await.unwrap_or_else(|e| {
-            warnings.push(format!("frame {sid} 的根帧 id 获取失败（{e}）"));
-            Default::default()
-        });
         let placed = sid == main;
-        // 批量几何（R-16）：一次 DOMSnapshot 替代逐节点 quads；
-        // 失败得空表，建树时自然回落
-        let geom = browser.geometry_map(&sid).await;
+        let root_frame = if placed {
+            String::new()
+        } else {
+            browser.root_frame_id(&sid).await.unwrap_or_else(|e| {
+                warnings.push(format!("frame {sid} 的根帧 id 获取失败（{e}）"));
+                Default::default()
+            })
+        };
+        // The pinned root view already has the scroll origin; each child
+        // session still needs its own origin to map its layout rectangles.
+        let origin = placed.then_some(view.page_origin);
+        let geom = browser.geometry_map(&sid, origin).await;
         sessions.push(SessionData {
             session: sid,
             nodes,
@@ -188,13 +286,7 @@ pub async fn build_observation(
                 if !sessions[j].placed {
                     continue;
                 }
-                let owner = sessions[j]
-                    .dom
-                    .iter()
-                    .find(|(_, (_, _, fid))| {
-                        fid.as_deref() == Some(sessions[i].root_frame.as_str())
-                    })
-                    .map(|(b, _)| *b);
+                let owner = frame_owner_backend(&sessions[j].dom, &sessions[i].root_frame);
                 if let Some(backend) = owner {
                     // 批量几何表优先，未覆盖回落逐节点 quads（R-16）
                     let q = match sessions[j].geom.get(&backend) {
@@ -237,12 +329,12 @@ pub async fn build_observation(
             continue;
         }
         for other in &sessions {
-            if let Some((backend, _)) = other
-                .dom
-                .iter()
-                .find(|(_, (_, _, fid))| fid.as_deref() == Some(sd.root_frame.as_str()))
-            {
-                host_of.insert(sd.session.clone(), (other.session.clone(), *backend));
+            // The child document's own HTML node may carry the same frame ID.
+            if other.session == sd.session {
+                continue;
+            }
+            if let Some(backend) = frame_owner_backend(&other.dom, &sd.root_frame) {
+                host_of.insert(sd.session.clone(), (other.session.clone(), backend));
                 break;
             }
         }
@@ -251,7 +343,7 @@ pub async fn build_observation(
     // 组装：主会话根为顶层；子会话根嫁接进宿主 iframe 元素（只嫁接一次，
     // 此前的实现同时又把子根追加到顶层，造成整棵子树出现两遍）；
     // 找不到宿主或宿主元素不在树中的，退回顶层追加，保证内容不丢。
-    let mut top: Vec<Element> = roots_by_session.remove(&main).unwrap_or_default();
+    let mut top: Vec<Element> = roots_by_session.remove(main).unwrap_or_default();
     let mut graft: HashMap<(String, i64), Vec<Element>> = HashMap::new();
     for (sid, roots) in roots_by_session {
         if let Some(host) = host_of.get(&sid) {
@@ -271,15 +363,7 @@ pub async fn build_observation(
         }
     }
 
-    let mut obs = Observation::new(
-        frame_id,
-        ObservationSource::Cdp,
-        Space {
-            width: vw,
-            height: vh,
-            scale: dpr,
-        },
-    );
+    let mut obs = Observation::new(frame_id, ObservationSource::Cdp, space);
     obs.elements = top;
     scrub(&mut obs.elements);
     obs.redact_sensitive();
@@ -298,6 +382,13 @@ pub async fn build_observation(
         });
     }
     Ok((obs, locate, warnings))
+}
+
+fn frame_owner_backend(dom: &crate::browser::DomMap, frame_id: &str) -> Option<i64> {
+    dom.iter().find_map(|(&backend, (tag, _, frame))| {
+        (!matches!(tag.as_str(), "#document" | "html") && frame.as_deref() == Some(frame_id))
+            .then_some(backend)
+    })
 }
 
 fn graft_into(
@@ -469,20 +560,8 @@ pub(crate) fn element_core(
         }
     }
     // 敏感判定走 DOM 属性（AX 不直接给密码标志）
-    if let Some(attrs) = dom_attrs {
-        let ty = attrs
-            .get("type")
-            .map(|s| s.to_lowercase())
-            .unwrap_or_default();
-        let ac = attrs
-            .get("autocomplete")
-            .map(|s| s.to_lowercase())
-            .unwrap_or_default();
-        if ty == "password" {
-            states.push(ElementState::Password);
-        } else if ac.contains("cc-") || ac.contains("one-time-code") {
-            states.push(ElementState::Sensitive);
-        }
+    if let Some(state) = dom_attrs.and_then(sensitive_state) {
+        states.push(state);
     }
     if let Some(q) = quad {
         let b = [
@@ -505,6 +584,17 @@ pub(crate) fn element_core(
         }
     }
     el
+}
+
+fn sensitive_state(attrs: &HashMap<String, String>) -> Option<ElementState> {
+    if attrs
+        .get("type")
+        .is_some_and(|value| value.eq_ignore_ascii_case("password"))
+    {
+        return Some(ElementState::Password);
+    }
+    let ac = attrs.get("autocomplete")?.to_ascii_lowercase();
+    (ac.contains("cc-") || ac.contains("one-time-code")).then_some(ElementState::Sensitive)
 }
 
 /// 确定性剪枝：无名、无值、不可交互的 generic 壳折叠（子节点上提）。
@@ -753,6 +843,7 @@ fn render_node(e: &Element, depth: usize, out: &mut String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rig_proto::observation::Space;
 
     fn el(role: &str, name: Option<&str>) -> Element {
         let mut e = Element::new(format!("x{}", role.len()), role, Origin::A11y);

@@ -22,6 +22,8 @@ use serde_json::Value;
 pub enum Hit {
     /// 换文档/换页/路由变化：之前的一切定位都不可信，需整页重采。
     Document,
+    /// 导航替换了这个会话的根文档。
+    Navigation,
     /// 若干节点（CDP nodeId，会话内）的子树或自身变了。
     Nodes(Vec<i64>),
 }
@@ -31,6 +33,13 @@ pub fn classify(method: &str, params: &Value) -> Option<Hit> {
     let id = |k: &str| params.get(k).and_then(Value::as_i64);
     match method {
         "DOM.documentUpdated" | "Page.navigatedWithinDocument" => Some(Hit::Document),
+        "Page.frameNavigated" if params.get("frame").is_some() => {
+            if params.pointer("/frame/parentId").is_none() {
+                Some(Hit::Navigation)
+            } else {
+                Some(Hit::Document)
+            }
+        }
         "Page.frameNavigated" => Some(Hit::Document),
         "DOM.attributeModified"
         | "DOM.attributeRemoved"
@@ -130,7 +139,7 @@ impl ChangeLog {
         let mut nodes: Vec<(String, i64)> = Vec::new();
         for e in g.log.iter().filter(|e| e.seq > mark) {
             match &e.hit {
-                Hit::Document => return Change::Document,
+                Hit::Document | Hit::Navigation => return Change::Document,
                 Hit::Nodes(ids) => {
                     for n in ids {
                         let key = (e.session.clone(), *n);
@@ -149,6 +158,28 @@ impl ChangeLog {
         } else {
             Change::Nodes(nodes)
         }
+    }
+
+    /// 同一 loader 可能经前进/后退缓存重新激活，仍以根导航划分文档代次。
+    pub fn root_navigated_since(&self, mark: u64, session: &str) -> bool {
+        let g = self.inner.lock().unwrap();
+        mark < g.floor
+            || g.log.iter().any(|entry| {
+                entry.seq > mark && entry.session == session && entry.hit == Hit::Navigation
+            })
+    }
+
+    /// 辅助识别截图期间发生又恢复、前后 DOM 几何相同的结构变化。
+    pub fn changed_in_sessions_since(
+        &self,
+        mark: u64,
+        sessions: &std::collections::HashSet<String>,
+    ) -> bool {
+        let g = self.inner.lock().unwrap();
+        mark < g.floor
+            || g.log
+                .iter()
+                .any(|entry| entry.seq > mark && sessions.contains(&entry.session))
     }
 }
 
@@ -194,6 +225,13 @@ mod tests {
         );
         assert_eq!(
             classify("Page.frameNavigated", &json!({"frame": {"id": "F"}})),
+            Some(Hit::Navigation)
+        );
+        assert_eq!(
+            classify(
+                "Page.frameNavigated",
+                &json!({"frame": {"id": "sub", "parentId": "F"}})
+            ),
             Some(Hit::Document)
         );
         assert_eq!(
@@ -236,6 +274,17 @@ mod tests {
         log.record("s1", Hit::Document);
         log.record("s1", Hit::Nodes(vec![2]));
         assert_eq!(log.since(m), Change::Document);
+    }
+
+    #[test]
+    fn root_navigation_tracks_only_the_requested_session() {
+        let log = ChangeLog::new(16, 8);
+        let mark = log.mark();
+        log.record("background", Hit::Navigation);
+        log.record("active", Hit::Document);
+        assert!(!log.root_navigated_since(mark, "active"));
+        log.record("active", Hit::Navigation);
+        assert!(log.root_navigated_since(mark, "active"));
     }
 
     #[test]

@@ -14,9 +14,9 @@ use std::sync::Arc;
 use base64::Engine;
 use ffmpeg_next as ff;
 use serde_json::{json, Value};
-use tokio::sync::{broadcast, mpsc, Mutex};
+use tokio::sync::{broadcast, mpsc, watch, Mutex};
 
-use crate::browser::Browser;
+use crate::browser::{ActivePage, Browser};
 use crate::chrome::{self, ChromeState, FindState, ResMode, TabView};
 use crate::exec::ExecControl;
 
@@ -90,19 +90,40 @@ impl LazyRgb {
 /// 最近合成帧的共享槽：帧本体（可能尚未解码）+ 合成时刻（F-04 的 Arc 共享）
 type LastRgbSlot = Arc<std::sync::Mutex<Option<(Arc<LazyRgb>, std::time::Instant)>>>;
 
+#[derive(Clone, Default)]
+struct CaptureDemand {
+    page: Option<ActivePage>,
+    consumers: usize,
+}
+
+/// 整页画面的消费者持有到连接、视频轨或播放请求失效为止。
+pub struct CaptureLease(watch::Sender<CaptureDemand>);
+
+impl CaptureLease {
+    fn acquire(sender: &watch::Sender<CaptureDemand>) -> Self {
+        sender.send_modify(|demand| demand.consumers += 1);
+        Self(sender.clone())
+    }
+}
+
+impl Drop for CaptureLease {
+    fn drop(&mut self) {
+        self.0.send_modify(|demand| demand.consumers -= 1);
+    }
+}
+
 pub struct HumanChannel {
     browser: Arc<Browser>,
     exec: Arc<ExecControl>,
     running: AtomicBool,
-    /// 正在看 WS JPEG 帧流的连接数（F-03 需求记账）：观看端按
-    /// 其真实显示模式经 jpeg-demand 消息增减，RTC/DOM 模式不计
-    jpeg_demand: Arc<std::sync::atomic::AtomicUsize>,
-    frames: broadcast::Sender<FrameMsg>,
+    capture: watch::Sender<CaptureDemand>,
+    controls: Mutex<Option<Arc<AtomicBool>>>,
+    view_switch: Mutex<()>,
+    frames: broadcast::Sender<(ActivePage, FrameMsg)>,
     /// 带外 JSON 消息（接管提示、打印就绪等），main.rs 合并进 WS 出站
     notices: broadcast::Sender<String>,
     last_size: Arc<Mutex<(u32, u32)>>,
-    last_frame: Arc<Mutex<Option<FrameMsg>>>,
-    /// 最近一帧的合成后 RGB（进程内编码层的帧源，与 last_frame 同步更新）；
+    /// 最近一帧的合成后 RGB（进程内编码层的帧源）；
     /// 同时记合成时刻——RTC 编码层以它为该帧的采集时间打时间戳
     /// （音视频共享纪元对齐，见 rtc.rs）。帧以 Arc 不可变共享
     /// 传递（F-04）：RTC feeder 每帧取用不再整帧克隆（1280×800
@@ -114,9 +135,6 @@ pub struct HumanChannel {
     /// 内容帧贴图一律以它为底、不在上次合成结果上叠加，避免旧位置残影
     /// 合成帧序号：每次 last_rgb 更新即递增，编码层据此判断画面是否变化
     rgb_seq: Arc<std::sync::atomic::AtomicU64>,
-    /// 最近的原始页面帧（JPEG 字节）：chrome 状态变化时重合成用
-    last_raw: Arc<Mutex<Option<Arc<Vec<u8>>>>>,
-    pump: Mutex<Option<Arc<AtomicBool>>>,
     chrome: Arc<Mutex<ChromeState>>,
     /// 当前观看的页面会话
     view_session: Arc<Mutex<Option<String>>>,
@@ -341,16 +359,15 @@ impl HumanChannel {
             browser,
             exec,
             running: AtomicBool::new(false),
-            jpeg_demand: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            capture: watch::Sender::new(CaptureDemand::default()),
+            controls: Mutex::new(None),
+            view_switch: Mutex::new(()),
             frames,
             notices,
             last_size: Arc::new(Mutex::new((0, 0))),
-            last_frame: Arc::new(Mutex::new(None)),
             last_rgb: Arc::new(std::sync::Mutex::new(None)),
             full_base: Arc::new(std::sync::Mutex::new(None)),
             rgb_seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            last_raw: Arc::new(Mutex::new(None)),
-            pump: Mutex::new(None),
             chrome: Arc::new(Mutex::new(ChromeState::default())),
             view_session: Arc::new(Mutex::new(None)),
             dom_press: AtomicBool::new(false),
@@ -502,7 +519,7 @@ impl HumanChannel {
         }
     }
 
-    pub fn subscribe(&self) -> broadcast::Receiver<FrameMsg> {
+    pub fn subscribe(&self) -> broadcast::Receiver<(ActivePage, FrameMsg)> {
         self.frames.subscribe()
     }
 
@@ -528,11 +545,6 @@ impl HumanChannel {
             .map(|(_, at)| at.elapsed().as_secs_f64() * 1000.0)
     }
 
-    /// 最近一帧（新观看者连上时立即回放当前画面）
-    pub async fn last_frame(&self) -> Option<FrameMsg> {
-        self.last_frame.lock().await.clone()
-    }
-
     /// 最近一帧的合成后 RGB（编码层在自己的线程里同步取用；
     /// Arc 共享，取用不拷贝像素）
     pub fn last_rgb(&self) -> Option<(Arc<image::RgbImage>, std::time::Instant)> {
@@ -541,27 +553,55 @@ impl HumanChannel {
         Some((lazy.get()?, at))
     }
 
-    /// F-03 需求记账：一个连接进入/离开 WS 帧流显示模式时调用
-    pub fn jpeg_demand_add(&self, delta: i32) {
-        if delta > 0 {
-            self.jpeg_demand.fetch_add(delta as usize, Ordering::SeqCst);
-        } else if delta < 0 {
-            // 钳到 0 的饱和减（CAS 循环）：记账漂移时宁可多编
-            // 一帧，不漏编黑屏
-            let n = delta.unsigned_abs() as usize;
-            let mut cur = self.jpeg_demand.load(Ordering::SeqCst);
-            while cur > 0 {
-                match self.jpeg_demand.compare_exchange_weak(
-                    cur,
-                    cur.saturating_sub(n),
-                    Ordering::SeqCst,
-                    Ordering::SeqCst,
-                ) {
-                    Ok(_) => break,
-                    Err(v) => cur = v,
-                }
-            }
+    pub fn request_capture(&self) -> CaptureLease {
+        CaptureLease::acquire(&self.capture)
+    }
+
+    /// 按连接补静态首帧，且只交付同一分頁、文档和视口的图像。
+    pub async fn first_frame(&self) -> Option<(ActivePage, FrameMsg)> {
+        let page = self.browser.active_page().await.ok()?;
+        let frame = self.capture_viewport(&page).await?;
+        Some((page, frame))
+    }
+
+    async fn capture_viewport(&self, page: &ActivePage) -> Option<FrameMsg> {
+        use base64::engine::general_purpose::STANDARD;
+        let session = &page.session;
+        let loader = self.browser.loader_id(session).await.ok()?;
+        let view = self.browser.view_state(session).await.ok()?;
+        let max_width = 1920.0 / (view.space.width * view.space.scale);
+        let max_height = 1200.0 / (view.space.height * view.space.scale);
+        let image = self
+            .browser
+            .cdp
+            .call(
+                Some(session),
+                "Page.captureScreenshot",
+                json!({
+                    "format": "jpeg", "quality": 60, "fromSurface": true,
+                    "clip": {
+                        "x": view.page_origin[0], "y": view.page_origin[1],
+                        "width": view.space.width, "height": view.space.height,
+                        "scale": view.visual_scale.min(max_width).min(max_height),
+                    },
+                }),
+            )
+            .await
+            .ok()?;
+        if self.browser.view_state(session).await.ok()? != view
+            || self.browser.loader_id(session).await.ok()? != loader
+            || &self.browser.active_page().await.ok()? != page
+            || !self.is_running()
+        {
+            return None;
         }
+        let jpeg = STANDARD.decode(image.get("data")?.as_str()?).ok()?;
+        let (width, height) = jpeg_dims(&jpeg)?;
+        Some(FrameMsg {
+            jpeg,
+            width,
+            height,
+        })
     }
 
     /// 合成帧序号（与 last_rgb 同步递增；编码层比对序号决定是否编码新帧）
@@ -620,41 +660,79 @@ impl HumanChannel {
 
     // ── 启停与帧泵 ──────────────────────────────────────────
 
-    pub async fn start(self: &Arc<Self>) -> Result<(), String> {
-        if self.running.swap(true, Ordering::SeqCst) {
-            return Ok(()); // 已在运行
-        }
-        // 初始化失败必须复位 running（GPT review R-17）
-        let res = self.start_inner().await;
-        if res.is_err() {
-            self.running.store(false, Ordering::SeqCst);
-        }
-        res
+    /// 只有这个任务启动、停止或更换整页采集。
+    pub fn manage_capture(self: &Arc<Self>) {
+        let mut request = self.capture.subscribe();
+        let weak = Arc::downgrade(self);
+        tokio::spawn(async move {
+            let mut pump: Option<(ActivePage, tokio::task::JoinHandle<()>)> = None;
+            loop {
+                let demand = request.borrow_and_update().clone();
+                let wanted = demand.page.filter(|_| demand.consumers != 0);
+                let Some(human) = weak.upgrade() else {
+                    break;
+                };
+                if pump
+                    .as_ref()
+                    .is_some_and(|(page, task)| wanted.as_ref() != Some(page) || task.is_finished())
+                {
+                    if let Some((page, task)) = pump.take() {
+                        task.abort();
+                        let _ = task.await;
+                        human.clear_capture_cache().await;
+                        let _ = human
+                            .browser
+                            .cdp
+                            .call(Some(&page.session), "Page.stopScreencast", json!({}))
+                            .await;
+                    }
+                }
+                if pump.is_none() {
+                    if let Some(page) = wanted {
+                        match human.start_frame_pump(page.clone()).await {
+                            Ok(task) => pump = Some((page, task)),
+                            Err(e) => eprintln!("整页采集启动失败: {e}"),
+                        }
+                    }
+                }
+                drop(human);
+                if request.changed().await.is_err() {
+                    break;
+                }
+            }
+            if let Some((_, task)) = pump {
+                task.abort();
+            }
+        });
     }
 
-    async fn start_inner(self: &Arc<Self>) -> Result<(), String> {
-        let main = self.browser.main().await?;
-        *self.view_session.lock().await = Some(main.clone());
-        // 先订阅 CDP 事件再开投屏：静态页面的首帧若在帧泵订阅前到达
-        // 会无人 ack，投屏就此停摆（实测 AV 静态音调页中招）
-        let pump_rx = self.browser.cdp.subscribe();
-        self.start_screencast(&main).await?;
-        let flag = Arc::new(AtomicBool::new(true));
-        *self.pump.lock().await = Some(flag.clone());
+    async fn clear_capture_cache(&self) {
+        *self.last_size.lock().await = (0, 0);
+        *self
+            .last_rgb
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        *self
+            .full_base
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    }
 
-        // 帧泵：只收当前观看会话的 screencast 帧，合成后广播
-        {
+    async fn start_frame_pump(
+        self: &Arc<Self>,
+        page: ActivePage,
+    ) -> Result<tokio::task::JoinHandle<()>, String> {
+        // 订阅先于 start，确保静态页的唯一一帧能收到并 ACK。
+        let mut rx = self.browser.cdp.subscribe();
+        self.start_screencast(&page.session).await?;
+        let task = {
             let browser = self.browser.clone();
             let frames = self.frames.clone();
             let last_size = self.last_size.clone();
-            let last_frame = self.last_frame.clone();
             let last_rgb = self.last_rgb.clone();
             let full_base = self.full_base.clone();
             let rgb_seq = self.rgb_seq.clone();
-            let last_raw = self.last_raw.clone();
-            let view_session = self.view_session.clone();
-            let flag = flag.clone();
-            let mut rx = pump_rx;
+            let weak = Arc::downgrade(self);
             tokio::spawn(async move {
                 // 帧分类状态（整页基准尺寸 / 内容帧贴图矩形缓存 /
                 // 基准滚动位）：观看会话切换即复位——新会话的
@@ -666,7 +744,6 @@ impl HumanChannel {
                 // 过滤掉的）：重定基准的唯一前提是页面上根本没有媒体元素
                 let mut gate_has_media = false;
                 let mut gate_scroll = (0i64, 0i64);
-                let mut gate_view: Option<String> = None;
                 // 页面当前视口缓存（缩型整页帧重定基准用，500ms
                 // 内不重复 eval）
                 let mut gate_vp = (0u32, 0u32);
@@ -688,10 +765,8 @@ impl HumanChannel {
                 if full_only {
                     eprintln!("[pump] RIG_PUMP_FULL_ONLY=1：内容帧全部丢弃，只用整页帧");
                 }
+                let mut seeded = false;
                 loop {
-                    if !flag.load(Ordering::SeqCst) {
-                        break;
-                    }
                     let mut ev = match tokio::time::timeout(
                         std::time::Duration::from_millis(500),
                         rx.recv(),
@@ -699,8 +774,33 @@ impl HumanChannel {
                     .await
                     {
                         Ok(Ok(ev)) => ev,
-                        Ok(Err(_)) => break,
+                        Ok(Err(broadcast::error::RecvError::Lagged(_))) => continue,
+                        Ok(Err(broadcast::error::RecvError::Closed)) => break,
                         Err(_) => {
+                            if gate_full == (0, 0) && !seeded {
+                                seeded = true;
+                                if let Some(human) = weak.upgrade() {
+                                    if let Some(frame) = human.capture_viewport(&page).await {
+                                        gate_full = (frame.width, frame.height);
+                                        *last_size.lock().await = gate_full;
+                                        let lazy = LazyRgb::lazy(
+                                            Arc::new(frame.jpeg.clone()),
+                                            (frame.width & !1, frame.height & !1),
+                                        );
+                                        let slot = Some((lazy, std::time::Instant::now()));
+                                        *last_rgb
+                                            .lock()
+                                            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                                            slot.clone();
+                                        *full_base
+                                            .lock()
+                                            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                                            slot;
+                                        rgb_seq.fetch_add(1, Ordering::SeqCst);
+                                        let _ = frames.send((page.clone(), frame));
+                                    }
+                                }
+                            }
                             // O01 定期汇总点（500ms 排水超时节拍）
                             if last_summary.elapsed() >= std::time::Duration::from_secs(30) {
                                 last_summary = std::time::Instant::now();
@@ -719,19 +819,10 @@ impl HumanChannel {
                             continue;
                         }
                     };
-                    let cur_view = view_session.lock().await.clone();
                     if ev.method != "Page.screencastFrame"
-                        || ev.session.as_deref() != cur_view.as_deref()
+                        || ev.session.as_deref() != Some(&page.session)
                     {
                         continue;
-                    }
-                    if gate_view != cur_view {
-                        gate_view = cur_view.clone();
-                        gate_full = (0, 0);
-                        gate_rects.clear();
-                        gate_rects_for = (0, 0);
-                        gate_scroll = (0, 0);
-                        gate_vp = (0, 0);
                     }
                     // 排水到最新：合成跟不上截屏生产时，队列里的
                     // 旧帧只有延迟没有信息量（画面已被新帧覆盖）。
@@ -740,7 +831,7 @@ impl HumanChannel {
                     // （本订阅只服务帧泵，其他子系统有各自的订阅）
                     while let Ok(next) = rx.try_recv() {
                         if next.method == "Page.screencastFrame"
-                            && next.session.as_deref() == cur_view.as_deref()
+                            && next.session.as_deref() == Some(&page.session)
                         {
                             // 被替换掉的候选帧计入丢弃（F-09 丢帧率）
                             crate::metrics::global()
@@ -789,7 +880,6 @@ impl HumanChannel {
                     // 尺寸以 JPEG 自身为准（见 jpeg_dims）：元数据只用于滚动/缩放
                     let (w, h) = jpeg_dims(&raw).unwrap_or((w, h));
                     let raw = Arc::new(raw);
-                    *last_raw.lock().await = Some(raw.clone());
                     // ── 帧分类（2026-11-20 LIU 实测「视频不停跳
                     // 全屏/小屏」定因）：Chromium screencast 在视频
                     // 播放页会交替发出两种帧——整页帧（视口尺寸）
@@ -801,7 +891,7 @@ impl HumanChannel {
                     // 元素随之忽满忽小。现按尺寸分流：
                     // 整页帧（宽高都达到基准 90%）走原路径并把
                     // RGB 归一化到基准尺寸（整页帧自身也有几像素
-                    // 的高度变体）；内容帧不广播、不改 last_frame，
+                    // 的高度变体）；内容帧不广播整页 JPEG，
                     // 解码后按 video/canvas 的视口矩形贴回最近
                     // 整页 RGB——编码层从此只见恒定尺寸的整页帧，
                     // 视频内容仍以内容帧的节奏更新。
@@ -1025,11 +1115,9 @@ impl HumanChannel {
                     // 不再合成进像素）。WS 帧流直接透传 screencast
                     // 的原始 JPEG（零重编码、无代际损耗）；解码出
                     // 的 RGB 只供 RTC/HLS 进程内编码层取用。
-                    // 透传后广播零成本，F-03 的需求记账对帧泵已
-                    // 无意义：每帧都记 last_frame 并广播——静态页
-                    // 面 + 新连接靠 last_frame 回放立刻有画面（旧
-                    // 实现靠同步循环重合成的副产物喂 last_frame，
-                    // 第五期删合成后必须在这里显式保住）。
+                    if browser.active_page().await.as_ref() != Ok(&page) {
+                        continue;
+                    }
                     if w > 0 && h > 0 {
                         crate::metrics::global()
                             .pump_full
@@ -1039,8 +1127,7 @@ impl HumanChannel {
                             width: w,
                             height: h,
                         };
-                        *last_frame.lock().await = Some(msg.clone());
-                        let _ = frames.send(msg);
+                        let _ = frames.send((page.clone(), msg));
                         crate::metrics::global()
                             .frames_sent
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1053,8 +1140,31 @@ impl HumanChannel {
                     *full_base.lock().unwrap() = slot;
                     rgb_seq.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 }
-            });
+            })
+        };
+        Ok(task)
+    }
+
+    pub async fn start(self: &Arc<Self>) -> Result<(), String> {
+        let mut controls = self.controls.lock().await;
+        if controls.is_some() {
+            return Ok(());
         }
+        let page = self.browser.active_page().await?;
+        // 首位观看者可能在第一次巡检前点开弹窗，启动时先记下已有标签。
+        let initial_tabs: Vec<String> = self
+            .browser
+            .page_targets()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(id, _, _)| id)
+            .collect();
+        *self.view_session.lock().await = Some(page.session.clone());
+        let flag = Arc::new(AtomicBool::new(true));
+        *controls = Some(flag.clone());
+        self.running.store(true, Ordering::SeqCst);
+        self.capture.send_modify(|demand| demand.page = Some(page));
 
         // 标签/导航状态刷新：标题、URL、前进后退、载入态。
         // 第五期起状态变化不再重合成帧，而是推 chrome-state
@@ -1068,8 +1178,8 @@ impl HumanChannel {
             let flag = flag.clone();
             let human = self.clone();
             tokio::spawn(async move {
-                let mut known_ids: Vec<String> = Vec::new();
-                let mut tab_order: Vec<String> = Vec::new();
+                let mut tab_order = initial_tabs.clone();
+                let mut known_ids = initial_tabs;
                 let mut last_sent = 0u64;
                 let mut stale_ticks = 0u32;
                 let mut last_activate =
@@ -1133,6 +1243,7 @@ impl HumanChannel {
                         view_target
                     };
                     if targets.len() > 1
+                        && human.capture.borrow().consumers > 0
                         && (appeared || stale_ticks >= 2)
                         && last_activate.elapsed() >= std::time::Duration::from_secs(3)
                         && browser.is_self_launched().await
@@ -1207,25 +1318,19 @@ impl HumanChannel {
     }
 
     pub async fn stop(&self) -> Result<(), String> {
-        if !self.running.swap(false, Ordering::SeqCst) {
-            return Ok(());
-        }
-        if let Some(flag) = self.pump.lock().await.take() {
+        let mut controls = self.controls.lock().await;
+        if let Some(flag) = controls.take() {
             flag.store(false, Ordering::SeqCst);
         }
-        if let Some(session) = self.view_session.lock().await.clone() {
-            let _ = self
-                .browser
-                .cdp
-                .call(Some(&session), "Page.stopScreencast", json!({}))
-                .await;
-        }
+        self.running.store(false, Ordering::SeqCst);
+        self.capture.send_modify(|demand| demand.page = None);
         Ok(())
     }
 
     // ── 观看标签切换 ────────────────────────────────────────
 
     async fn switch_view(&self, target_id: &str) -> Result<(), String> {
+        let _switch = self.view_switch.lock().await;
         // 新标签的会话经 auto-attach 出现，可能要等一拍
         let mut session = None;
         for _ in 0..20 {
@@ -1236,36 +1341,20 @@ impl HumanChannel {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
         let session = session.ok_or_else(|| format!("标签 {target_id} 无会话"))?;
-        let old = self.view_session.lock().await.replace(session.clone());
-        // AI 通道跟随活动标签：观察/动作对象 = 人正在看的页面
+        *self.view_session.lock().await = Some(session.clone());
         self.browser.set_main(&session).await;
-        if old.as_deref() != Some(session.as_str()) {
-            if let Some(old) = old {
-                let _ = self
-                    .browser
-                    .cdp
-                    .call(Some(&old), "Page.stopScreencast", json!({}))
-                    .await;
-            }
-            self.start_screencast(&session).await?;
-        }
         let _ = self.browser.activate_target(target_id).await;
-        // 静态页（刚开出来、已在前台）激活不会触发重绘，screencast 起了却一帧
-        // 不来，观看端就是旧画面。截一张小图强制出一次合成帧。
-        let _ = self
-            .browser
-            .cdp
-            .call(
-                Some(&session),
-                "Page.captureScreenshot",
-                json!({"format": "jpeg", "quality": 1}),
-            )
-            .await;
         // 当前分辨率模式落到新标签
         let res = self.chrome.lock().await.res;
         if let ResMode::Fixed(w, h) = res {
             let _ = self.browser.set_viewport(&session, w, h).await;
         }
+        let page = self.browser.active_page().await?;
+        self.capture.send_modify(|demand| {
+            if demand.page.is_some() {
+                demand.page = Some(page);
+            }
+        });
         Ok(())
     }
 
@@ -1313,9 +1402,17 @@ impl HumanChannel {
                 }
             }
             "resize" => {
-                let w = v.get("w").and_then(Value::as_u64).unwrap_or(0) as u32;
-                let h = v.get("h").and_then(Value::as_u64).unwrap_or(0) as u32;
-                self.resize(w, h).await;
+                let size = |key| {
+                    v.get(key)
+                        .and_then(Value::as_u64)
+                        .and_then(|n| u32::try_from(n).ok())
+                        .unwrap_or(0)
+                };
+                if let Some((w, h)) = self.resize(size("w"), size("h")).await {
+                    let request = v.get("request").and_then(Value::as_u64);
+                    let msg = json!({"type": "viewport", "request": request, "cssWidth": w, "cssHeight": h});
+                    let _ = out.send(msg.to_string()).await;
+                }
             }
             "chrome" => {
                 // 第五期：原生工具栏的显式命令（导航/标签/寻找/
@@ -1527,30 +1624,29 @@ impl HumanChannel {
         }
     }
 
-    async fn resize(&self, w: u32, h: u32) {
-        if w == 0 || h == 0 {
-            return;
+    async fn applied_viewport(&self, session: &str) -> Option<(u32, u32)> {
+        let size = self
+            .browser
+            .eval_json(session, "[window.innerWidth, window.innerHeight]")
+            .await
+            .ok()?;
+        let dimension = |i: usize| u32::try_from(size.get(i)?.as_u64()?).ok();
+        Some((dimension(0)?, dimension(1)?))
+    }
+
+    async fn resize(&self, w: u32, h: u32) -> Option<(u32, u32)> {
+        let _switch = self.view_switch.lock().await;
+        let session = self.view().await.ok()?;
+        let applied = self.applied_viewport(&session).await;
+        if w == 0 || h == 0 || self.chrome.lock().await.res != ResMode::Auto {
+            return applied;
         }
-        let res = self.chrome.lock().await.res;
-        if res == ResMode::Auto {
-            let (w, h) = (w.clamp(320, 2560), h.clamp(240, 1600));
-            // 观看端会周期性重报尺寸（防一次丢失让远端视口卡在旧尺寸、
-            // 视频被缩小显示）：视口已一致就不重复设，免得无谓重排
-            let Ok(session) = self.view().await else {
-                return;
-            };
-            if let Ok(Value::Array(a)) = self
-                .browser
-                .eval_json(&session, "[window.innerWidth, window.innerHeight]")
-                .await
-            {
-                let g = |i: usize| a.get(i).and_then(Value::as_u64).unwrap_or(0) as u32;
-                if (g(0), g(1)) == (w, h) {
-                    return;
-                }
-            }
-            let _ = self.browser.set_viewport(&session, w, h).await;
+        let (w, h) = (w.clamp(320, 2560), h.clamp(240, 1600));
+        if applied == Some((w, h)) {
+            return applied;
         }
+        let _ = self.browser.set_viewport(&session, w, h).await;
+        self.applied_viewport(&session).await
     }
 
     // ── chrome 命令（第五期：观看页原生工具栏的显式命令） ──
@@ -1942,6 +2038,18 @@ fn decode_jpeg_rgb(raw: &[u8]) -> Option<image::RgbImage> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn capture_demand_is_released_once_per_consumer() {
+        let demand = watch::Sender::new(CaptureDemand::default());
+        let first = CaptureLease::acquire(&demand);
+        let second = CaptureLease::acquire(&demand);
+        assert_eq!(demand.borrow().consumers, 2);
+        drop(first);
+        assert_eq!(demand.borrow().consumers, 1);
+        drop(second);
+        assert_eq!(demand.borrow().consumers, 0);
+    }
 
     /// LazyRgb：同一帧只解码一次，并按目标尺寸归一化（奇数边取偶）
     #[test]
