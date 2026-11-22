@@ -28,7 +28,7 @@ RIG 的**瀏覽器邊緣程序**：一個 Rust 二進位，與目標 Chromium �
 |---|---|---|
 | 人（同機） | 觀看頁 | `rig-edge-browser --url https://example.com` 後開 `http://127.0.0.1:39871/`：視頻/DOM 雙模式觀看與操作、原生 header、音視頻（HLS/RTC）都在這一頁 |
 | AI（同機） | MCP stdio | 智能體以子進程拉起 `rig-edge-browser --stdio`，JSON-RPC 協議見 §7；observe/act/screenshot 三工具 |
-| AI（局域網/遠程直連） | HTTP | `rig-edge-browser --listen 0.0.0.0:39871 --token <令牌>`（非回環無令牌拒絕啟動，見 §6）；`POST /observe`、`/act`、`/screenshot` |
+| AI（局域網/遠程直連） | HTTP | `rig-edge-browser --listen 0.0.0.0:39871 --token <令牌>`（非回環無令牌拒絕啟動，見 §6）；`POST /observe`、`/act`、`/screenshot.png`（Bearer 啟動令牌） |
 | 人+AI 協作 | 同時在線 | AI 通道與人通道可並存：交互模型（待命/執行/強制接管）見 §7.1，人隨時可接管 |
 
 四種形態共用同一份感知與動作語義（§10），差別只在傳輸與前端外殼。
@@ -114,11 +114,14 @@ platform/arch——版本取 product 的真實完整版本，UA 串裡的是約�
 | `--no-ai` | — | AI 通道預設關閉（運行時仍可經 `/channels` 開啟） |
 | `--human` | — | 人通道預設開啟（不給則預設關閉，觀看頁無畫面） |
 | `--av` | — | 預設允許 HLS 播放，首個有效播放列表請求啟動合流 |
-| `--token <secret>` | 環境變數 `RIG_EDGE_TOKEN` | 直連鑑權令牌（見 §6） |
+| `--token <secret>` | 環境變數 `RIG_EDGE_TOKEN` | **對外提供 HTTP 時必設**（空值視同未設），由啟動程序隨機生成並傳入；見 §6 |
+| `--embed-origin <origin[,…]>` | — | 允許內嵌觀看頁的宿主來源；未給則禁止任何內嵌（見 §6.1） |
 | `--tls-cert <path>` / `--tls-key <path>` | — | HTTPS 服務（須成對給）；檔案缺失時自動生成自簽名證書（SAN 含 localhost、127.0.0.1 與綁定 host），私鑰以 0600 原子建立落盤復用。**非回環監聽強制 TLS**（LIU 2026-11-20 裁定，整改第二期）：未給證書時自動生成自簽名（`~/.rig-edge/self-signed.{crt,key}`）並顯著提示——DOM 通道承載頁面欄位值，其安全性由傳輸加密保證（R-07 處置）；僅回環監聽可明文 |
 | `--stdio` | — | MCP stdio 前端模式（見 §7） |
 | `--profile-dir <path>` | 環境變數 `RIG_EDGE_PROFILE_DIR`；未給 = 一次性臨時目錄 | **持久化目錄**（LIU 2026-11-20 定）：Chromium 用戶數據目錄。登入態、Cookie、LocalStorage / IndexedDB / Session Storage、Service Worker 與 Cache Storage、保存的密碼、擴展、已安裝應用、站點權限全在其中——邊緣重啟原樣續用，**整目錄搬到新環境重部署即可無損打開之前的網站**。密碼存儲固定 `--password-store=basic`：OSCrypt 密鑰隨 profile 的 Local State 走，新機器可解密；用宿主 keyring 則密鑰不跟目錄走、遷移即全滅。同一目錄同一時間只能被一個邊緣使用（Chromium 單例鎖）。PWAs 的系統層快捷方式不在目錄內、需在新環境重建，應用數據本身隨目錄走 |
 | `--cache-dir <path>` | 環境變數 `RIG_EDGE_CACHE_DIR`；未給 = profile 內 | 可棄緩存目錄：Chromium 磁盤緩存（HTTP / 媒體）經 `--disk-cache-dir` 放到這裡，與 profile 分開存、遷移時可不帶。GPU / 著色器等小緩存無官方分離參數、仍留在 profile 內（體積小、可自愈重建） |
+
+**臨時目錄清理**（LIU 2026-11-22）：未專門指定的目錄（沒給 `--profile-dir` 的一次性 profile `<tmp>/rig-edge-<pid>`、沒給 `--cache-dir` 的上傳目錄 `<tmp>/rig-edge-<pid>-uploads`）在 Chromium 關閉**之後**於退出時刪除（HTTP / stdio 兩模式、SIGINT / SIGTERM / stdin 關閉同）；專門指定的目錄一律不動。SIGKILL 與崩潰無法兜底，會留下殘餘。
 
 持久化與停機口徑：邊緣收到 SIGINT / SIGTERM 時先請 Chromium 以 `Browser.close` **落盤關閉**再退出（HTTP 與 stdio 兩模式同）——強殺（SIGKILL）會丟掉最近未提交的 Cookie / Local Storage 寫入（IT 實測：數秒前的寫入被整組強殺即丟失，IndexedDB 因事務即時提交幸免）。部署側停機請用 TERM 而非 KILL。集成測試 `edge_profile_persistence` 驗證：寫入 Cookie / LocalStorage / IndexedDB → SIGTERM 優雅停機（附落盤實據斷言）→ 同雙目錄重啟 → 三值全數恢復。
 
@@ -143,17 +146,38 @@ platform/arch——版本取 product 的真實完整版本，UA 串裡的是約�
 從 `/channels` 重開後，觀看端需重新連線。AV 關閉時合流管線停機。三通道全關時僅控制介面可用。
 閘門在 HTTP 與 MCP 兩個前端一致生效。
 
-## 6. 直連鑑權（提交 `26dc971`）
+## 6. 直連鑑權（LIU 2026-11-22 重做，見 `docs/HARDENING_PLAN_2026-11-22.md`）
 
-- 設了令牌（`--token` 或 `RIG_EDGE_TOKEN`）後，除 `/health` 外所有 HTTP 路由
-  （含 `/ws` 升級與 `/stream`）都要求憑證，二選一：
-  `Authorization: Bearer <token>` 標頭，或 `?token=<token>` 查詢參數
-  （觀看頁與瀏覽器原生媒體元素無法設標頭，故保留查詢參數通道）。
-- 觀看頁從自身 URL 讀令牌，自動透傳給 WS、`/channels` 與影音流請求；
-  HLS 播放列表中的相對分片位址由服務端改寫、逐條補上 `?token=`
-  （相對 URL 解析不繼承查詢串，`#EXT-X-MAP` 的 init 段同樣處理）。
-- **綁非回環位址且未設令牌 → 啟動即以退出碼 2 拒絕啟動**（fail-closed）；
-  位址解析失敗按非回環處理。綁回環且無令牌允許（本機直連場景）。
+- **啟動令牌必設**：只要對外提供 HTTP（純 HTTP 模式，或 `--stdio --human`），
+  `--token` / `RIG_EDGE_TOKEN` 缺失或為空即以退出碼 2 拒絕啟動。令牌由**啟動程序隨機生成並傳入**，
+  換令牌 = 換值重啟。非回環監聽強制 TLS（未給證書則自簽）。
+- **令牌只走 `Authorization: Bearer` 頭與換票請求的 body，URL 中不再接受任何令牌。**
+- **路由拆分**：
+  - Viewer 路由：`/`、`/viewer.js`、`/auth.js`、`/health`、`/ready`、`POST /session`、
+    `POST /session/refresh`、`/channels`、`/print.pdf`、`/stream/*`、`/ws`。
+  - AI 路由：`/observe`、`/act`、`/screenshot.png`，**僅純 HTTP 模式掛載**；
+    `--stdio` 模式下 AI 只能走 MCP，本機其他進程無法經 HTTP 繞過 AI 閘門。
+- **換票**：`POST /session` body `{"token": <啟動令牌>}` → `access`（15 分鐘）+ `refresh`
+  （無時限）+ `stream_key`。`POST /session/refresh` body `{"refresh": …}` 換新一對，
+  **舊 refresh 立即作廢**（輪換，被盜用時真假雙方必有一方失效）。viewer 在 access 將過期時
+  自動靜默續期，無登入時長。票據只存內存，**進程重啟即全部失效**。
+- **憑證權限**：Viewer 路由認 access 票據（或啟動令牌）；AI 路由只認啟動令牌，access 不得調用。
+- **WebSocket**：瀏覽器 WS 無法設請求頭，連上後須在 3 秒內以首幀
+  `{"type":"auth","access":…}` 認證，否則斷開；非瀏覽器客戶端可在升級請求帶 Bearer 頭。
+- **媒體流**：HLS 由原生 `<video src>` 請求，無法帶頭。`/stream/{stream_key}/{rend}/{name}` 用路徑中的
+  隨機 `stream_key`（只讀、僅限 `/stream`，登入後才下發），播放列表的相對分片位址自然繼承該前綴。
+  這是「令牌不入 URL」的唯一例外，且該鑰匙不具備任何控制能力。
+
+### 6.1 觀看頁的兩種打開方式與第三方內嵌
+
+- **獨立打開**：訪問 `https://host:port/`，顯示令牌輸入頁，輸入啟動令牌後進入。
+- **內嵌 iframe**（智能體自身的 web UI）：
+  1. 啟動邊緣時用 `--embed-origin https://agent.example`（逗號分隔多個）聲明允許的宿主來源；
+     服務端據此設 `Content-Security-Policy: frame-ancestors …`，**未配置則禁止任何內嵌**。
+  2. 宿主頁面嵌入 `<iframe src="https://edge-host:port/">`，iframe 載入後向父頁發
+     `{type:"rig-ready"}`；宿主回覆 `iframe.contentWindow.postMessage({type:"rig-auth", token}, edgeOrigin)`，
+     viewer 只接受來自 `window.parent` 的該消息，自動換票進入，無需人工操作。
+  3. https 的宿主頁面不能內嵌 http 的 viewer（混合內容）；自簽證書需用戶先在瀏覽器信任一次。
 
 ## 7. MCP stdio 前端（提交 `4bf5d08`）
 
@@ -162,7 +186,7 @@ platform/arch——版本取 product 的真實完整版本，UA 串裡的是約�
 AI 操作全走 stdio；人要看畫面時加 `--human`，HTTP 觀看頁並行提供。
 
 - **stdout 只寫協議幀**；所有提示與診斷走 stderr，不得污染協議流。
-- 方法：`initialize`（回顯客戶端 `protocolVersion`，缺省 `2025-03-26`；
+- 方法：`initialize`（協商 `protocolVersion`：客戶端版本在 2025-06-18／2025-03-26／2024-11-05 內則回同版本，否則回 2025-06-18；
   `serverInfo.name = "rig-edge-browser"`）、`ping`、`tools/list`、`tools/call`；
   無 `id` 的通知不回覆；未知方法回 `-32601`。
 - 工具（與 HTTP 語義一一對應，共用同一 AiChannel 與通道閘門）：
@@ -728,11 +752,13 @@ HTTP act 點擊後 ghost 到達且落點在目標中心 40px 內。
 動作，邊緣經 CDP `DOM.setFileInputFiles` 直接給文件輸入框餵文件。
 
 **協議**：rig-proto 新增 `Action::Upload { target, files: Vec<String> }`，
-與其他動作同走幀號陳舊校驗與執行期語義。`files` 是**邊緣主機上的路徑**
-（個人受信工具口徑：能持有邊緣令牌即可信；AI 與邊緣同機是常態部署）。
+與其他動作同走幀號陳舊校驗與執行期語義。`files` 是**邊緣主機上、上傳根目錄內的路徑**：
+根目錄為 `<cache-dir>/uploads/`；未給 `--cache-dir` 時用本進程的一次性臨時目錄 `<tmp>/rig-edge-<pid>-uploads`（LIU 2026-11-22；實際路徑啟動時打印到 stderr）；相對路徑按該根解析，絕對路徑須落在其內。
+路徑先 `canonicalize` 再判斷，`..` 穿越與符號鏈接逃逸一律以 `policy_denied` 拒絕，交給 Chromium 的是規範化後的路徑。
+人要給 AI 傳文件，把文件放進該目錄即可。
 
 **校驗與錯誤**：目標元素須為 `<input type="file">`（否則拒絕
-`not_file_input`）；每個路徑須存在且為普通文件（`file_not_found`）；
+`not_file_input`）；每個路徑須在上傳根目錄內（否則 `policy_denied`）、存在且為普通文件（`file_not_found`）；
 文件數 ≤ 20、單文件 ≤ 200 MiB（`file_too_large`）。三者是
 RejectReason 的正式代碼（非 PolicyDenied 文案）。`multiple` 屬性
 缺失且給多文件時只取第一個，並在 `ActionResult::Done` 的可選
@@ -749,7 +775,7 @@ JSON 加字段向後兼容。
 AI 通道的 Upload 或站點自身的其他入口。
 
 **測試**：集成測試 `edge_upload_action` 覆蓋正例（頁面 change
-收到文件名:大小）、兩負例（`not_file_input`/`file_not_found` 按碼
+收到文件名:大小）、負例（`not_file_input`/`file_not_found`/目錄外 `policy_denied` 按碼
 斷言）與單選截斷（Done.note 註明、頁面只收到第一個文件）；
 rig-proto 單元測試鎖定 upload/新拒絕碼/Done.note 的線格式。
 
@@ -836,7 +862,7 @@ rig-proto 單元測試鎖定 upload/新拒絕碼/Done.note 的線格式。
 | `edge_browser_end_to_end` | 登入流程全鏈：observe → 填表 → 點擊 → 歡迎語斷言；iframe 內表單；陳舊幀拒絕 |
 | `edge_text_keys_clipboard` | 文本鍵入、組合鍵（Ctrl+A/C/V 跨框複製）、IME 整段送入 |
 | `edge_av_and_image_clipboard` | HLS 雙版本播放列表與分片、440Hz 音調非靜音驗證、圖片剪貼板雙向（尺寸驗證） |
-| `edge_token_auth` | 非回環無令牌拒絕啟動、無憑證 401、Bearer 與 `?token=` 雙通道放行、播放列表令牌改寫 |
+| `edge_token_auth` | 無令牌拒絕啟動、令牌只認 Bearer（URL 令牌 401）、換票、access 不得調 AI 路由、refresh 輪換與舊票重放 401、靜態殼免令牌 |
 | `edge_stdio_mcp_and_attach` | MCP：initialize/tools/list/observe/act/screenshot 全流程 + stdin EOF 正常退出；掛靠：`--cdp-url` 連現成 Chromium、邊緣退出後瀏覽器存活 |
 | `edge_chrome_ui_and_takeover` | chrome UI：地址欄導航、後退、菜單尋找條、標籤新建/關閉；Point 越界與陳舊幀拒絕；執行期遮蔽 + 強制接管（在途 act 回 Aborted{UserTakeover}、頁面動作未落地） |
 | `edge_dom_channel` | DOM 通道全鏈：快照建成、val/add/scr 差分、seq 嚴格遞增、resync 收斂；DOM 模式幽靈指針下發與落點；canvas 子流幀（節點 id 對應、PNG data URL）；同源 iframe 內容經 f 子樹進快照、內嵌突變觸發重同步 |

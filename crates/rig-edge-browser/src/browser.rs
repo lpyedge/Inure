@@ -219,6 +219,12 @@ async fn http_get_json(url: &str) -> CdpResult<Value> {
     serde_json::from_str(body).map_err(|e| format!("DevTools JSON 解析失败: {e}"))
 }
 
+/// 未给 --profile-dir 时的一次性 profile 目录（本进程专属；退出时由
+/// main 清理）
+pub fn temp_profile_dir() -> std::path::PathBuf {
+    std::env::temp_dir().join(format!("rig-edge-{}", std::process::id()))
+}
+
 impl Browser {
     pub async fn launch(
         chromium: Option<&str>,
@@ -248,7 +254,7 @@ impl Browser {
                 let _ = std::fs::create_dir_all(&p);
                 p
             }
-            None => std::env::temp_dir().join(format!("rig-edge-{}", std::process::id())),
+            None => temp_profile_dir(),
         };
         let cache_arg = cache_dir.map(|d| {
             let _ = std::fs::create_dir_all(d);

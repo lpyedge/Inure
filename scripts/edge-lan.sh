@@ -58,7 +58,8 @@ echo $! >"$ROOT/.temp/edge-lan.pid"
 sleep 2
 if curl -sk "https://$IP:$PORT/health" | grep -q '"ok":true'; then
   echo "OK  pid=$(cat "$ROOT/.temp/edge-lan.pid") pa_pid=$(cat "$RUN/daemon.pid" 2>/dev/null)"
-  echo "URL: https://$IP:$PORT/?token=$TOKEN"
+  echo "URL: https://$IP:$PORT/   （打开后在输入页填令牌，令牌不进 URL）"
+  echo "TOKEN: $TOKEN"
   echo "停：kill $(cat "$ROOT/.temp/edge-lan.pid") $(cat "$RUN/daemon.pid" 2>/dev/null)"
 else
   echo "edge 未就绪，看 $ROOT/.temp/edge-lan.log"

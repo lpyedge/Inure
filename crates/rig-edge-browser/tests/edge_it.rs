@@ -100,12 +100,28 @@ fn serve(listener: TcpListener, pages: Vec<(String, String)>) -> u16 {
     port
 }
 
+/// 测试用启动令牌：spawn_edge 默认注入，http/ws 辅助函数默认带上
+const TEST_TOKEN: &str = "it-token";
+
 fn http(port: u16, method: &str, path: &str, body: Option<&str>) -> (u16, Vec<u8>) {
+    http_with(port, method, path, body, Some(TEST_TOKEN))
+}
+
+fn http_with(
+    port: u16,
+    method: &str,
+    path: &str,
+    body: Option<&str>,
+    bearer: Option<&str>,
+) -> (u16, Vec<u8>) {
     let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
     s.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
     let body = body.unwrap_or("");
+    let auth = bearer
+        .map(|t| format!("authorization: Bearer {t}\r\n"))
+        .unwrap_or_default();
     let req = format!(
-        "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+        "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n{auth}content-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
         body.len(),
         body
     );
@@ -198,6 +214,10 @@ impl Drop for EdgeProc {
         // 的命名是 /tmp/rig-edge-<边缘pid>，按命令行扫掉整棵树。
         let pat = format!("rig-edge-{}([^0-9]|$)", self.0.id());
         let _ = Command::new("pkill").args(["-KILL", "-f", &pat]).status();
+        // SIGKILL 下边缘来不及清理自己的一次性临时目录，这里代为清掉
+        let tmp = std::env::temp_dir();
+        let _ = std::fs::remove_dir_all(tmp.join(format!("rig-edge-{}", self.0.id())));
+        let _ = std::fs::remove_dir_all(tmp.join(format!("rig-edge-{}-uploads", self.0.id())));
     }
 }
 
@@ -231,6 +251,8 @@ async fn edge_browser_end_to_end() {
             .args([
                 "--listen",
                 &format!("127.0.0.1:{edge_port}"),
+                "--token",
+                TEST_TOKEN,
                 "--url",
                 &format!("{origin_a}/login.html"),
                 "--human",
@@ -427,7 +449,7 @@ async fn edge_browser_end_to_end() {
     assert!(png.len() > 1000 && &png[..4] == b"\x89PNG", "应返回 PNG 图");
 
     // ── 4. 人通道 WS 收帧 ────────────────────────────────────
-    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{edge_port}/ws"))
+    let (mut ws, _) = ws_connect(format!("ws://127.0.0.1:{edge_port}/ws"))
         .await
         .expect("人通道开启时 WS 应可连接");
     let mut got_frame = false;
@@ -459,7 +481,7 @@ async fn edge_browser_end_to_end() {
     assert_eq!(status, 200);
     let (status, _) = http_json(edge_port, "POST", "/observe", Some(json!({})));
     assert_eq!(status, 409, "AI 通道关闭时 observe 应被拒");
-    let ws_res = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{edge_port}/ws")).await;
+    let ws_res = ws_connect(format!("ws://127.0.0.1:{edge_port}/ws")).await;
     assert!(ws_res.is_err(), "人通道关闭时 WS 应被拒");
     let (status, v) = http_json(edge_port, "POST", "/channels", Some(json!({"ai": true})));
     assert_eq!(status, 200);
@@ -690,10 +712,38 @@ fn b64_decode(s: &str) -> Vec<u8> {
     out
 }
 
+/// 带 Bearer 头连 WS（浏览器端走首帧认证，见 edge_viewer_login）
+async fn ws_connect(
+    url: String,
+) -> Result<
+    (
+        tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+        tokio_tungstenite::tungstenite::handshake::client::Response,
+    ),
+    tokio_tungstenite::tungstenite::Error,
+> {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    let mut req = url.into_client_request()?;
+    req.headers_mut().insert(
+        "authorization",
+        format!("Bearer {TEST_TOKEN}").parse().unwrap(),
+    );
+    tokio_tungstenite::connect_async(req).await
+}
+
 fn spawn_edge(args: &[String]) -> EdgeProc {
+    let mut args = args.to_vec();
+    // 对外提供 HTTP 必须设令牌：未显式给时注入测试令牌
+    let serves_http = !args.iter().any(|a| a == "--stdio") || args.iter().any(|a| a == "--human");
+    if serves_http && !args.iter().any(|a| a == "--token") {
+        args.push("--token".into());
+        args.push(TEST_TOKEN.into());
+    }
     EdgeProc(
         Command::new(env!("CARGO_BIN_EXE_rig-edge-browser"))
-            .args(args)
+            .args(&args)
             .process_group(0)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -884,7 +934,7 @@ async fn edge_av_and_image_clipboard() {
     let _ = &mut proc2;
     tokio::time::sleep(Duration::from_millis(600)).await;
     use futures_util::SinkExt;
-    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{img_port}/ws"))
+    let (mut ws, _) = ws_connect(format!("ws://127.0.0.1:{img_port}/ws"))
         .await
         .expect("人通道 WS 应可连接");
     let o1 = observe(img_port);
@@ -1017,19 +1067,7 @@ fn free_port() -> u16 {
     p
 }
 
-/// 发一条带自定义请求头的原始 HTTP 请求，返回状态码。
-fn http_status_raw(port: u16, request: &str) -> u16 {
-    let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
-    s.write_all(request.as_bytes()).unwrap();
-    let mut b = String::new();
-    s.read_to_string(&mut b).unwrap_or(0);
-    b.split_whitespace()
-        .nth(1)
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0)
-}
-
-/// 直连鉴权：非回环无令牌拒绝启动；带令牌的回环服务全接口查令牌。
+/// 直连鉴权：无令牌拒绝启动；令牌只认 Bearer 头，换票与 refresh 轮换。
 #[tokio::test]
 async fn edge_token_auth() {
     if std::env::var("RIG_EDGE_IT").is_err() {
@@ -1039,7 +1077,13 @@ async fn edge_token_auth() {
     let _serial = SERIAL.lock().await;
     // 1) 绑 0.0.0.0 又不给令牌 → 拒绝启动（非零退出）
     let bad_port = free_port();
-    let mut bad = spawn_edge(&["--listen".into(), format!("0.0.0.0:{bad_port}")]);
+    // 空令牌视同未设（spawn_edge 见 --token 不再注入）
+    let mut bad = spawn_edge(&[
+        "--listen".into(),
+        format!("0.0.0.0:{bad_port}"),
+        "--token".into(),
+        String::new(),
+    ]);
     let deadline = Instant::now() + Duration::from_secs(10);
     let status = loop {
         if let Some(s) = bad.0.try_wait().unwrap() {
@@ -1062,28 +1106,66 @@ async fn edge_token_auth() {
     ]);
     wait_health(port).await;
     let _ = &mut proc;
-    let (code, _) = http(port, "GET", "/channels", None);
-    assert_eq!(code, 401, "无令牌应 401");
-    let (code, _) = http(port, "GET", "/channels?token=wrong", None);
-    assert_eq!(code, 401, "错令牌应 401");
-    let (code, _body) = http(port, "GET", "/channels?token=sekret", None);
-    assert_eq!(code, 200, "查询参数令牌应放行");
-    let code = http_status_raw(
-        port,
-        "GET /channels HTTP/1.0\r\nAuthorization: Bearer sekret\r\n\r\n",
+    // 令牌只认 Authorization 头：URL 里的令牌一律无效
+    let get = |p: &str, b: Option<&str>| http_with(port, "GET", p, None, b).0;
+    assert_eq!(get("/channels", None), 401, "无令牌应 401");
+    assert_eq!(get("/channels", Some("wrong")), 401, "错令牌应 401");
+    assert_eq!(get("/channels?token=sekret", None), 401, "URL 令牌不再接受");
+    assert_eq!(
+        get("/channels", Some("sekret")),
+        200,
+        "Bearer 启动令牌应放行"
     );
-    assert_eq!(code, 200, "Bearer 请求头令牌应放行");
-    let (code, _) = http(port, "POST", "/observe?token=sekret", Some("{}"));
-    assert_eq!(code, 200, "带令牌观察应放行");
-    let (code, _) = http(port, "POST", "/observe", Some("{}"));
-    assert_eq!(code, 401, "无令牌观察应 401");
-    // 3) 观看页子资源：页面本体查令牌，但 /viewer.js 必须免令牌
-    // 可达——<script src> 带不上页面 URL 的 ?token=，被 401 时
-    // 观看页只剩空壳（第五期上线实踩，LIU 实测全黑）。
-    let (code, _) = http(port, "GET", "/", None);
-    assert_eq!(code, 401, "无令牌观看页应 401");
-    let (code, body) = http(port, "GET", "/viewer.js", None);
-    assert_eq!(code, 200, "viewer.js 无令牌应放行（子资源带不上令牌）");
+    assert_eq!(
+        http_with(port, "POST", "/observe", Some("{}"), Some("sekret")).0,
+        200,
+        "带令牌观察应放行"
+    );
+    assert_eq!(
+        http_with(port, "POST", "/observe", Some("{}"), None).0,
+        401,
+        "无令牌观察应 401"
+    );
+    // 换票：body 带启动令牌 → access + refresh
+    let login = |t: &str| {
+        let b = json!({"token": t}).to_string();
+        let (c, body) = http_with(port, "POST", "/session", Some(&b), None);
+        (
+            c,
+            serde_json::from_slice::<Value>(&body).unwrap_or(Value::Null),
+        )
+    };
+    assert_eq!(login("wrong").0, 401, "错令牌不得换票");
+    let (c, pair) = login("sekret");
+    assert_eq!(c, 200);
+    let access = pair["access"].as_str().unwrap().to_string();
+    let refresh = pair["refresh"].as_str().unwrap().to_string();
+    assert_eq!(
+        get("/channels", Some(&access)),
+        200,
+        "access 可调 Viewer 路由"
+    );
+    assert_eq!(
+        http_with(port, "POST", "/observe", Some("{}"), Some(&access)).0,
+        401,
+        "access 不得调 AI 路由"
+    );
+    // refresh 轮换：旧的立即失效，新的可继续
+    let rb = json!({"refresh": refresh}).to_string();
+    let (c, body) = http_with(port, "POST", "/session/refresh", Some(&rb), None);
+    assert_eq!(c, 200);
+    let pair2: Value = serde_json::from_slice(&body).unwrap();
+    assert_ne!(pair2["refresh"], pair["refresh"]);
+    let (c, _) = http_with(port, "POST", "/session/refresh", Some(&rb), None);
+    assert_eq!(c, 401, "旧 refresh 不得重放");
+    // 3) 静态壳（页面、脚本）无需令牌，真实数据路由才查令牌
+    let (code, body) = http_with(port, "GET", "/", None, None);
+    assert_eq!(code, 200, "观看页壳无需令牌（内含令牌输入页）");
+    assert!(String::from_utf8_lossy(&body).contains("/auth.js"));
+    let (code, _) = http_with(port, "GET", "/auth.js", None, None);
+    assert_eq!(code, 200);
+    let (code, body) = http_with(port, "GET", "/viewer.js", None, None);
+    assert_eq!(code, 200, "viewer.js 无令牌应放行");
     assert!(
         String::from_utf8_lossy(&body).contains("chrome"),
         "viewer.js 应是观看页脚本"
@@ -1334,6 +1416,8 @@ async fn edge_text_keys_clipboard() {
             .args([
                 "--listen",
                 &format!("127.0.0.1:{edge_port}"),
+                "--token",
+                TEST_TOKEN,
                 "--url",
                 &format!("{origin_a}/text.html"),
                 "--human",
@@ -1449,7 +1533,7 @@ async fn edge_text_keys_clipboard() {
     );
 
     // ── 3. 人通道：点击聚焦 → 输入法成品整段直插 ──
-    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{edge_port}/ws"))
+    let (mut ws, _) = ws_connect(format!("ws://127.0.0.1:{edge_port}/ws"))
         .await
         .expect("人通道 WS 应可连接");
     use futures_util::SinkExt;
@@ -1624,7 +1708,7 @@ async fn edge_chrome_ui_and_takeover() {
     // 观看端页面手势会被遮蔽并弹接管提示——页面点击前先等保持窗
     // 结束（chrome 命令是工具栏操作，不受遮蔽）。
     use futures_util::SinkExt;
-    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{edge_port}/ws"))
+    let (mut ws, _) = ws_connect(format!("ws://127.0.0.1:{edge_port}/ws"))
         .await
         .expect("人通道 WS 应可连接");
     // 等一帧并核对帧尺寸（第五期：纯页面帧，高恰为页面高）
@@ -2515,22 +2599,22 @@ async fn edge_human_zero_viewers_stops_full_frame_pump() {
         }
     }
     // 啟動中的連線立刻斷開，不得留下消費者需求。
-    let (early, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{edge_port}/ws"))
+    let (early, _) = ws_connect(format!("ws://127.0.0.1:{edge_port}/ws"))
         .await
         .expect("早退觀看連線應可建立");
     drop(early);
     wait_full_stable(edge_port).await;
-    let (mut a, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{edge_port}/ws"))
+    let (mut a, _) = ws_connect(format!("ws://127.0.0.1:{edge_port}/ws"))
         .await
         .unwrap();
-    let (mut b, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{edge_port}/ws"))
+    let (mut b, _) = ws_connect(format!("ws://127.0.0.1:{edge_port}/ws"))
         .await
         .unwrap();
     frame_within(&mut a, "A 接入").await;
     frame_within(&mut b, "B 接入").await;
     drop(a);
     frame_within(&mut b, "A 離開後 B 仍接收").await;
-    let (mut c, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{edge_port}/ws"))
+    let (mut c, _) = ws_connect(format!("ws://127.0.0.1:{edge_port}/ws"))
         .await
         .unwrap();
     frame_within(&mut c, "C 接入").await;
@@ -2561,10 +2645,9 @@ async fn edge_human_zero_viewers_stops_full_frame_pump() {
     }
     drop(c);
     wait_full_stable(edge_port).await;
-    let (mut reconnect, _) =
-        tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{edge_port}/ws"))
-            .await
-            .unwrap();
+    let (mut reconnect, _) = ws_connect(format!("ws://127.0.0.1:{edge_port}/ws"))
+        .await
+        .unwrap();
     let frame = frame_within(&mut reconnect, "静态页首帧").await;
     let mut decoder = Command::new("ffmpeg")
         .args([
@@ -2634,7 +2717,7 @@ async fn edge_viewer_summary_viewport_and_rtc_audio_demand() {
 
     use futures_util::SinkExt;
     use tokio_tungstenite::tungstenite::Message;
-    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{edge_port}/ws"))
+    let (mut ws, _) = ws_connect(format!("ws://127.0.0.1:{edge_port}/ws"))
         .await
         .unwrap();
     ws.send(Message::Text(
@@ -2839,7 +2922,7 @@ async fn edge_dom_subscription_keeps_jpeg_frames() {
     let _ = &mut proc;
 
     use futures_util::SinkExt;
-    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{edge_port}/ws"))
+    let (mut ws, _) = ws_connect(format!("ws://127.0.0.1:{edge_port}/ws"))
         .await
         .expect("人通道 WS 应可连接");
     ws.send(tokio_tungstenite::tungstenite::Message::Text(
@@ -2917,7 +3000,7 @@ async fn edge_dom_channel() {
     tokio::time::sleep(Duration::from_millis(800)).await;
 
     use futures_util::SinkExt;
-    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{edge_port}/ws"))
+    let (mut ws, _) = ws_connect(format!("ws://127.0.0.1:{edge_port}/ws"))
         .await
         .expect("人通道 WS 应可连接");
     macro_rules! ws_send {
@@ -3324,9 +3407,14 @@ async fn edge_upload_action() {
     let bound = serve(listener, vec![("/upload.html".into(), UPLOAD_HTML.into())]);
     assert_eq!(bound, port);
     let edge_port = free_port();
+    // 上传根目录固定为 <cache-dir>/uploads
+    let cache = format!("/tmp/rig-upload-it-{edge_port}-cache");
+    let uploads = format!("{cache}/uploads");
     let _edge = spawn_edge(&[
         "--listen".into(),
         format!("127.0.0.1:{edge_port}"),
+        "--cache-dir".into(),
+        cache.clone(),
         "--url".into(),
         format!("{origin}/upload.html"),
         "--width".into(),
@@ -3337,10 +3425,12 @@ async fn edge_upload_action() {
     wait_health(edge_port).await;
 
     // 边缘主机上的待上传文件（测试进程与边缘同机）
-    let f1 = format!("/tmp/rig-upload-it-{edge_port}-a.txt");
-    let f2 = format!("/tmp/rig-upload-it-{edge_port}-b.txt");
+    let f1 = format!("{uploads}/a.txt");
+    let f2 = format!("{uploads}/b.txt");
     std::fs::write(&f1, b"hello-upload").unwrap();
     std::fs::write(&f2, b"second").unwrap();
+    let outside = format!("/tmp/rig-upload-it-{edge_port}-outside.txt");
+    std::fs::write(&outside, b"must-not-upload").unwrap();
 
     let deadline = Instant::now() + Duration::from_secs(5);
     let obs = loop {
@@ -3367,10 +3457,27 @@ async fn edge_upload_action() {
         edge_port,
         frame,
         json!({"kind": "upload", "target": {"by": "element", "id": up_id},
-               "files": ["/tmp/rig-upload-it-no-such-file.bin"]}),
+               "files": ["no-such-file.bin"]}),
     );
     assert_eq!(r["result"], "rejected", "不存在文件应被拒: {r}");
     assert_eq!(r["reason"]["code"], "file_not_found", "拒绝码: {r}");
+
+    // 负例 1b：上传目录之外的文件（绝对路径、.. 穿越）一律拒绝
+    for bad in [
+        outside.clone(),
+        "../../../../../../etc/hostname".to_string(),
+    ] {
+        let obs = observe(edge_port);
+        let frame = obs["observation"]["frame_id"].as_u64().unwrap();
+        let r = act(
+            edge_port,
+            frame,
+            json!({"kind": "upload", "target": {"by": "element", "id": up_id},
+                   "files": [bad]}),
+        );
+        assert_eq!(r["result"], "rejected", "目录外文件应被拒: {r}");
+        assert_eq!(r["reason"]["code"], "policy_denied", "拒绝码: {r}");
+    }
 
     // 负例 2：目标不是文件框 → not_file_input
     let obs = observe(edge_port);
@@ -3439,8 +3546,8 @@ async fn edge_upload_action() {
         obs["text"]
     );
 
-    let _ = std::fs::remove_file(&f1);
-    let _ = std::fs::remove_file(&f2);
+    let _ = std::fs::remove_dir_all(&cache);
+    let _ = std::fs::remove_file(&outside);
 }
 
 fn count_json_elements(obs: &Value) -> usize {
@@ -3679,6 +3786,8 @@ async fn edge_tree_image_masks_projected_out_secret_and_matches_mcp() {
                 "--human",
                 "--listen",
                 &format!("127.0.0.1:{edge_port}"),
+                "--token",
+                TEST_TOKEN,
                 "--url",
                 &format!("{origin}/mask.html"),
                 "--width",
@@ -3694,7 +3803,26 @@ async fn edge_tree_image_masks_projected_out_secret_and_matches_mcp() {
             .expect("啟動 MCP 邊緣"),
     );
     wait_health(edge_port).await;
-    let (_, http_full) = http_json(edge_port, "POST", "/observe", Some(json!({})));
+    // stdio 模式的观看页端口不挂 AI 路由：AI 只能走 MCP
+    assert_eq!(
+        http(edge_port, "POST", "/observe", Some("{}")).0,
+        404,
+        "stdio+human 不应暴露 HTTP /observe"
+    );
+    // HTTP 形态的遮罩校验另起纯 HTTP 进程
+    let http_port = free_port();
+    let _http_proc = spawn_edge(&[
+        "--listen".into(),
+        format!("127.0.0.1:{http_port}"),
+        "--url".into(),
+        format!("{origin}/mask.html"),
+        "--width".into(),
+        "900".into(),
+        "--height".into(),
+        "700".into(),
+    ]);
+    wait_health(http_port).await;
+    let (_, http_full) = http_json(http_port, "POST", "/observe", Some(json!({})));
     let secret = find_element(&http_full["observation"], "textbox", "合成密碼")
         .expect("完整觀察應含合成密碼欄位");
     assert!(
@@ -3710,7 +3838,7 @@ async fn edge_tree_image_masks_projected_out_secret_and_matches_mcp() {
         .unwrap()
         .to_string();
     let request = json!({"mode":"tree_image", "subtree":main_id});
-    let (status, http_image_out) = http_json(edge_port, "POST", "/observe", Some(request.clone()));
+    let (status, http_image_out) = http_json(http_port, "POST", "/observe", Some(request.clone()));
     assert_eq!(status, 200, "HTTP tree_image 應成功: {http_image_out}");
     assert!(
         find_element(&http_image_out["observation"], "textbox", "合成密碼").is_none(),
@@ -3814,7 +3942,7 @@ async fn edge_tree_image_masks_projected_out_secret_and_matches_mcp() {
         mcp_img.as_raw(),
         "HTTP 與 MCP 的標記、編號、遮罩像素應一致"
     );
-    let (status, http_png) = http(edge_port, "GET", "/screenshot.png", None);
+    let (status, http_png) = http(http_port, "GET", "/screenshot.png", None);
     assert_eq!(status, 200);
     let standalone = rpc(
         &mut stdin,
@@ -4028,7 +4156,7 @@ async fn edge_internal_gate_and_dblclick() {
     }
 
     use futures_util::{SinkExt, StreamExt};
-    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{edge_port}/ws"))
+    let (mut ws, _) = ws_connect(format!("ws://127.0.0.1:{edge_port}/ws"))
         .await
         .expect("人通道 WS 应可连接");
     macro_rules! ws_send {
@@ -4177,7 +4305,7 @@ async fn edge_dom_sub_idempotent_and_cleanup() {
     }
 
     use futures_util::SinkExt;
-    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{edge_port}/ws"))
+    let (mut ws, _) = ws_connect(format!("ws://127.0.0.1:{edge_port}/ws"))
         .await
         .expect("人通道 WS 应可连接");
     wait_viewers(edge_port, 0, "初始").await;
@@ -4215,7 +4343,7 @@ async fn edge_dom_sub_idempotent_and_cleanup() {
     wait_viewers(edge_port, 0, "断开连接后名额应回收").await;
 
     let ws_url = format!("ws://127.0.0.1:{edge_port}/ws");
-    let (mut ws, _) = tokio_tungstenite::connect_async(&ws_url).await.unwrap();
+    let (mut ws, _) = ws_connect(ws_url.clone()).await.unwrap();
     for command in [
         json!({"type":"dom-start"}),
         json!({"type":"rtc-start","video":true,"audio":false}),
@@ -4255,10 +4383,10 @@ async fn edge_dom_sub_idempotent_and_cleanup() {
         assert!(Instant::now() < deadline, "关闭人通道应回收 RTC 视频需求");
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    assert!(tokio_tungstenite::connect_async(&ws_url).await.is_err());
+    assert!(ws_connect(ws_url.clone()).await.is_err());
     let (_, state) = http_json(edge_port, "POST", "/channels", Some(json!({"human":true})));
     assert_eq!(state["human"], true);
-    assert!(tokio_tungstenite::connect_async(&ws_url).await.is_ok());
+    assert!(ws_connect(ws_url.clone()).await.is_ok());
     drop(proc);
 }
 
@@ -4313,7 +4441,7 @@ async fn edge_popup_keeps_view_frames() {
         )
     }
     use futures_util::SinkExt;
-    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{edge_port}/ws"))
+    let (mut ws, _) = ws_connect(format!("ws://127.0.0.1:{edge_port}/ws"))
         .await
         .expect("人通道 WS 应可连接");
     // 实际观看后才有采集需求；先确认原动画标签已开始出帧。
@@ -4413,7 +4541,7 @@ async fn edge_dom_no_duplicate_adds() {
     tokio::time::sleep(Duration::from_millis(800)).await;
 
     use futures_util::SinkExt;
-    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{edge_port}/ws"))
+    let (mut ws, _) = ws_connect(format!("ws://127.0.0.1:{edge_port}/ws"))
         .await
         .expect("人通道 WS 应可连接");
     ws.send(tokio_tungstenite::tungstenite::Message::Text(
@@ -4489,7 +4617,7 @@ setInterval(()=>{const p=document.createElement('p');const b=document.createElem
     tokio::time::sleep(Duration::from_millis(800)).await;
 
     use futures_util::SinkExt;
-    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{edge_port}/ws"))
+    let (mut ws, _) = ws_connect(format!("ws://127.0.0.1:{edge_port}/ws"))
         .await
         .expect("人通道 WS 应可连接");
     let send = |t: &str| {
@@ -4617,7 +4745,7 @@ const log=[]; for (const type of ['mousedown','mouseup','click','dblclick','cont
     ]);
     wait_health(edge_port).await;
     use futures_util::SinkExt;
-    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{edge_port}/ws"))
+    let (mut ws, _) = ws_connect(format!("ws://127.0.0.1:{edge_port}/ws"))
         .await
         .unwrap();
     macro_rules! send {
@@ -4767,7 +4895,7 @@ field.addEventListener('keyup',e=>{if(e.code==='F7'||e.code==='F8')field.value='
     ]);
     wait_health(edge_port).await;
     use futures_util::SinkExt;
-    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{edge_port}/ws"))
+    let (mut ws, _) = ws_connect(format!("ws://127.0.0.1:{edge_port}/ws"))
         .await
         .unwrap();
     macro_rules! send {

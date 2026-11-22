@@ -25,6 +25,8 @@ axum-server = { version = "0.7", features = ["tls-rustls"] }
 rcgen = "0.13"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 base64 = "0.22"
+# 令牌随机源（已在依赖树内，MIT/Apache-2.0）
+getrandom = "0.3"
 # 进程内编码层（Phase 1a；LIU 2026-11-19 定案弃 stdio ffmpeg 子进程）：Rust 直调
 # libavcodec + hw_frames_ctx 运行时协商硬编、无则软编回落，RTC 与 HLS 两路共用。
 # 运行时依赖系统 libavcodec/libavformat/libavutil/libswscale/libavdevice（需 -dev 包）。

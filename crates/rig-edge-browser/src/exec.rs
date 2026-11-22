@@ -10,7 +10,7 @@
 
 use std::collections::VecDeque;
 use std::sync::{
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicU64, AtomicUsize, Ordering},
     Arc,
 };
 use std::time::{Duration, Instant};
@@ -43,8 +43,6 @@ pub enum ExecState {
 
 struct Inner {
     state: ExecState,
-    /// 代次：begin/request_abort 都递增；保持窗任务只在代次未变时回待命
-    generation: u64,
     /// 取消代次（GPT review R-01）：request_abort 递增；每个 call
     /// 在 begin 时领取当时的代次，代次不符即已被接管取消。新 call
     /// 领取新代次，永不复活旧 call 的取消状态
@@ -60,14 +58,13 @@ struct Inner {
     pulse_at: Option<Instant>,
 }
 
-/// 一个 AI call 的执行句柄：携带它领取的取消代次与开始代次。
+/// 一个 AI call 的执行句柄：携带它领取的取消代次。
 /// 非 Copy 的 owned guard：显式 `end()` 未跑到（任务被 abort/panic）
 /// 就由 Drop 归还在途计数，保证取消安全（A02）。`end()` 接管句柄
 /// 的所有权，正常结束的句柄 Drop 时不再重复归还。
 pub struct ExecHandle {
     ctl: Arc<ExecControl>,
     epoch: u64,
-    gen: u64,
     done: bool,
 }
 
@@ -75,7 +72,6 @@ impl std::fmt::Debug for ExecHandle {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ExecHandle")
             .field("epoch", &self.epoch)
-            .field("gen", &self.gen)
             .field("done", &self.done)
             .finish()
     }
@@ -91,7 +87,7 @@ impl Drop for ExecHandle {
         let prev = self.ctl.active.fetch_sub(1, Ordering::SeqCst);
         if prev == 1 {
             // 最后一个在途 call 随取消离开：排一次保持窗回待命
-            self.ctl.spawn_holdover(self.gen);
+            self.ctl.spawn_holdover();
         }
     }
 }
@@ -101,6 +97,8 @@ pub struct ExecControl {
     /// 在途 AI call 数（同步原子计数）：保持窗只由最后一个
     /// 结束的 call 触发；放原子里是为了 Drop（同步上下文）也能归还
     active: AtomicUsize,
+    /// 在途数归零的次数，保持窗任务凭它判断自己是否已被后来者取代
+    zero_seq: AtomicU64,
     holdover: Duration,
 }
 
@@ -115,7 +113,6 @@ impl ExecControl {
         ExecControl {
             inner: Mutex::new(Inner {
                 state: ExecState::Idle,
-                generation: 0,
                 cancel_epoch: 0,
                 latched: false,
                 x: 0.0,
@@ -126,6 +123,7 @@ impl ExecControl {
                 pulse_at: None,
             }),
             active: AtomicUsize::new(0),
+            zero_seq: AtomicU64::new(0),
             holdover,
         }
     }
@@ -134,12 +132,10 @@ impl ExecControl {
     /// 闩锁检查与计数递增之间 park——本函数持有锁期间无 await。
     fn start_call(self: &Arc<Self>, g: &mut Inner) -> ExecHandle {
         g.state = ExecState::Executing;
-        g.generation += 1;
         self.active.fetch_add(1, Ordering::SeqCst);
         ExecHandle {
             ctl: self.clone(),
             epoch: g.cancel_epoch,
-            gen: g.generation,
             done: false,
         }
     }
@@ -162,16 +158,19 @@ impl ExecControl {
 
     /// 排一次保持窗回待命（同步上下文可用：Drop 里也能调）。
     /// 无运行时（如解释器关闭期）则跳过，不 panic。
-    fn spawn_holdover(self: &Arc<Self>, gen: u64) {
+    /// 序号在「在途数归零」这一刻领取：后归零的保持窗使先前的作废，
+    /// 与 call 的开始先后无关（反序结束时最后结束的未必是最后开始的）。
+    fn spawn_holdover(self: &Arc<Self>) {
         let Ok(rt) = tokio::runtime::Handle::try_current() else {
             return;
         };
+        let seq = self.zero_seq.fetch_add(1, Ordering::SeqCst) + 1;
         let me = self.clone();
         let holdover = self.holdover;
         rt.spawn(async move {
             tokio::time::sleep(holdover).await;
             let mut g = me.inner.lock().await;
-            if g.generation == gen
+            if me.zero_seq.load(Ordering::SeqCst) == seq
                 && me.active.load(Ordering::SeqCst) == 0
                 && g.state == ExecState::Executing
             {
@@ -189,7 +188,7 @@ impl ExecControl {
         h.done = true;
         let prev = self.active.fetch_sub(1, Ordering::SeqCst);
         if prev == 1 {
-            self.spawn_holdover(h.gen);
+            self.spawn_holdover();
         }
     }
 
@@ -207,7 +206,6 @@ impl ExecControl {
     pub async fn request_abort(&self) {
         let mut g = self.inner.lock().await;
         g.state = ExecState::Idle;
-        g.generation += 1;
         g.cancel_epoch += 1;
         g.latched = true;
         g.has_pos = false;
@@ -317,6 +315,19 @@ mod tests {
         c.end(b).await;
         tokio::time::sleep(Duration::from_millis(150)).await;
         assert_eq!(c.state().await, ExecState::Idle, "全部结束后应回待命");
+    }
+
+    /// 反序完成回归：A 先开始、B 后开始，B 先结束、A 最后结束，
+    /// 最后一个结束的是更早开始的 A，保持窗后仍必须回 Idle
+    #[tokio::test]
+    async fn holdover_after_out_of_order_finish() {
+        let c = ctl();
+        let a = c.begin_observe().await;
+        let b = c.begin_act().await.expect("未闩锁应放行");
+        c.end(b).await;
+        c.end(a).await;
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(c.state().await, ExecState::Idle, "反序结束后应回待命");
     }
 
     /// R-01 回归：接管后新 call 的 begin 不得复活旧 call——旧句柄

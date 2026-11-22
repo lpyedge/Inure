@@ -24,6 +24,7 @@
 //! 两通道可单开、双开、双关；双关时仅控制接口存活。
 
 mod ai;
+mod auth;
 mod browser;
 mod cdp;
 mod changes;
@@ -80,8 +81,11 @@ struct App {
     /// 人通道最近一次启动失败的原因（R-11：状态必须如实——
     /// 启动失败不得把 gate 报成已启用，错误要可查询）
     human_error: std::sync::Mutex<Option<String>>,
-    /// 直连鉴权令牌（--token / RIG_EDGE_TOKEN）；None = 不鉴权（仅回环允许）
-    token: Option<String>,
+    /// 直连鉴权（启动令牌换 access/refresh 票据，见 auth.rs）
+    auth: auth::Auth,
+    /// 允许内嵌观看页的宿主来源（--embed-origin，逗号分隔）；
+    /// 空 = 禁止任何内嵌
+    embed_origins: Vec<String>,
 }
 
 impl App {
@@ -90,46 +94,124 @@ impl App {
     }
 }
 
-/// 直连鉴权中间件：设了令牌时，除 /health 外所有接口都要带令牌——
-/// `Authorization: Bearer <token>` 或 `?token=<token>`（观看页的媒体元素
-/// 与 WebSocket 无法设请求头，走查询参数）。中转是手段不是目的：边缘
-/// 直连本机/局域网是本体形态，鉴权是它敢绑出回环的前提（LIU 2026-11-19）。
-async fn auth_guard(State(app): State<Arc<App>>, req: Request, next: Next) -> Response {
-    let Some(token) = &app.token else {
-        return next.run(req).await;
-    };
-    if req.uri().path() == "/health" || req.uri().path() == "/ready" {
-        return next.run(req).await;
+/// 路由的鉴权类别。AI 路由只认启动令牌；Viewer 路由认 access 票据
+/// （或启动令牌，供脚本使用）；未知路径按 Viewer 最严处理。
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum Access {
+    /// 无秘密的静态资源与换票入口（换票自带令牌校验）
+    Public,
+    /// 处理函数自行校验：/ws 首帧认证、/stream 路径钥匙
+    SelfChecked,
+    Viewer,
+    Master,
+}
+
+fn route_access(path: &str) -> Access {
+    match path {
+        "/" | "/viewer.js" | "/auth.js" | "/health" | "/ready" | "/session"
+        | "/session/refresh" => Access::Public,
+        "/ws" => Access::SelfChecked,
+        "/observe" | "/act" | "/screenshot.png" => Access::Master,
+        p if p.starts_with("/stream/") => Access::SelfChecked,
+        _ => Access::Viewer,
     }
-    // /viewer.js 免鑑權：它是觀看頁的靜態腳本（無秘密、內容對
-    // 所有人相同），而 <script src> 子資源請求帶不上頁面 URL
-    // 裡的 ?token=——不豁免則帶令牌訪問時腳本被 401、頁面只剩
-    // 空殼（第五期上線實踩：標籤/按鈕/幀全滅）。頁面本體、WS
-    // 與全部 API 仍查令牌。
-    if req.uri().path() == "/viewer.js" {
-        return next.run(req).await;
+}
+
+fn authorized(auth: &auth::Auth, access: Access, bearer: Option<&str>) -> bool {
+    match access {
+        Access::Public | Access::SelfChecked => true,
+        Access::Master => bearer.is_some_and(|t| auth.is_master(t)),
+        Access::Viewer => bearer.is_some_and(|t| auth.is_master(t) || auth.check_access(t)),
     }
-    let from_header = req
-        .headers()
+}
+
+fn bearer_of(headers: &axum::http::HeaderMap) -> Option<&str> {
+    headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "));
-    let from_query = req.uri().query().and_then(|q| {
-        q.split('&')
-            .find_map(|kv| kv.strip_prefix("token="))
-            // 查询串里的令牌是 percent-encoded 的，与原始令牌比较前必须
-            // 先解码，否则含特殊字符的令牌永远认证失败（GPT review R-09）
-            .map(percent_decode)
-    });
-    let ok = from_header == Some(token.as_str()) || from_query.as_deref() == Some(token.as_str());
-    if ok {
+        .and_then(|v| v.strip_prefix("Bearer "))
+}
+
+/// 直连鉴权中间件：令牌只走 `Authorization: Bearer` 头，URL 里不再接受
+/// 任何令牌。启动令牌换 access/refresh 票据后，viewer 用 access 调
+/// Viewer 路由；AI 路由只认启动令牌（LIU 2026-11-22）。
+async fn auth_guard(State(app): State<Arc<App>>, req: Request, next: Next) -> Response {
+    let access = route_access(req.uri().path());
+    if authorized(&app.auth, access, bearer_of(req.headers())) {
         next.run(req).await
     } else {
         (
             StatusCode::UNAUTHORIZED,
-            Json(json!({"error": "需要令牌（Authorization: Bearer 或 ?token=）"})),
+            Json(json!({"error": "需要令牌（Authorization: Bearer）"})),
         )
             .into_response()
+    }
+}
+
+#[derive(Deserialize)]
+struct LoginBody {
+    token: String,
+}
+
+#[derive(Deserialize)]
+struct RefreshBody {
+    refresh: String,
+}
+
+fn pair_response(app: &App, pair: Option<auth::TokenPair>) -> Response {
+    match pair {
+        Some(p) => Json(json!({
+            "access": p.access,
+            "refresh": p.refresh,
+            "expires_in": p.expires_in,
+            "stream_key": app.auth.stream_key(),
+        }))
+        .into_response(),
+        None => (StatusCode::UNAUTHORIZED, Json(json!({"error": "令牌无效"}))).into_response(),
+    }
+}
+
+/// 启动令牌（body）换 access + refresh
+async fn session_login(State(app): State<Arc<App>>, Json(b): Json<LoginBody>) -> Response {
+    pair_response(&app, app.auth.login(&b.token))
+}
+
+/// refresh（body）换新一对；旧 refresh 立即作废
+async fn session_refresh(State(app): State<Arc<App>>, Json(b): Json<RefreshBody>) -> Response {
+    pair_response(&app, app.auth.refresh(&b.refresh))
+}
+
+#[cfg(test)]
+mod auth_route_tests {
+    use super::*;
+
+    #[test]
+    fn route_classes() {
+        assert_eq!(route_access("/observe"), Access::Master);
+        assert_eq!(route_access("/act"), Access::Master);
+        assert_eq!(route_access("/screenshot.png"), Access::Master);
+        assert_eq!(route_access("/channels"), Access::Viewer);
+        assert_eq!(route_access("/print.pdf"), Access::Viewer);
+        assert_eq!(route_access("/anything-else"), Access::Viewer);
+        assert_eq!(route_access("/ws"), Access::SelfChecked);
+        assert_eq!(
+            route_access("/stream/k/h264/index.m3u8"),
+            Access::SelfChecked
+        );
+        assert_eq!(route_access("/session"), Access::Public);
+        assert_eq!(route_access("/"), Access::Public);
+    }
+
+    #[test]
+    fn viewer_ticket_cannot_reach_ai_routes() {
+        let a = auth::Auth::new("master-secret".into());
+        let p = a.login("master-secret").unwrap();
+        assert!(authorized(&a, Access::Viewer, Some(&p.access)));
+        assert!(authorized(&a, Access::Viewer, Some("master-secret")));
+        assert!(!authorized(&a, Access::Master, Some(&p.access)));
+        assert!(authorized(&a, Access::Master, Some("master-secret")));
+        assert!(!authorized(&a, Access::Viewer, None));
+        assert!(!authorized(&a, Access::Master, Some(&p.refresh)));
     }
 }
 
@@ -312,7 +394,9 @@ async fn main() {
     let ai_default = !has("--no-ai");
     let human_default = has("--human");
     let av_default = has("--av");
-    let token = get_arg("--token").or_else(|| std::env::var("RIG_EDGE_TOKEN").ok());
+    let token = get_arg("--token")
+        .or_else(|| std::env::var("RIG_EDGE_TOKEN").ok())
+        .filter(|t| !t.is_empty());
     // 持久化双目录（LIU 2026-11-20 定）：profile 存一切身份与站点
     // 状态（凭据/Cookie/存储/扩展/应用），cache 只放可重取的磁盘
     // 缓存；换环境重部署时把 profile 目录整份带走即可续用。
@@ -328,20 +412,47 @@ async fn main() {
     // HTTPS 才是安全上下文，剪贴板 writeText/ClipboardItem 等
     // 标准路径才可用——不再为非安全上下文绕路。
     let tls = build_tls(&get_arg, &listen).await;
-    // 直连安全底线：绑出回环（局域网可达）必须设令牌，否则拒绝启动——
-    // 无鉴权的边缘等于把浏览器操作权开放给同网段任何人。
-    if token.is_none() && !listen_is_loopback(&listen) {
+    // 直连安全底线（LIU 2026-11-22）：只要对外开 HTTP（纯 HTTP 模式或
+    // stdio+viewer），令牌必设——由启动程序随机生成并传入；绑出回环
+    // 令牌与票据靠 HTTPS 保密：非回环监听由 build_tls 强制 TLS。
+    let serves_http = !has("--stdio") || human_default;
+    if serves_http && token.is_none() {
         eprintln!(
-            "拒绝启动：监听 {listen} 不是回环地址且未设令牌。局域网直连请加 --token <令牌>（或环境变量 RIG_EDGE_TOKEN）。"
+            "拒绝启动：对外提供 HTTP 必须设令牌。请由启动程序随机生成并传入 --token <令牌>（或环境变量 RIG_EDGE_TOKEN）。"
         );
         std::process::exit(2);
     }
+    let embed_origins: Vec<String> = get_arg("--embed-origin")
+        .map(|v| {
+            v.split(',')
+                .map(|o| o.trim().trim_end_matches('/').to_string())
+                .filter(|o| !o.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
 
     // 虚拟声卡先行：Chromium 出生时就把声音放进 null sink，
     // 之后 ffmpeg 从它的 monitor 合流（LIU 2026-11-18 定的音频方案）。
     let av_capable = media::ensure_virtual_sink().await;
     if av_capable {
         std::env::set_var("PULSE_SINK", media::SINK_NAME);
+    }
+
+    // Upload 只允许取自该目录（人要给 AI 传文件，把文件放进来）：给了
+    // --cache-dir 用其下 uploads/；没给则用本进程的一次性临时目录
+    let upload_root = match cache_dir.as_deref() {
+        Some(d) => std::path::Path::new(d).join("uploads"),
+        None => std::env::temp_dir().join(format!("rig-edge-{}-uploads", std::process::id())),
+    };
+    std::fs::create_dir_all(&upload_root).expect("创建上传目录失败");
+    // 没有专门指定的目录都是本进程的一次性临时目录：退出时清理，
+    // 不在磁盘上留登录态/下载的文件（SIGKILL 无法兜底）
+    let mut temp_dirs: Vec<std::path::PathBuf> = Vec::new();
+    if cache_dir.is_none() {
+        temp_dirs.push(upload_root.clone());
+    }
+    if profile_dir.is_none() && get_arg("--cdp-url").is_none() {
+        temp_dirs.push(browser::temp_profile_dir());
     }
 
     // 浏览器来源二选一：--cdp-url 挂靠现成 Chromium（client 与浏览器分开，
@@ -368,6 +479,7 @@ async fn main() {
             cache_dir.as_deref().unwrap_or("(profile 内)"),
         );
     }
+    eprintln!("rig-edge-browser: uploads={}", upload_root.display());
     if let Some(url) = &start_url {
         if url != "about:blank" {
             if let Some(o) = origin_of(url) {
@@ -427,7 +539,9 @@ async fn main() {
         .and_then(|h| h.parse::<std::net::IpAddr>().ok())
         .filter(|ip| !ip.is_unspecified());
     let app = Arc::new(App {
-        ai: AiChannel::new(browser.clone(), origins, exec.clone()),
+        ai: AiChannel::new(browser.clone(), origins, exec.clone())
+            .with_upload_root(&upload_root)
+            .expect("上传目录不可用"),
         exec,
         media: Arc::new(media::MediaPipeline::new(human.clone())),
         rtc: rtc::RtcHub::new(human.clone(), stun),
@@ -440,7 +554,8 @@ async fn main() {
         gate_human: watch::channel(human_default).0,
         gate_transition: Mutex::new(()),
         human_error: std::sync::Mutex::new(None),
-        token,
+        auth: auth::Auth::new(token.unwrap_or_default()),
+        embed_origins,
     });
     app.human.set_gate_display(ai_default, human_default).await;
     app.human.manage_capture();
@@ -457,20 +572,32 @@ async fn main() {
         }
     }
 
-    let router = Router::new()
+    // 路由拆分：Viewer 路由（观看页/换票/WS/媒体）与 AI 路由（HTTP
+    // 形态的 observe/act）。stdio 模式只挂 Viewer 路由，AI 只能走 MCP，
+    // 本机其他进程无法经 HTTP 绕过 AI 闸门。
+    let viewer_router = Router::new()
         .route("/", get(viewer))
         .route("/viewer.js", get(viewer_js))
+        .route("/auth.js", get(auth_js))
         .route("/health", get(health))
         .route("/ready", get(ready))
+        .route("/session", post(session_login))
+        .route("/session/refresh", post(session_refresh))
         .route("/channels", get(get_channels).post(set_channels))
+        .route("/print.pdf", get(print_pdf))
+        .route("/stream/{key}/{rend}/{name}", get(stream_file))
+        .route("/ws", get(ws_handler));
+    let ai_router = Router::new()
         .route("/observe", post(observe))
         .route("/act", post(act))
-        .route("/screenshot.png", get(screenshot))
-        .route("/print.pdf", get(print_pdf))
-        .route("/stream/{rend}/{name}", get(stream_file))
-        .route("/ws", get(ws_handler))
-        .layer(middleware::from_fn_with_state(app.clone(), auth_guard))
-        .with_state(app.clone());
+        .route("/screenshot.png", get(screenshot));
+    let router = if has("--stdio") {
+        viewer_router
+    } else {
+        viewer_router.merge(ai_router)
+    }
+    .layer(middleware::from_fn_with_state(app.clone(), auth_guard))
+    .with_state(app.clone());
 
     if has("--stdio") {
         // stdio 模式：AI 通道走 MCP（stdin/stdout），进程边界即信任边界；
@@ -497,6 +624,7 @@ async fn main() {
             // 信号收尾与 HTTP 分支同口径：SIGTERM/SIGINT 时先请
             // Chromium 落盘关闭再退出，不等 stdin 关闭
             let app_sig = app.clone();
+            let temp_sig = temp_dirs.clone();
             tokio::spawn(async move {
                 let mut term =
                     tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
@@ -506,6 +634,7 @@ async fn main() {
                     _ = term.recv() => {}
                 }
                 app_sig.browser.shutdown().await;
+                remove_temp_dirs(&temp_sig);
                 std::process::exit(0);
             });
         }
@@ -551,15 +680,48 @@ async fn main() {
         r.expect("服务异常退出");
     }
     app.browser.shutdown().await;
+    remove_temp_dirs(&temp_dirs);
 }
 
-async fn viewer() -> impl axum::response::IntoResponse {
+/// 清理本进程的一次性临时目录（须在 Chromium 退出之后调用）
+fn remove_temp_dirs(dirs: &[std::path::PathBuf]) {
+    for d in dirs {
+        let _ = std::fs::remove_dir_all(d);
+    }
+}
+
+async fn viewer(State(app): State<Arc<App>>) -> impl axum::response::IntoResponse {
+    // 只有 --embed-origin 白名单里的宿主能内嵌观看页；未配置即禁止
+    let ancestors = if app.embed_origins.is_empty() {
+        "'none'".to_string()
+    } else {
+        app.embed_origins.join(" ")
+    };
     /* no-store：观看页随边缘版本演进，浏览器缓存住旧版页面/
     脚本会让已修的状态机在用户侧继续跑旧逻辑（且无任何
     提示）——每次加载都取当前构建的版本 */
     (
-        [(axum::http::header::CACHE_CONTROL, "no-store")],
+        [
+            (axum::http::header::CACHE_CONTROL, "no-store".to_string()),
+            (
+                axum::http::header::CONTENT_SECURITY_POLICY,
+                format!("frame-ancestors {ancestors}"),
+            ),
+        ],
         Html(VIEWER_HTML),
+    )
+}
+
+async fn auth_js() -> impl axum::response::IntoResponse {
+    (
+        [
+            (
+                axum::http::header::CONTENT_TYPE,
+                "text/javascript; charset=utf-8",
+            ),
+            (axum::http::header::CACHE_CONTROL, "no-store"),
+        ],
+        AUTH_JS,
     )
 }
 
@@ -742,8 +904,13 @@ async fn print_pdf(State(app): State<Arc<App>>) -> Response {
 /// HLS 合流输出：/stream/{hevc|h264}/index.m3u8、init.mp4、seg-N.m4s
 async fn stream_file(
     State(app): State<Arc<App>>,
-    axum::extract::Path((rend, name)): axum::extract::Path<(String, String)>,
+    axum::extract::Path((key, rend, name)): axum::extract::Path<(String, String, String)>,
 ) -> Response {
+    // 媒体元素无法带请求头：路径钥匙只授权只读的 /stream，
+    // 且仅认证过的 viewer 能拿到；播放列表里的相对段地址继承该前缀
+    if !app.auth.check_stream_key(&key) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
     if !app.human_enabled() {
         return channel_off();
     }
@@ -756,16 +923,6 @@ async fn stream_file(
             } else {
                 "video/iso.segment"
             };
-            // 设了令牌时给播放列表里的相对段地址补 ?token=：媒体元素解析
-            // 相对 URL 时不继承播放列表 URL 的查询串，段请求会丢令牌。
-            let bytes = if name.ends_with(".m3u8") {
-                match &app.token {
-                    Some(t) => rewrite_playlist_tokens(&bytes, t).into_bytes(),
-                    None => bytes,
-                }
-            } else {
-                bytes
-            };
             (
                 StatusCode::OK,
                 [(axum::http::header::CONTENT_TYPE, ct)],
@@ -775,39 +932,6 @@ async fn stream_file(
         }
         None => StatusCode::NOT_FOUND.into_response(),
     }
-}
-
-/// 给 HLS 播放列表中的段/初始化段 URI 追加 ?token=（见 stream_file 注释）。
-fn rewrite_playlist_tokens(bytes: &[u8], token: &str) -> String {
-    let enc: String = token
-        .bytes()
-        .map(|b| match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                (b as char).to_string()
-            }
-            _ => format!("%{b:02X}"),
-        })
-        .collect();
-    let suffix = format!("?token={enc}");
-    String::from_utf8_lossy(bytes)
-        .lines()
-        .map(|line| {
-            if line.starts_with('#') {
-                // #EXT-X-MAP:URI="init.mp4" 形式
-                if line.contains("URI=\"") && !line.contains("?token=") {
-                    line.replacen(".mp4\"", &format!(".mp4{suffix}\""), 1)
-                } else {
-                    line.to_string()
-                }
-            } else if line.is_empty() || line.contains("?token=") {
-                line.to_string()
-            } else {
-                format!("{line}{suffix}")
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-        + "\n"
 }
 
 fn channel_off() -> Response {
@@ -884,6 +1008,7 @@ async fn screenshot(State(app): State<Arc<App>>) -> Response {
 
 async fn ws_handler(
     State(app): State<Arc<App>>,
+    headers: axum::http::HeaderMap,
     ws: WebSocketUpgrade,
     axum::extract::ConnectInfo(remote): axum::extract::ConnectInfo<std::net::SocketAddr>,
 ) -> Response {
@@ -892,7 +1017,10 @@ async fn ws_handler(
     if !*gate.borrow() {
         return channel_off();
     }
-    ws.on_upgrade(move |socket| ws_session(app, socket, remote, gate))
+    // 非浏览器客户端可在升级请求里带 Bearer；浏览器 WebSocket 无法设头，
+    // 升级后须在 3 秒内以首帧 {"type":"auth","access":…} 认证
+    let pre_authed = authorized(&app.auth, Access::Viewer, bearer_of(&headers));
+    ws.on_upgrade(move |socket| ws_session(app, socket, remote, gate, pre_authed))
 }
 
 /// RTC host 候选的通告地址：监听地址是具体 IP 时用它；绑通配地址时
@@ -984,16 +1112,44 @@ async fn first_viewer_frame(
     (app.browser.active_page().await.as_ref() == Ok(&page)).then_some(frame)
 }
 
+/// 首帧认证：3 秒内收到合法的 auth 帧才放行，其他一律拒绝
+async fn ws_first_frame_auth(
+    auth: &auth::Auth,
+    stream: &mut futures_util::stream::SplitStream<WebSocket>,
+) -> bool {
+    let wait = async {
+        while let Some(Ok(m)) = stream.next().await {
+            if let Message::Text(t) = m {
+                let v: serde_json::Value = serde_json::from_str(&t).unwrap_or_default();
+                let ok = v.get("type").and_then(serde_json::Value::as_str) == Some("auth")
+                    && v.get("access")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|a| authorized(auth, Access::Viewer, Some(a)));
+                return ok;
+            }
+        }
+        false
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(3), wait)
+        .await
+        .unwrap_or(false)
+}
+
 async fn ws_session(
     app: Arc<App>,
     socket: WebSocket,
     remote: std::net::SocketAddr,
     mut gate: watch::Receiver<bool>,
+    pre_authed: bool,
 ) {
     if gate.has_changed().unwrap_or(true) {
         return;
     }
     let (mut sink, mut stream) = socket.split();
+    if !pre_authed && !ws_first_frame_auth(&app.auth, &mut stream).await {
+        let _ = sink.send(Message::Close(None)).await;
+        return;
+    }
     // 订阅先于声明需求，让首帧可以直接接收。
     let mut frames = app.human.subscribe();
     let mut jpeg_lease = Some(app.human.request_capture());
@@ -1237,7 +1393,7 @@ async fn ws_session(
                 _ => {
                     // DOM 模式的输入带 dom:1，坐标是页面坐标，走直达分发
                     if v.get("dom").and_then(|x| x.as_bool()) == Some(true) {
-                        app2.human.handle_ws_dom(&v).await;
+                        app2.human.handle_ws_dom(&v, &out_tx).await;
                         continue;
                     }
                     // 输入分发全在人通道（chrome 命中/编辑器/遮蔽接管）；
@@ -1275,6 +1431,7 @@ async fn ws_session(
 }
 
 const VIEWER_HTML: &str = include_str!("viewer.html");
+const AUTH_JS: &str = include_str!("auth.js");
 const VIEWER_JS: &str = include_str!("viewer.js");
 
 // ───────────────────────────── MCP stdio 前端 ─────────────────────────────
@@ -1333,6 +1490,18 @@ async fn serve_stdio(app: Arc<App>) {
     }
 }
 
+/// 本实现只用 tools 子集（三个版本线格式一致）；客户端请求的版本在
+/// 列表内就回同一版本，否则回我们的最新版，由客户端决定是否继续。
+const MCP_VERSIONS: [&str; 3] = ["2025-06-18", "2025-03-26", "2024-11-05"];
+
+fn negotiate_mcp_version(requested: Option<&str>) -> &'static str {
+    MCP_VERSIONS
+        .iter()
+        .find(|v| Some(**v) == requested)
+        .copied()
+        .unwrap_or(MCP_VERSIONS[0])
+}
+
 /// 返回 (结果, 是否发生了用户强制接管)
 async fn mcp_dispatch(
     app: &Arc<App>,
@@ -1341,10 +1510,11 @@ async fn mcp_dispatch(
 ) -> Result<(serde_json::Value, bool), (i64, String)> {
     match method {
         "initialize" => {
-            let v = params
-                .get("protocolVersion")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("2025-03-26");
+            let v = negotiate_mcp_version(
+                params
+                    .get("protocolVersion")
+                    .and_then(serde_json::Value::as_str),
+            );
             Ok((
                 json!({
                     "protocolVersion": v,
@@ -1468,6 +1638,10 @@ async fn mcp_call(app: &Arc<App>, params: &serde_json::Value) -> (serde_json::Va
                     let mut content = vec![
                         json!({"type": "text", "text": serde_json::to_string(&r).unwrap_or_default()}),
                     ];
+                    if taken {
+                        // 契约里的 Aborted 不变；停止指示以附加文本块给到智能体
+                        content.push(json!({"type": "text", "text": "用户已强制接管浏览器：请停止原任务，不要重试已中断的动作，等待用户的新指示后再重新 observe。"}));
+                    }
                     // 被拒时附最新帧文本视图（第二个文本块）
                     match fresh {
                         Ok(Some(ObserveOut::Delta(delta, text))) => {
@@ -1509,50 +1683,32 @@ async fn mcp_call(app: &Arc<App>, params: &serde_json::Value) -> (serde_json::Va
     (result, taken)
 }
 
-/// percent-decode（%XX → 字节）；非法序列原样保留。只解 %XX，不把
-/// '+' 转空格——观看页用 encodeURIComponent 编码（'+' 会被编成 %2B），
-/// 两侧正好往返一致。
-fn percent_decode(s: &str) -> String {
-    fn hex(b: u8) -> Option<u8> {
-        match b {
-            b'0'..=b'9' => Some(b - b'0'),
-            b'a'..=b'f' => Some(b - b'a' + 10),
-            b'A'..=b'F' => Some(b - b'A' + 10),
-            _ => None,
-        }
-    }
-    let bytes = s.as_bytes();
-    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%' && i + 3 <= bytes.len() {
-            if let (Some(h), Some(l)) = (hex(bytes[i + 1]), hex(bytes[i + 2])) {
-                out.push(h * 16 + l);
-                i += 3;
-                continue;
-            }
-        }
-        out.push(bytes[i]);
-        i += 1;
-    }
-    String::from_utf8_lossy(&out).to_string()
-}
-
 #[cfg(test)]
 mod tests {
-    use super::percent_decode;
-    use super::ConnSubs;
+    #[test]
+    fn remove_temp_dirs_deletes_contents_and_tolerates_missing() {
+        let d = std::env::temp_dir().join(format!("rig-cleanup-ut-{}", std::process::id()));
+        std::fs::create_dir_all(d.join("sub")).unwrap();
+        std::fs::write(d.join("sub/f.txt"), b"x").unwrap();
+        let missing = d.join("nope");
+        super::remove_temp_dirs(&[d.clone(), missing]);
+        assert!(!d.exists());
+    }
 
     #[test]
-    fn percent_decode_round_trips() {
-        assert_eq!(percent_decode("abc"), "abc");
-        assert_eq!(percent_decode("a%2Bb"), "a+b");
-        assert_eq!(percent_decode("a%20b"), "a b");
-        assert_eq!(percent_decode("%E4%B8%AD%E6%96%87"), "中文");
-        assert_eq!(percent_decode("100%"), "100%");
-        assert_eq!(percent_decode("%zz"), "%zz");
-        assert_eq!(percent_decode("a+b"), "a+b");
+    fn mcp_version_negotiation_never_echoes_unknown() {
+        assert_eq!(
+            super::negotiate_mcp_version(Some("2025-03-26")),
+            "2025-03-26"
+        );
+        assert_eq!(
+            super::negotiate_mcp_version(Some("9999-01-01")),
+            "2025-06-18"
+        );
+        assert_eq!(super::negotiate_mcp_version(None), "2025-06-18");
     }
+
+    use super::ConnSubs;
 
     /// D01：同一连接重复 start/stop 只记一次账——`dom-start,
     /// dom-start,dom-stop,close` 计数恰好回零，不多扣不少补。

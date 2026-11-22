@@ -154,6 +154,9 @@ pub struct AiChannel {
     /// 当前动作的意图标签（供 AI 指针显示），act 执行前设置
     pending_label: Mutex<Option<String>>,
     pub allowed_origins: Vec<String>,
+    /// Upload 的上传根目录（规范化路径，`<cache-dir>/uploads`）；
+    /// None = 未配置，Upload 一律拒绝
+    upload_root: Option<std::path::PathBuf>,
 }
 
 impl AiChannel {
@@ -177,7 +180,14 @@ impl AiChannel {
             exec,
             pending_label: Mutex::new(None),
             allowed_origins,
+            upload_root: None,
         }
+    }
+
+    /// 配置上传根目录（须已存在；内部取规范化路径供越界判断）
+    pub fn with_upload_root(mut self, root: &std::path::Path) -> std::io::Result<AiChannel> {
+        self.upload_root = Some(root.canonicalize()?);
+        Ok(self)
     }
 
     /// 变化日志当前序号（/health 暴露，供观测与测试）
@@ -1067,11 +1077,16 @@ impl AiChannel {
                     self.require_current_document(frame).await?;
                 }
                 self.live(h).await?;
-                // 输入落到当前焦点所在会话：优先用焦点元素所在会话
-                let session = self
-                    .focus_session(current, locate)
-                    .await
-                    .unwrap_or_else(|| main.clone());
+                // 有元素目标时，以点击后的实时焦点为准：目标必须真的持有
+                // 焦点才输入，并落到目标自己的会话（页面重设焦点或跨
+                // iframe 时拒绝，而不是写进别的字段）；无目标沿用快照焦点
+                let session = match target {
+                    Some(Target::Element { id }) => self.require_focused(locate, id).await?,
+                    _ => self
+                        .focus_session(current, locate)
+                        .await
+                        .unwrap_or_else(|| main.clone()),
+                };
                 self.browser
                     .insert_text(&session, text)
                     .await
@@ -1136,6 +1151,7 @@ impl AiChannel {
                     .and_then(serde_json::Value::as_str)
                     .ok_or_else(|| denied("resolveNode 无 objectId".into()))?
                     .to_string();
+                self.live(h).await?;
                 let out = self
                     .browser
                     .cdp
@@ -1199,24 +1215,21 @@ impl AiChannel {
                 let Target::Element { id } = target else {
                     return Err(denied("Upload 只支持元素目标".into()));
                 };
-                // 先验文件（边缘主机侧，便宜且不碰页面）：
+                // 先验文件（边缘主机侧，便宜且不碰页面）：限定在上传根目录内，
                 // 存在且为普通文件、单文件 ≤200MiB、总数 ≤20
+                let Some(root) = &self.upload_root else {
+                    return Err(denied("未配置上传目录，Upload 不可用".into()));
+                };
                 if files.is_empty() {
                     return Err(denied("Upload files 为空".into()));
                 }
                 if files.len() > 20 {
                     return Err(denied(format!("Upload 文件数超限: {} > 20", files.len())));
                 }
-                for f in files {
-                    let md = std::fs::metadata(f)
-                        .map_err(|_| RejectReason::FileNotFound { path: f.clone() })?;
-                    if !md.is_file() {
-                        return Err(RejectReason::FileNotFound { path: f.clone() }.into());
-                    }
-                    if md.len() > 200 * 1024 * 1024 {
-                        return Err(RejectReason::FileTooLarge { path: f.clone() }.into());
-                    }
-                }
+                let files: Vec<String> = files
+                    .iter()
+                    .map(|f| resolve_upload_path(root, f))
+                    .collect::<Result<_, _>>()?;
                 let (session, backend) = self.locate_session_backend(locate, id).await?;
                 let resolved = self
                     .browser
@@ -1266,6 +1279,7 @@ impl AiChannel {
                 } else {
                     (&files[..], None)
                 };
+                self.live(h).await?;
                 self.browser
                     .cdp
                     .call(
@@ -1283,6 +1297,51 @@ impl AiChannel {
                 tokio::time::sleep(std::time::Duration::from_millis(300)).await;
                 Ok(None)
             }
+        }
+    }
+
+    /// 校验元素（或其后代、label 关联控件）此刻持有所在文档的焦点，
+    /// 返回其会话；否则拒绝。
+    async fn require_focused(&self, locate: &LocateMap, id: &str) -> Result<String, ExecErr> {
+        let denied = |e: String| ExecErr::Rejected(RejectReason::PolicyDenied { detail: e });
+        let (session, backend) = self.locate_session_backend(locate, id).await?;
+        let resolved = self
+            .browser
+            .cdp
+            .call(
+                Some(&session),
+                "DOM.resolveNode",
+                serde_json::json!({"backendNodeId": backend}),
+            )
+            .await
+            .map_err(denied)?;
+        let object_id = resolved
+            .pointer("/object/objectId")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| denied("resolveNode 无 objectId".into()))?
+            .to_string();
+        let out = self
+            .browser
+            .cdp
+            .call(
+                Some(&session),
+                "Runtime.callFunctionOn",
+                serde_json::json!({
+                    "objectId": object_id,
+                    "functionDeclaration": "function(){ const a = this.ownerDocument.activeElement; return !!a && (this === a || this.contains(a) || this.control === a); }",
+                    "returnByValue": true,
+                }),
+            )
+            .await
+            .map_err(denied)?;
+        if out
+            .pointer("/result/value")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+        {
+            Ok(session)
+        } else {
+            Err(denied("Type 目标点击后未获得焦点，已拒绝输入".into()))
         }
     }
 
@@ -1574,8 +1633,94 @@ fn draw_marks(
     Ok(out)
 }
 
+/// Upload 文件解析：相对路径按上传根目录解析；canonicalize 后必须落在
+/// 根目录内（挡 `..` 穿越与符号链接逃逸），且是普通文件。返回规范化路径，
+/// 交给 Chromium 的就是它（不再是调用方给的原串）。
+fn resolve_upload_path(root: &std::path::Path, f: &str) -> Result<String, RejectReason> {
+    let not_found = || RejectReason::FileNotFound {
+        path: f.to_string(),
+    };
+    let p = std::path::Path::new(f);
+    let joined = if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        root.join(p)
+    };
+    let real = joined.canonicalize().map_err(|_| not_found())?;
+    if !real.starts_with(root) {
+        return Err(RejectReason::PolicyDenied {
+            detail: "Upload 文件必须位于上传目录内".into(),
+        });
+    }
+    let md = std::fs::metadata(&real).map_err(|_| not_found())?;
+    if !md.is_file() {
+        return Err(not_found());
+    }
+    if md.len() > UPLOAD_MAX_BYTES {
+        return Err(RejectReason::FileTooLarge {
+            path: f.to_string(),
+        });
+    }
+    real.to_str().map(str::to_string).ok_or_else(not_found)
+}
+
+const UPLOAD_MAX_BYTES: u64 = 200 * 1024 * 1024;
+
 #[cfg(test)]
 mod tests {
+    fn upload_sandbox(tag: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        let base = std::env::temp_dir().join(format!("rig-upload-ut-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let root = base.join("uploads");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("a.txt"), b"hi").unwrap();
+        std::fs::write(base.join("secret.txt"), b"nope").unwrap();
+        (
+            base.canonicalize().unwrap().join("uploads"),
+            base.canonicalize().unwrap(),
+        )
+    }
+
+    #[test]
+    fn upload_path_confined_to_root() {
+        let (root, base) = upload_sandbox("confine");
+        // 相对名按根解析；绝对路径在根内也可
+        assert!(resolve_upload_path(&root, "a.txt")
+            .unwrap()
+            .ends_with("uploads/a.txt"));
+        assert!(resolve_upload_path(&root, root.join("a.txt").to_str().unwrap()).is_ok());
+        // 根外：绝对路径、`..` 穿越都拒绝
+        let outside = base.join("secret.txt");
+        assert!(matches!(
+            resolve_upload_path(&root, outside.to_str().unwrap()),
+            Err(RejectReason::PolicyDenied { .. })
+        ));
+        assert!(matches!(
+            resolve_upload_path(&root, "../secret.txt"),
+            Err(RejectReason::PolicyDenied { .. })
+        ));
+        // 不存在 / 目录
+        assert!(matches!(
+            resolve_upload_path(&root, "missing.txt"),
+            Err(RejectReason::FileNotFound { .. })
+        ));
+        assert!(matches!(
+            resolve_upload_path(&root, "."),
+            Err(RejectReason::FileNotFound { .. })
+        ));
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn upload_symlink_escape_is_rejected() {
+        let (root, base) = upload_sandbox("symlink");
+        std::os::unix::fs::symlink(base.join("secret.txt"), root.join("link.txt")).unwrap();
+        assert!(matches!(
+            resolve_upload_path(&root, "link.txt"),
+            Err(RejectReason::PolicyDenied { .. })
+        ));
+        let _ = std::fs::remove_dir_all(base);
+    }
     use super::*;
 
     /// 回归（审查 P1）：打码取自完整快照——响应视图被裁掉敏感字段时，

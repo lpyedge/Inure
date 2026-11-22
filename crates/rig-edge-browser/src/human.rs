@@ -391,7 +391,7 @@ impl HumanChannel {
 
     /// DOM 镜像模式的输入分发：坐标已是页面坐标，绕过 chrome 命中
     /// 测试与编辑器，直达页面（执行期遮蔽规则与视频模式一致）。
-    pub async fn handle_ws_dom(&self, v: &Value) {
+    pub async fn handle_ws_dom(&self, v: &Value, out: &mpsc::Sender<String>) {
         let kind = v.get("type").and_then(Value::as_str).unwrap_or("");
         let f = |k: &str| v.get(k).and_then(Value::as_f64).unwrap_or(0.0) as f32;
         match kind {
@@ -404,23 +404,28 @@ impl HumanChannel {
                 }
             }
             "clipboard-get" => {
-                // 同 handle_ws 的显式剪贴板桥；DOM 模式无逐连接
-                // 回信通道，借 notices 广播（观看端不分模式都收）
+                // 同 handle_ws 的显式剪贴板桥：只回请求端，不得广播
+                // 给其他观看端（否则会写入别人的本机剪贴板）
                 if let Ok(t) = self.clipboard_get_text().await {
-                    self.notice(json!({"type": "clipboard-text", "text": t}));
+                    let msg = json!({"type": "clipboard-text", "text": t});
+                    let _ = out.send(msg.to_string()).await;
                 }
             }
             "image-at" => {
                 let (x, y) = (f("x"), f("y"));
                 let d = self.image_at(x, y).await.unwrap_or_default();
-                self.notice(json!({"type": "image-at", "data": d}));
+                let _ = out
+                    .send(json!({"type": "image-at", "data": d}).to_string())
+                    .await;
             }
             "image-at-node" => {
                 // DOM 模式按节点 id 取图（镜像坐标会漂移，按 id
                 // 在序列化器注册表里定位元素本体，永远准确）
                 let i = v.get("i").and_then(Value::as_i64).unwrap_or(0);
                 let d = self.image_at_node(i).await.unwrap_or_default();
-                self.notice(json!({"type": "image-at", "data": d}));
+                let _ = out
+                    .send(json!({"type": "image-at", "data": d}).to_string())
+                    .await;
             }
             _ => {}
         }
@@ -1960,6 +1965,10 @@ impl HumanChannel {
     }
 
     pub async fn paste_image(&self, png_base64: &str) -> Result<(), String> {
+        // 该串会拼进页面 JS，先验字母表与大小，杜绝字符串逃逸注入
+        if !is_safe_base64(png_base64) {
+            return Err("paste-image 数据不是合法 base64 或超限".into());
+        }
         let session = self.view().await?;
         let js = format!(
             "(async () => {{ \
@@ -1980,6 +1989,17 @@ impl HumanChannel {
             .await?;
         Ok(())
     }
+}
+
+/// 图片贴上 base64 长度上限（约 15MB 原图）
+const MAX_PASTE_IMAGE_B64: usize = 20 * 1024 * 1024;
+
+/// 仅标准 base64 字母表（含 `=` 填充）且非空、不超限
+fn is_safe_base64(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= MAX_PASTE_IMAGE_B64
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'='))
 }
 
 /// screencast JPEG → RGB。必须走 ffmpeg（libavcodec mjpeg），不能用
@@ -2031,6 +2051,16 @@ fn decode_jpeg_rgb(raw: &[u8]) -> Option<image::RgbImage> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 图片贴上的 base64 会拼进页面 JS，必须只含标准字母表且有上限
+    #[test]
+    fn paste_image_base64_rejects_script_injection() {
+        assert!(is_safe_base64("iVBORw0KGgo="));
+        assert!(!is_safe_base64("');alert(1);//"));
+        assert!(!is_safe_base64("abc\ndef"));
+        assert!(!is_safe_base64(""));
+        assert!(!is_safe_base64(&"A".repeat(MAX_PASTE_IMAGE_B64 + 1)));
+    }
 
     #[test]
     fn capture_demand_is_released_once_per_consumer() {

@@ -6,11 +6,9 @@ const promptBox = document.getElementById('prompt');
 /* 输入坐标使用边缘实际应用的 CSS 视口。 */
 let cssViewportW = 0, cssViewportH = 0;
 const rtcAudio = new Audio();
-/* 直连令牌：从本页 URL 的 ?token= 读出，透传给 WS 与文件取回 */
-const TOK = new URLSearchParams(location.search).get('token') || '';
-const TQ = TOK ? ('?token=' + encodeURIComponent(TOK)) : '';
-const fch = (u, o) => fetch(u + (TOK ? (u.includes('?') ? '&' : '?') + 'token=' + encodeURIComponent(TOK) : ''), o);
-const ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws' + TQ);
+/* 鉴权由 auth.js 引导（令牌不进 URL）：fch 带 access 头，WS 首帧认证 */
+const fch = (u, o) => window.__rigAuth.fetch(u, o);
+const ws = window.__rigAuth.openWs();
 let avWanted = false, avWait = 0;
 let hlsRequested = false, hlsPlaying = false;
 ws.binaryType = 'arraybuffer';
@@ -67,7 +65,7 @@ ws.onmessage = (ev) => {
   if (m.type === 'dom-snapshot' || m.type === 'dom-delta' || m.type === 'dom-state' || m.type === 'dom-canvas' || m.type === 'dom-region' || m.type === 'dom-chunk') {
     __domStats.ws++; domFeed(m);
   }
-  if (m.type === 'ghost') showGhost(m);
+  if (m.type === 'ghost') { showGhost(m); if (tookOver) { tookOver = false; toast('AI 已恢复控制'); } }
   if (m.type === 'ghost-off') hideGhost();
   /* T01：边缘 DC 待发队列丢弃旧代次后请求重同步，观看端回发 dom-resync */
   if (m.type === 'dom-resync-needed') send({type:'dom-resync'});
@@ -169,7 +167,16 @@ function applyCanvas(m) {
   img.src = m.d;
 }
 function send(o) { if (ws.readyState === 1) ws.send(JSON.stringify(o)); }
-document.getElementById('pYes').onclick = () => { promptBox.style.display = 'none'; send({type:'takeover', yes:true}); ime.focus(); };
+/* 强制接管后 AI 若恢复操作（收到 ghost 指针），给明确提示 */
+let tookOver = false;
+function toast(text) {
+  const el = document.createElement('div');
+  el.textContent = text;
+  el.style.cssText = 'position:fixed;top:56px;left:50%;transform:translateX(-50%);z-index:9000;padding:6px 14px;border-radius:6px;background:#c62828;color:#fff;font:13px system-ui,sans-serif;pointer-events:none';
+  document.body.appendChild(el);
+  setTimeout(() => el.remove(), 3000);
+}
+document.getElementById('pYes').onclick = () => { promptBox.style.display = 'none'; tookOver = true; send({type:'takeover', yes:true}); ime.focus(); };
 document.getElementById('pNo').onclick = () => { promptBox.style.display = 'none'; send({type:'takeover', yes:false}); ime.focus(); };
 function frameRect() {
   return (hlsPlaying || rtcOn ? vid : cv).getBoundingClientRect();
@@ -759,7 +766,7 @@ function startHls() {
   const offered = window.__rigHls || ['hevc', 'h264'];
   const hevcOk = offered.includes('hevc') && window.MediaSource && MediaSource.isTypeSupported('video/mp4; codecs="hvc1.1.6.L93.B0, mp4a.40.2"');
   vid.muted = false;
-  vid.src = (hevcOk ? '/stream/hevc/index.m3u8' : '/stream/h264/index.m3u8') + TQ;
+  vid.src = '/stream/' + window.__rigAuth.streamKey() + (hevcOk ? '/hevc/index.m3u8' : '/h264/index.m3u8');
   vid.play().catch(() => {});
 }
 function stopHls() {
