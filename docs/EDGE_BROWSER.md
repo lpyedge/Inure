@@ -145,6 +145,7 @@ platform/arch——版本取 product 的真實完整版本，UA 串裡的是約�
 人通道關閉時會斷開既有觀看連線，停止輸入並釋放 DOM、RTC 與 JPEG 需求。
 從 `/channels` 重開後，觀看端需重新連線。AV 關閉時合流管線停機。三通道全關時僅控制介面可用。
 閘門在 HTTP 與 MCP 兩個前端一致生效。
+**關閉 AI 通道同時撤銷當前執行代次**（與強制接管同一機制）：在途 act 在下一個檢查點以 `Aborted` 中止，重新開啟後須先 `observe` 重新同步才能 `act`。
 
 ## 6. 直連鑑權（LIU 2026-11-22 重做，見 `docs/HARDENING_PLAN_2026-11-22.md`）
 
@@ -529,6 +530,8 @@ offer 同時攜帶 host 與 srflx 候選；全 ICE 與真瀏覽器連通
   三檔帶勾/AI 通道/人通道帶勾）。
 
 ### 9.2 DOM 鏡像通道（Phase 2 原型，LIU 2026-11-19 立項；已實現）
+
+> **密碼值不進鏡像**（2026-11-22）：序列化器對 `type=password` 的輸入框不發 `value` 屬性與值；`val` 增量與 `value` 屬性變化同樣不帶，非空時僅發定長佔位（不洩露長度）。測試 `edge_dom_mirror_does_not_carry_password_values`。
 
 Spike 數據（`docs/DOM_SPIKE_2026-11-19.md`）支持人通道改
 混合分層：普通頁面走 DOM 鏡像、頁內媒體區域走視頻子流、

@@ -870,6 +870,11 @@ async fn apply_gate_flags(app: &Arc<App>, ai: Option<bool>, human: Option<bool>,
     }
     if let Some(a) = ai {
         app.gate_ai.store(a, Ordering::SeqCst);
+        if !a {
+            // 关闭 AI 通道 = 撤销当前执行代次：在途 act 在下一个检查点中止，
+            // 重开后须先 observe 重新同步才能 act（与强制接管同一机制）
+            app.exec.request_abort().await;
+        }
     }
     if let Some(av) = av {
         if !av || app.av_capable && app.human_enabled() {
@@ -1540,12 +1545,13 @@ fn mcp_tools() -> serde_json::Value {
         },
         {
             "name": "act",
-            "description": "执行一个动作。参数为 ActionRequest：{frame_id, action}。action 示例：{kind:'click', target:{by:'element', id:'e3'}}、{kind:'type', target:{by:'element', id:'e3'}, text:'内容', submit:false}、{kind:'key', key:'Control+A'}、{kind:'navigate', url:'https://…'}、{kind:'scroll', dx:0, dy:600}、{kind:'upload', target:{by:'element', id:'e3'}, files:['/abs/path/a.pdf']}（给文件框喂边缘主机上的文件）。frame_id 用最近一次 observe 的帧号，页面变化后陈旧帧会被拒（重新 observe 即可）。",
+            "description": "执行一个动作。参数为 ActionRequest：{frame_id, action}。action 示例：{kind:'click', target:{by:'element', id:'e3'}}、{kind:'type', target:{by:'element', id:'e3'}, text:'内容', submit:false}、{kind:'key', key:'Control+A'}、{kind:'navigate', url:'https://…'}、{kind:'scroll', dx:0, dy:600}、{kind:'upload', target:{by:'element', id:'e3'}, files:['a.pdf']}（给文件框喂文件；只能取自边缘的上传目录，相对名按该目录解析，目录外一律拒绝）。frame_id 用最近一次 observe 的帧号，页面变化后陈旧帧会被拒（重新 observe 即可）。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "frame_id": {"type": "integer"},
-                    "action": {"type": "object"}
+                    "action": {"type": "object"},
+                    "request_id": {"type": "string", "description": "可选；用于幂等与追踪，缺省时边缘自动生成"}
                 },
                 "required": ["frame_id", "action"],
                 "additionalProperties": false

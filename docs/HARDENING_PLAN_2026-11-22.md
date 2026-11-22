@@ -77,9 +77,12 @@
 | # | 改动 | 状态 |
 |---|---|---|
 | 15 | 恢复提示与 Aborted 文案 | 完成 |
+| 16 | 人工关闭 AI 通道时撤销在途动作（后补：审查 P1 前半，初版只核实了入口闸门）；`act` schema 声明可选 `request_id`；upload 工具描述改为上传目录口径 | 完成 |
+| 17 | DOM 镜像不再携带密码框的值（快照 `v`/`value` 属性、`val` 增量、`value` 属性变化均不带；非空时只发定长占位，不泄露长度）；探针 `edge_dom_mirror_does_not_carry_password_values` | 完成 |
+| 18 | 音视频集成测试 `edge_av_and_image_clipboard` 改用 `stream_key` 路径并增加错误钥匙 401 断言 | 完成 |
 
 ## 五、不在本次范围
 
 - 外部审查附带的 OpenClaw/Hermes 配置与体积数字：来源不是本仓库实测，未经实际运行不写入文档。
 - `act` schema 是否声明 `request_id`：未核实，暂不处理。
-- DOM 镜像传原始表单值：登录场景视为可接触凭证的通道，已知，不在本轮改动。
+- Hermes / OpenClaw 宿主接入：属接入开发逻辑，暂不做。

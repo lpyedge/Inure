@@ -813,7 +813,22 @@ async fn edge_av_and_image_clipboard() {
     assert_eq!(ch["av_available"], true, "ffmpeg/PulseAudio 应就位: {ch}");
     assert_eq!(ch["av_wanted"], true, "--av 應保留 AV 意圖: {ch}");
     assert_eq!(ch["av"], false, "沒有播放請求時不應啟動合流管線: {ch}");
-    let (status, _) = http(av_port, "GET", "/stream/hevc/not-a-playlist.m3u8", None);
+    // 媒体流用登录后下发的路径钥匙（原生 <video> 带不了请求头）
+    let (_, login) = http_json(
+        av_port,
+        "POST",
+        "/session",
+        Some(json!({"token": TEST_TOKEN})),
+    );
+    let key = login["stream_key"].as_str().expect("登录应下发 stream_key");
+    let (status, _) = http(av_port, "GET", "/stream/wrong-key/hevc/index.m3u8", None);
+    assert_eq!(status, 401, "錯誤的 stream_key 應被拒: {status}");
+    let (status, _) = http(
+        av_port,
+        "GET",
+        &format!("/stream/{key}/hevc/not-a-playlist.m3u8"),
+        None,
+    );
     assert_eq!(status, 404, "無效播放路徑應被拒: {status}");
     let (_, idle) = http_json(av_port, "GET", "/health", None);
     assert_eq!(
@@ -824,7 +839,12 @@ async fn edge_av_and_image_clipboard() {
     let deadline = Instant::now() + Duration::from_secs(60);
     let mut playlist = String::new();
     let seg_name = loop {
-        let (status, bytes) = http(av_port, "GET", "/stream/hevc/index.m3u8", None);
+        let (status, bytes) = http(
+            av_port,
+            "GET",
+            &format!("/stream/{key}/hevc/index.m3u8"),
+            None,
+        );
         if status == 200 {
             playlist = String::from_utf8_lossy(&bytes).to_string();
             if let Some(line) = playlist.lines().find(|l| l.ends_with(".m4s")) {
@@ -846,15 +866,30 @@ async fn edge_av_and_image_clipboard() {
     // H.264 版本与 HEVC 同进程双路输出，首段落盘可能稍晚——同样轮询等待
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
-        let (status, _) = http(av_port, "GET", "/stream/h264/index.m3u8", None);
+        let (status, _) = http(
+            av_port,
+            "GET",
+            &format!("/stream/{key}/h264/index.m3u8"),
+            None,
+        );
         if status == 200 {
             break;
         }
         assert!(Instant::now() < deadline, "H.264 兜底版本播放列表未就绪");
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
-    let (_, init) = http(av_port, "GET", "/stream/hevc/init.mp4", None);
-    let (_, seg) = http(av_port, "GET", &format!("/stream/hevc/{seg_name}"), None);
+    let (_, init) = http(
+        av_port,
+        "GET",
+        &format!("/stream/{key}/hevc/init.mp4"),
+        None,
+    );
+    let (_, seg) = http(
+        av_port,
+        "GET",
+        &format!("/stream/{key}/hevc/{seg_name}"),
+        None,
+    );
     assert!(
         init.len() > 100 && seg.len() > 1000,
         "初始化段/媒体段应有内容"
@@ -1065,6 +1100,123 @@ fn free_port() -> u16 {
     let p = l.local_addr().unwrap().port();
     drop(l);
     p
+}
+
+const DOM_PW_HTML: &str = r#"<!DOCTYPE html><html lang="zh"><head><meta charset="utf-8"><title>DOM 密码探针</title></head>
+<body><input id="plain" type="text" value="PLAIN-OK">
+<input id="pw" type="password" value="SYNTHETIC-ONLY">
+<script>
+setTimeout(() => {
+  const p = document.getElementById('pw');
+  p.value = 'LATE-SECRET';
+  p.dispatchEvent(new Event('input', {bubbles: true}));
+}, 1200);
+</script></body></html>"#;
+
+/// DOM 镜像通道不得携带密码框的值（快照与后续 val 增量都不行），
+/// 普通输入框的值照常镜像（防假通过）。
+#[tokio::test]
+async fn edge_dom_mirror_does_not_carry_password_values() {
+    if std::env::var("RIG_EDGE_IT").is_err() {
+        eprintln!("跳过：未设置 RIG_EDGE_IT");
+        return;
+    }
+    let _serial = SERIAL.lock().await;
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    serve(listener, vec![("/pw.html".into(), DOM_PW_HTML.into())]);
+    let edge_port = free_port();
+    let _edge = spawn_edge(&[
+        "--listen".into(),
+        format!("127.0.0.1:{edge_port}"),
+        "--url".into(),
+        format!("http://127.0.0.1:{port}/pw.html"),
+        "--human".into(),
+        "--width".into(),
+        "900".into(),
+        "--height".into(),
+        "700".into(),
+    ]);
+    wait_health(edge_port).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    use futures_util::SinkExt;
+    let (mut ws, _) = ws_connect(format!("ws://127.0.0.1:{edge_port}/ws"))
+        .await
+        .expect("人通道 WS 应可连接");
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        json!({"type": "dom-start"}).to_string().into(),
+    ))
+    .await
+    .unwrap();
+    // 收 4 秒内的全部 DOM 文本帧（覆盖初始快照与 1.2s 后的 val 增量）
+    let mut all = String::new();
+    let deadline = Instant::now() + Duration::from_secs(4);
+    while Instant::now() < deadline {
+        if let Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Text(t)))) =
+            tokio::time::timeout(Duration::from_millis(500), ws.next()).await
+        {
+            all.push_str(&t);
+        }
+    }
+    assert!(all.contains("dom-snapshot"), "应收到 DOM 快照");
+    assert!(all.contains("PLAIN-OK"), "普通输入框的值应照常镜像");
+    for secret in ["SYNTHETIC-ONLY", "LATE-SECRET"] {
+        assert!(!all.contains(secret), "DOM 镜像不得携带密码值 {secret}");
+    }
+}
+
+/// 人工关闭 AI 通道 = 撤销当前执行代次：重新开启后，必须先 observe
+/// 重新同步，旧任务的 act 不得直接继续（外部审查 P1）。
+#[tokio::test]
+async fn edge_ai_gate_close_cancels_inflight_and_latches() {
+    if std::env::var("RIG_EDGE_IT").is_err() {
+        eprintln!("跳过：未设置 RIG_EDGE_IT");
+        return;
+    }
+    let _serial = SERIAL.lock().await;
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    serve(listener, vec![("/login.html".into(), LOGIN_HTML.into())]);
+    let edge_port = free_port();
+    let _edge = spawn_edge(&[
+        "--listen".into(),
+        format!("127.0.0.1:{edge_port}"),
+        "--url".into(),
+        format!("http://127.0.0.1:{port}/login.html"),
+    ]);
+    wait_health(edge_port).await;
+
+    let obs = observe(edge_port);
+    let frame = obs["observation"]["frame_id"].as_u64().unwrap();
+    let btn = find_element(&obs["observation"], "button", "登录").expect("应有登录按钮")["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let click = |rid: &str, frame: u64| {
+        http_json(
+            edge_port,
+            "POST",
+            "/act",
+            Some(json!({"request_id": rid, "frame_id": frame,
+                        "action": {"kind":"click","target":{"by":"element","id":btn}}})),
+        )
+    };
+
+    http_json(edge_port, "POST", "/channels", Some(json!({"ai": false})));
+    let (code, _) = click("gate-closed", frame);
+    assert_eq!(code, 409, "AI 通道关闭时 act 应被闸门拒绝");
+    http_json(edge_port, "POST", "/channels", Some(json!({"ai": true})));
+    let (code, v) = click("after-reopen", frame);
+    assert_eq!(code, 200);
+    assert_eq!(
+        v["result"]["result"], "aborted",
+        "重开后未重新 observe，旧任务的 act 不得继续: {v}"
+    );
+    let obs = observe(edge_port);
+    let frame = obs["observation"]["frame_id"].as_u64().unwrap();
+    let (_, v) = click("after-observe", frame);
+    assert_eq!(v["result"]["result"], "done", "重新 observe 后应放行: {v}");
 }
 
 /// 直连鉴权：无令牌拒绝启动；令牌只认 Bearer 头，换票与 refresh 轮换。

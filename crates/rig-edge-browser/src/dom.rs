@@ -38,6 +38,10 @@ const SCRIPT: &str = r##"(() => {
   // 镜像文档的源是观看页，相对/根相对路径若留到镜像端解析会落到
   // 观看端源上（实测 YouTube 的 /s/player/*.css 被请求到边缘地址
   // 吃 401）。data:/blob:/# 等非网络引用原样保留。
+  // 密码框的值永不进镜像（快照、val 增量、value 属性变化都不带）；
+  // 非空时只发定长占位，不泄露真实长度
+  function isPw(n) { return n && n.tagName === 'INPUT' && String(n.type).toLowerCase() === 'password'; }
+  function pwMask(v) { return v ? '\u2022\u2022\u2022\u2022\u2022\u2022' : ''; }
   function absUrl(v) {
     if (!v || /^(data:|blob:|javascript:|mailto:|tel:|#)/i.test(v)) return v;
     try { return new URL(v, location.href).href; } catch (e) { return v; }
@@ -77,6 +81,7 @@ const SCRIPT: &str = r##"(() => {
     }
     const attrs = {};
     for (const at of node.attributes) { if (!/^on/i.test(at.name)) attrs[at.name] = at.value; }
+    if (isPw(node)) delete attrs.value;
     for (const k of ['href', 'src', 'poster', 'action', 'data', 'background']) {
       if (attrs[k]) attrs[k] = absUrl(attrs[k]);
     }
@@ -87,7 +92,7 @@ const SCRIPT: &str = r##"(() => {
     // 站点的图标全是内联 SVG，实测 YouTube 镜像里所有图标
     // 按钮成空白圆圈即此故
     if (node.namespaceURI === 'http://www.w3.org/2000/svg') out.ns = 1;
-    if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') { out.v = node.value; if (node.checked) out.k = 1; }
+    if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') { out.v = isPw(node) ? pwMask(node.value) : node.value; if (node.checked) out.k = 1; }
     if (tag === 'OPTION' && node.selected) out.k = 1;
     if (tag === 'VIDEO') {
       const r = node.getBoundingClientRect();
@@ -172,7 +177,7 @@ const SCRIPT: &str = r##"(() => {
     if (!S.obs) return;
     const t = e.target;
     if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT')) {
-      S.queue.push({ o: 'val', i: rid(t), v: t.value, k: t.checked ? 1 : 0 }); schedule();
+      S.queue.push({ o: 'val', i: rid(t), v: isPw(t) ? pwMask(t.value) : t.value, k: t.checked ? 1 : 0 }); schedule();
     }
   }
   // 规则序列化（递归）：@import 同源可读则内联展开（跨源保留原行）；
@@ -333,6 +338,7 @@ const SCRIPT: &str = r##"(() => {
           }
         }
       } else if (r.type === 'attributes') {
+        if (r.attributeName === 'value' && isPw(r.target)) continue;
         let v = r.target.getAttribute(r.attributeName);
         // 差分里的资源属性同样要绝对化（与快照同一口径）
         if (v && ['href', 'src', 'poster', 'action', 'data', 'background'].includes(r.attributeName)) v = absUrl(v);
