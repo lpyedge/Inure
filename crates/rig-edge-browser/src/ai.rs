@@ -1735,6 +1735,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(base);
     }
 
+    #[cfg(unix)]
     #[test]
     fn upload_symlink_escape_is_rejected() {
         let (root, base) = upload_sandbox("symlink");

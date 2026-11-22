@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/rig-proto",
     "crates/rig-edge-browser",
+    "crates/rig-launcher",
     "crates/rig-eval",
 ]
 [workspace.package]

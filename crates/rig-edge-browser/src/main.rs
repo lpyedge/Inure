@@ -36,7 +36,12 @@ mod exec;
 mod human;
 mod media;
 mod metrics;
+#[cfg(target_os = "linux")]
 mod pulse;
+#[cfg(not(target_os = "linux"))]
+mod pulse {
+    pub const SINK_NAME: &str = "rigsink";
+}
 mod rtc;
 mod snapshot;
 
@@ -383,9 +388,39 @@ fn origin_of(url: &str) -> Option<String> {
     Some(format!("{scheme}://{hostport}"))
 }
 
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to register SIGTERM handler");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = term.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    tokio::signal::ctrl_c()
+        .await
+        .expect("failed to register Ctrl+C handler");
+}
+
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = std::env::args().collect();
+    if args
+        .get(1)
+        .is_some_and(|arg| arg == "--check-media-runtime")
+    {
+        encode::ensure_init();
+        for name in ["libx264", "libx265", "aac"] {
+            if ffmpeg_next::encoder::find_by_name(name).is_none() {
+                eprintln!("Required FFmpeg encoder is unavailable: {name}");
+                std::process::exit(1);
+            }
+        }
+        println!("FFmpeg runtime ready");
+        return;
+    }
     let get_arg = |name: &str| -> Option<String> {
         args.windows(2).find(|w| w[0] == name).map(|w| w[1].clone())
     };
@@ -440,6 +475,7 @@ async fn main() {
 
     let attached = get_arg("--cdp-url");
     // 自拉 Chromium 启动时接入自己的虚拟声卡；挂靠无法改变现有进程的输出。
+    #[cfg(target_os = "linux")]
     let audio = if serves_http && attached.is_none() {
         pulse::PulseAudio::start(get_arg("--pulseaudio-dir").as_deref())
             .await
@@ -450,7 +486,10 @@ async fn main() {
     } else {
         None
     };
+    #[cfg(target_os = "linux")]
     let pulse_server = audio.as_ref().map(|instance| instance.server().to_owned());
+    #[cfg(not(target_os = "linux"))]
+    let (audio, pulse_server): (Option<()>, Option<String>) = (None, None);
     let pulse = Arc::new(Mutex::new(audio));
 
     // Upload 只允许取自该目录（人要给 AI 传文件，把文件放进来）：给了
@@ -647,15 +686,9 @@ async fn main() {
             let temp_sig = temp_dirs.clone();
             let pulse_sig = pulse.clone();
             tokio::spawn(async move {
-                let mut term =
-                    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                        .expect("failed to register SIGTERM handler");
-                tokio::select! {
-                    _ = tokio::signal::ctrl_c() => {}
-                    _ = term.recv() => {}
-                }
+                shutdown_signal().await;
                 app_sig.browser.shutdown().await;
-                drop(pulse_sig.lock().await.take());
+                let _ = pulse_sig.lock().await.take();
                 remove_temp_dirs(&temp_sig);
                 std::process::exit(0);
             });
@@ -676,13 +709,7 @@ async fn main() {
                 // 落盘关闭（持久化目录靠它兑现，见 browser.rs）。
                 // 只认 ctrl_c 时，systemd/部署脚本的 kill（TERM）
                 // 会把边缘连同未落盘的登录态一起带走。
-                let mut term =
-                    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                        .expect("failed to register SIGTERM handler");
-                tokio::select! {
-                    _ = tokio::signal::ctrl_c() => {}
-                    _ = term.recv() => {}
-                }
+                shutdown_signal().await;
                 h.graceful_shutdown(Some(std::time::Duration::from_secs(5)));
             });
         }
@@ -702,7 +729,7 @@ async fn main() {
         r.expect("server exited abnormally");
     }
     app.browser.shutdown().await;
-    drop(pulse.lock().await.take());
+    let _ = pulse.lock().await.take();
     remove_temp_dirs(&temp_dirs);
 }
 

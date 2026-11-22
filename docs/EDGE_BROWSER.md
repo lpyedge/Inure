@@ -62,7 +62,7 @@ RIG 的**瀏覽器邊緣程序**：一個 Rust 二進位，與目標 Chromium �
 
 | 模式 | 觸發 | 行為 | 生命週期歸屬 |
 |---|---|---|---|
-| 自拉起 launch | 預設 | 依序從 PATH 發現 `chromium`、`chromium-browser`、`google-chrome`、`google-chrome-stable`；`--chromium-dir` 指定直接含 `chrome` 或 `chromium` 的目錄。显式目录无效时报错，不回退到 PATH；无 Playwright/HOME 自动探测 | 邊緣擁有：退出時關閉瀏覽器 |
+| 自拉起 launch | 預設 | 原生发布启动器优先查包旁 `chromium/`，然后查 PATH 与平台默认安装位置，最后回退到 `--chromium-dir`；源码直接运行从 PATH 和平台位置开始。支持平台对应的可执行文件名及 macOS 标准应用包；不探测 Playwright 缓存 | 邊緣擁有：退出時關閉瀏覽器 |
 | 掛靠 attach | `--cdp-url http://127.0.0.1:9222` | 輪詢 `{base}/json/version` 取 `webSocketDebuggerUrl` 後連接現成 Chromium | 瀏覽器自有：邊緣退出**只斷開連接，絕不關閉被掛靠的瀏覽器**（集成測試驗證） |
 
 兩種模式連接後的頁面會話建立、AX 啟用、剪貼板授權流程完全一致（內部共用
@@ -106,7 +106,8 @@ platform/arch——版本取 product 的真實完整版本，UA 串裡的是約�
 | `--listen <addr:port>` | `127.0.0.1:39871` | HTTP 服務綁定位址（stdio 模式下僅 `--human` 時用於觀看頁） |
 | `--url <url>` | `about:blank` | 啟動後導航到的頁面；其 origin 自動進入導航白名單 |
 | `--cdp-url <base>` | — | 掛靠模式：現成 Chromium 的 DevTools HTTP 基位址（見 §3） |
-| `--chromium-dir <path>` | 自動發現 | 自拉起模式的 Chromium 目錄；目錄中須直接有可執行檔 `chrome` 或 `chromium`。未指定時按順序查找 PATH：`chromium`、`chromium-browser`、`google-chrome`、`google-chrome-stable`；無 Playwright/HOME 自動探測，指定目錄無效會報錯且不回退 |
+| `--chromium-dir <path>` | 自動發現 | 自拉起模式的最后回退目录；Linux/macOS 识别 `chrome`/`chromium`，Windows 识别 `.exe` 版本；macOS 支持 Chrome for Testing、Google Chrome 和 Chromium 应用包。发布包顺序为包旁 `chromium/` → PATH → Windows/macOS 默认安装位置 → 此参数；源码运行从 PATH 和平台位置开始。 |
+| `--install-deps [--with-chromium] [--deps-base-url HTTPS_URL]` | — | 发布启动器的独立安装/更新命令，下载并部署后退出，不启动服务。按 target 与媒体 ABI 下载索引和 full 归档，校验 SHA-256，并用本地核心程序检查媒体编码器后替换运行库；`--with-chromium` 同时安装便携浏览器 |
 | `--pulseaudio-dir <path>` | 啟動器提供 | 指定 PulseAudio 解包目錄；發布入口使用包內目錄，源碼運行可從 PATH 啟動系統 PulseAudio |
 | `--width` / `--height` | 1280 / 800 | 瀏覽器視口尺寸 |
 | `--allow-origin <origin>` | — | 追加允許 Navigate 的 origin（可重複給多次） |
@@ -317,7 +318,7 @@ libavutil/libswscale/libavdevice/libswresample 及其傳遞依賴。
   H.264 = libx264（veryfast、2.5Mbps）；關鍵幀間隔 20 幀（2 秒）；
   均 AAC 48kHz 128k。HLS fMP4：`hls_time 1`、列表 6 段、自動刪舊段；
   輸出於臨時目錄 `rig-edge-hls-<pid>/{hevc,h264}/`，布局與舊管線一致。
-- **虛擬聲卡**：只有提供 HTTP 且自拉 Chromium 時，程序才啟動私有 PulseAudio daemon、socket 與 `rigsink`；發布包從相鄰 `pulseaudio/` 提供執行檔和模組，源码運行可顯式指定 `--pulseaudio-dir` 或從 PATH 使用系統 PulseAudio。純 stdio 與掛靠模式不啟動。啟動缺失或失敗只禁用音頻，視頻不受影響；消費者不需安裝 PulseAudio、pactl 或 ffmpeg 命令行。
+- **虛擬聲卡**：Linux 发布包提供 PulseAudio 执行档和模块。只有提供 HTTP 且自拉 Chromium 时，程序才启动私有 PulseAudio daemon、socket 与 `rigsink`；源码运行可显式指定 `--pulseaudio-dir` 或从 PATH 使用系统 PulseAudio。Windows/macOS 原生包不提供虚拟音频采集。纯 stdio 与挂靠模式不启动。PulseAudio 缺失或启动失败只禁用音频，视频不受影响；消费者不需安装 `pactl` 或 ffmpeg 命令行。
 
 ## 9. 人通道輸入與剪貼板
 
@@ -846,7 +847,7 @@ rig-proto 單元測試鎖定 upload/新拒絕碼/Done.note 的線格式。
 
 ## 12. 集成測試
 
-`crates/rig-edge-browser/tests/edge_it.rs`：`scripts/test.sh unit` 始終跳過真 Chromium；`it`、`av`、`all` 才執行集成測試。默認從 PATH 查找 Chromium；`RIG_EDGE_TEST_CHROMIUM_DIR` 可顯式指定直接含 `chrome` 或 `chromium` 的目錄，不探測 HOME 或 Playwright。`scripts/test.sh` 在 `.temp/pulseaudio/` 存在時自動設置 PulseAudio fixture，也可用 `RIG_EDGE_TEST_PULSEAUDIO_DIR` 指定。
+`crates/rig-edge-browser/tests/edge_it.rs`：`scripts/test.sh unit` 始終跳過真 Chromium；`it`、`av`、`all` 才執行集成測試。源码测试从 PATH 和平台默认位置查找 Chromium；`RIG_EDGE_TEST_CHROMIUM_DIR` 可显式指定目录，不探测 Playwright 缓存。`scripts/test.sh` 在 `.temp/media-deps/root/` 已由 `scripts/prepare-media.sh` 准备时自动使用其中的 PulseAudio，也可用 `RIG_EDGE_TEST_PULSEAUDIO_DIR` 指定。
 
 | 測試 | 覆蓋 |
 |---|---|
@@ -882,7 +883,7 @@ rig-proto 單元測試鎖定 upload/新拒絕碼/Done.note 的線格式。
 - 測試頁元素的 AX 名稱來自 `<label>` 文本（如「用戶名」），勿憑假設寫
   期望名。
 
-全倉提交門禁 `scripts/local-gate.sh` 依序運行 fmt、clippy 與 `scripts/test.sh all`。真 Chromium 集成測試需要完整 Chromium；音視頻測試另需 PulseAudio fixture 與 `ffprobe`。
+全倉提交門禁 `scripts/local-gate.sh` 依序運行 fmt、clippy 與 `scripts/test.sh all`。真 Chromium 集成測試需要完整 Chromium；音視頻測試另需 PulseAudio、`ffprobe` 與 `ffmpeg` 命令行。
 
 ## 13. 本批次提交索引
 

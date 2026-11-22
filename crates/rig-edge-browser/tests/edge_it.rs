@@ -5,6 +5,8 @@
 //! 覆盖：登录全流程（动作+脱敏）、跨源 iframe 坐标合成、canvas 页截圖、
 //! 双通道独立开关（关人通道 WS 被拒、关 AI 通道 observe 被拒）。
 
+#![cfg(unix)]
+
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::os::unix::process::CommandExt;
@@ -757,7 +759,7 @@ fn spawn_edge(args: &[String]) -> EdgeProc {
 fn edge_command() -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_rig-edge-browser"));
     if let Ok(dir) = std::env::var("RIG_EDGE_TEST_CHROMIUM_DIR") {
-        command.args(["--chromium-dir", &dir]);
+        command.env("RIG_EDGE_BUNDLED_CHROMIUM_DIR", dir);
     }
     if let Ok(dir) = std::env::var("RIG_EDGE_TEST_PULSEAUDIO_DIR") {
         command.args(["--pulseaudio-dir", &dir]);
@@ -4327,7 +4329,18 @@ async fn edge_profile_persistence() {
     );
     assert!(
         file_contains(&dft.join("LocalStorage"), b"lv1")
-            || file_contains(&dft.join("LocalStorage-wal"), b"lv1"),
+            || file_contains(&dft.join("LocalStorage-wal"), b"lv1")
+            || std::fs::read_dir(dft.join("Local Storage/leveldb"))
+                .into_iter()
+                .flatten()
+                .filter_map(Result::ok)
+                .any(|entry| {
+                    let path = entry.path();
+                    matches!(
+                        path.extension().and_then(|ext| ext.to_str()),
+                        Some("log" | "ldb")
+                    ) && file_contains(&path, b"lv1")
+                }),
         "优雅关闭后 localStorage 应已落盘"
     );
     drop(proc_a);

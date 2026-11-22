@@ -75,8 +75,8 @@ pub struct Browser {
     persona_tz: Option<String>,
 }
 
-/// 是否以 root 运行（Linux 读 /proc/self/status 的 Uid 行首字段；
-/// 非 Linux 或读不到时按非 root 处理，即默认保留 Chromium 沙箱）。
+/// 仅在 Linux 读取实际 UID；无法读取时保留 Chromium 沙箱。
+#[cfg(target_os = "linux")]
 fn running_as_root() -> bool {
     std::fs::read_to_string("/proc/self/status")
         .ok()
@@ -86,6 +86,11 @@ fn running_as_root() -> bool {
                 .and_then(|l| l.split_whitespace().nth(1).map(|u| u == "0"))
         })
         .unwrap_or(false)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn running_as_root() -> bool {
+    false
 }
 
 /// 调试输出用的 URL 脱敏：只留 scheme://host/path，去掉 query 与 fragment
@@ -105,32 +110,128 @@ fn url_for_log(url: &str) -> String {
 }
 
 fn find_chromium(explicit: Option<&str>) -> CdpResult<PathBuf> {
-    if let Some(dir) = explicit {
-        return chromium_in_dir(std::path::Path::new(dir)).ok_or_else(|| {
-            format!(
-                "No executable chrome or chromium found directly in --chromium-dir {}",
-                dir
-            )
-        });
-    }
-    for name in [
-        "chromium",
-        "chromium-browser",
-        "google-chrome",
-        "google-chrome-stable",
-    ] {
-        if let Some(path) = find_on_path(name, std::env::var_os("PATH").as_deref()) {
-            return Ok(path);
-        }
-    }
-    Err("Chromium not found on PATH (specify its directory with --chromium-dir)".into())
+    let bundled = std::env::var_os("RIG_EDGE_BUNDLED_CHROMIUM_DIR").map(PathBuf::from);
+    let bundled = bundled.as_deref();
+    let path = std::env::var_os("PATH");
+    let installed_dirs = installed_chromium_dirs();
+    resolve_chromium(
+        explicit,
+        bundled,
+        path.as_deref(),
+        &installed_dirs,
+        path_chromium_names(),
+    )
 }
 
 fn chromium_in_dir(dir: &std::path::Path) -> Option<PathBuf> {
-    ["chrome", "chromium"]
+    #[cfg(windows)]
+    let names = ["chrome.exe", "chromium.exe"];
+    #[cfg(not(windows))]
+    let names = ["chrome", "chromium"];
+    let executable = names
         .iter()
         .map(|name| dir.join(name))
-        .find(|path| is_executable(path))
+        .find(|path| is_executable(path));
+    #[cfg(target_os = "macos")]
+    return executable.or_else(|| mac_chromium_bundle_paths(dir).find(|path| is_executable(path)));
+    #[cfg(not(target_os = "macos"))]
+    executable
+}
+
+#[cfg(target_os = "macos")]
+fn mac_chromium_bundle_paths(dir: &std::path::Path) -> impl Iterator<Item = PathBuf> {
+    let mut paths: Vec<PathBuf> = [
+        "Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing",
+        "Google Chrome.app/Contents/MacOS/Google Chrome",
+        "Chromium.app/Contents/MacOS/Chromium",
+    ]
+    .iter()
+    .map(|relative| dir.join(relative))
+    .collect();
+    paths.extend([
+        dir.join("Contents/MacOS/Google Chrome for Testing"),
+        dir.join("Contents/MacOS/Google Chrome"),
+        dir.join("Contents/MacOS/Chromium"),
+    ]);
+    paths.into_iter()
+}
+
+fn path_chromium_names() -> &'static [&'static str] {
+    #[cfg(windows)]
+    {
+        &["chrome.exe", "chromium.exe"]
+    }
+    #[cfg(not(windows))]
+    {
+        &[
+            "chromium",
+            "chromium-browser",
+            "google-chrome",
+            "google-chrome-stable",
+        ]
+    }
+}
+
+fn installed_chromium_dirs() -> Vec<PathBuf> {
+    #[allow(unused_mut)]
+    let mut dirs = Vec::new();
+    #[cfg(windows)]
+    {
+        for variable in ["ProgramFiles", "ProgramFiles(x86)", "LOCALAPPDATA"] {
+            if let Some(root) = std::env::var_os(variable).map(PathBuf::from) {
+                dirs.push(root.join("Google/Chrome/Application"));
+            }
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        for root in [
+            Some(PathBuf::from("/Applications")),
+            std::env::var_os("HOME").map(|home| PathBuf::from(home).join("Applications")),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            dirs.push(root);
+        }
+    }
+    dirs
+}
+
+fn resolve_chromium(
+    explicit: Option<&str>,
+    bundled: Option<&std::path::Path>,
+    path: Option<&std::ffi::OsStr>,
+    installed_dirs: &[PathBuf],
+    path_names: &[&str],
+) -> CdpResult<PathBuf> {
+    if let Some(dir) = bundled.filter(|dir| dir.is_absolute()) {
+        if let Some(path) = chromium_in_dir(dir) {
+            return Ok(path);
+        }
+    }
+    for name in path_names {
+        if let Some(path) = find_on_path(name, path) {
+            return Ok(path);
+        }
+    }
+    for dir in installed_dirs {
+        if let Some(path) = chromium_in_dir(dir) {
+            return Ok(path);
+        }
+    }
+    if let Some(dir) = explicit {
+        if let Some(path) = chromium_in_dir(std::path::Path::new(dir)) {
+            return Ok(path);
+        }
+        return Err(format!(
+            "No executable Chromium found in --chromium-dir {dir}"
+        ));
+    }
+    Err(
+        "Chromium not found beside the release or in system locations; specify --chromium-dir"
+            .into(),
+    )
 }
 
 fn find_on_path(name: &str, path: Option<&std::ffi::OsStr>) -> Option<PathBuf> {
@@ -1752,7 +1853,9 @@ fn collect_dom(node: &Value, map: &mut DomMap) {
 
 #[cfg(test)]
 mod chromium_lookup_tests {
-    use super::{chromium_in_dir, find_chromium, find_on_path, is_executable};
+    use super::{
+        chromium_in_dir, find_on_path, is_executable, path_chromium_names, resolve_chromium,
+    };
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -1770,7 +1873,9 @@ mod chromium_lookup_tests {
         }
 
         fn add_executable(&self, name: &str) -> PathBuf {
-            let path = self.0.join(name);
+            let path = self
+                .0
+                .join(format!("{name}{}", std::env::consts::EXE_SUFFIX));
             std::fs::write(&path, b"test").unwrap();
             #[cfg(unix)]
             {
@@ -1795,6 +1900,93 @@ mod chromium_lookup_tests {
     }
 
     #[test]
+    fn bundled_directory_precedes_path_and_explicit_fallback() {
+        let bundled = TestDir::new();
+        let bundled_exe = bundled.add_executable("chrome");
+        let path_dir = TestDir::new();
+        path_dir.add_executable("chromium");
+        let explicit = TestDir::new();
+        explicit.add_executable("chromium");
+
+        let result = resolve_chromium(
+            Some(explicit.0.to_str().unwrap()),
+            Some(bundled.0.as_path()),
+            Some(path_dir.0.as_os_str()),
+            &[],
+            path_chromium_names(),
+        );
+        assert_eq!(result.unwrap(), bundled_exe);
+    }
+
+    #[test]
+    fn path_precedes_installed_directories_and_explicit_fallback() {
+        let path_dir = TestDir::new();
+        let path_exe = path_dir.add_executable("chromium");
+        let installed = TestDir::new();
+        installed.add_executable("chrome");
+        let explicit = TestDir::new();
+        explicit.add_executable("chromium");
+
+        let result = resolve_chromium(
+            Some(explicit.0.to_str().unwrap()),
+            None,
+            Some(path_dir.0.as_os_str()),
+            std::slice::from_ref(&installed.0),
+            path_chromium_names(),
+        );
+        assert_eq!(result.unwrap(), path_exe);
+    }
+
+    #[test]
+    fn installed_directories_precede_explicit_fallback() {
+        let installed = TestDir::new();
+        let installed_exe = installed.add_executable("chrome");
+        let explicit = TestDir::new();
+        explicit.add_executable("chromium");
+
+        let result = resolve_chromium(
+            Some(explicit.0.to_str().unwrap()),
+            None,
+            None,
+            std::slice::from_ref(&installed.0),
+            path_chromium_names(),
+        );
+        assert_eq!(result.unwrap(), installed_exe);
+    }
+
+    #[test]
+    fn explicit_directory_is_last_fallback_and_absolute_bundled_only() {
+        let explicit = TestDir::new();
+        let explicit_exe = explicit.add_executable("chromium");
+        let relative = Path::new("relative-bundle");
+        assert!(!relative.is_absolute());
+        let result = resolve_chromium(
+            Some(explicit.0.to_str().unwrap()),
+            Some(relative),
+            None,
+            &[],
+            path_chromium_names(),
+        );
+        assert_eq!(result.unwrap(), explicit_exe);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn chromium_directory_supports_platform_layouts() {
+        let dir = TestDir::new();
+        let app = dir.0.join("Google Chrome for Testing.app/Contents/MacOS");
+        std::fs::create_dir_all(&app).unwrap();
+        let app_exe = app.join("Google Chrome for Testing");
+        std::fs::write(&app_exe, b"test").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&app_exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        assert_eq!(chromium_in_dir(Path::new(&dir.0)), Some(app_exe));
+    }
+
+    #[test]
     fn explicit_directory_rejects_nested_or_non_executable_candidates() {
         let dir = TestDir::new();
         std::fs::create_dir(dir.0.join("nested")).unwrap();
@@ -1807,7 +1999,7 @@ mod chromium_lookup_tests {
     #[test]
     fn invalid_explicit_directory_error_names_option() {
         let dir = TestDir::new();
-        let error = find_chromium(dir.0.to_str()).unwrap_err();
+        let error = resolve_chromium(dir.0.to_str(), None, None, &[], &[]).unwrap_err();
         assert!(error.to_string().contains("--chromium-dir"));
     }
 
@@ -1816,7 +2008,10 @@ mod chromium_lookup_tests {
         let dir = TestDir::new();
         let expected = dir.add_executable("google-chrome");
         assert_eq!(
-            find_on_path("google-chrome", Some(dir.0.as_os_str())),
+            find_on_path(
+                expected.file_name().unwrap().to_str().unwrap(),
+                Some(dir.0.as_os_str())
+            ),
             Some(expected)
         );
         assert_eq!(find_on_path("chromium", Some(dir.0.as_os_str())), None);

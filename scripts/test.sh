@@ -13,8 +13,8 @@ ROOT="$PWD"
 WHAT="${1:-unit}"
 
 run_with_it() {
-  if [ -x "$ROOT/.temp/pulseaudio/usr/bin/pulseaudio" ]; then
-    export RIG_EDGE_TEST_PULSEAUDIO_DIR="${RIG_EDGE_TEST_PULSEAUDIO_DIR:-$ROOT/.temp/pulseaudio}"
+  if [ -x "$ROOT/.temp/media-deps/root/usr/bin/pulseaudio" ]; then
+    export RIG_EDGE_TEST_PULSEAUDIO_DIR="${RIG_EDGE_TEST_PULSEAUDIO_DIR:-$ROOT/.temp/media-deps/root}"
   fi
   RIG_EDGE_IT=1 cargo test "$@"
 }

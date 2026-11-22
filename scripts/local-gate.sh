@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # 本地提交门禁：CI 检查与真实 Chromium 集成测试。
 # 任一步失败即非零退出。在仓库根目录运行 bash scripts/local-gate.sh。
-# 需要 libav* 开发包、完整 Chromium、PulseAudio 虚拟声卡和 ffprobe。
+# 需要 libav 开发包和 Chromium；音视频用例还需要 PulseAudio、ffprobe、ffmpeg。
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
