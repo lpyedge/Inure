@@ -1,5 +1,7 @@
 # rig-edge-browser —— 瀏覽器邊緣程序說明
 
+> **入口與當前狀態的權威說明見 [docs/README.md](README.md)（10 篇文檔集）。** 本文保留各專題的逐項細節（觀看端設計、DOM 鏡像、輸入與剪貼板、音視頻、提交索引），其中令牌/路由相關內容以 [08 安全模型](08-安全模型.md) 與 [06 接口与调用](06-接口与调用.md) 為準。
+>
 > 本文是 `crates/rig-edge-browser` 的權威使用與實現說明，供後續開發與外部 review 使用。
 > 定位见 `README.md` 与 `CLAUDE.md`；感知語義細節見 `docs/PERCEPTION.md`；
 > 協議型別（Observation / Action / ActionRequest 等）定義在 `crates/rig-proto`。
@@ -130,7 +132,9 @@ platform/arch——版本取 product 的真實完整版本，UA 串裡的是約�
 | 路由 | 方法 | 說明 |
 |---|---|---|
 | `/` | GET | 觀看頁（人通道 UI：原生 header、畫面、輸入覆蓋層、通道開關、影音流入口） |
-| `/viewer.js` | GET | 觀看頁腳本（與 `/` 同屬 R-17 拆分；經鑑權中介層） |
+| `/viewer.js`、`/auth.js` | GET | 觀看頁腳本（無秘密、免令牌；`auth.js` 先加載，授權成功後才加載 `viewer.js`） |
+| `/session` | POST | 啟動令牌（body）換 `access` + `refresh` + `stream_key`（見 §6） |
+| `/session/refresh` | POST | `refresh`（body）換新一對，舊 refresh 立即作廢 |
 | `/health` | GET | 存活探針（免鑑權）；回 `{"ok":true,...}`，整改第四期起附可觀測字段：`ready`、`cdp_connected`、`last_frame_age_ms`、`exec_in_flight`、`frames{sent,skipped}`、`latency{compose,encode,act,observe,dom_snapshot,quads}`（各分段 p50/p95/p99/max + 累計）、`last_snapshot`（最近一次 observe 的總時/CDP 調用數/quads 次數與耗時/AX 段耗時/節點數） |
 | `/ready` | GET | 就緒探針（免鑑權、無敏感信息）：CDP 存活且至少一個會話 → 200，否則 503。與 /health（liveness）分離（R-19） |
 | `/channels` | GET | 查三通道狀態：`{"ai":bool,"human":bool,"av":bool,"av_available":bool}` |
@@ -138,8 +142,8 @@ platform/arch——版本取 product 的真實完整版本，UA 串裡的是約�
 | `/observe` | POST | AI 觀察：請求體為 rig-proto 的 `ObserveRequest`（可空 `{}`）。回應組成由 `mode` 定：`text` 只回 `{"text"}`；`tree`（默認）回 `{"text", "observation"}`；`tree_image` 再加 `"image_png_base64"`。`budget_tokens` 按預算裁剪**響應視圖**（存儲幀不動、被裁元素憑 id 仍可操作，裁剪說明附在 text 末尾）；`subtree` 只回某元素子樹（id 不存在回 400）。`include_offscreen` 默認 false：視口外元素不進響應視圖（存儲幀保留、帶 Offscreen 狀態），true 才帶。`since_frame` 使用客戶端最後套用的觀察幀。當 `mode=tree` 且分頁、文件、座標空間與輸出投影相容時，可回 `{"delta": ObservationDelta, "text"}`。基幀須在最近 8 個已輸出的結構化觀察內。無法重建目前視圖時回整幀 |
 | `/act` | POST | AI 動作：接受 `ActionRequest`，回 `{"result": ActionResult}`。頁面狀態類拒絕另附最新觀察及文字，或附無法取得最新狀態的說明 |
 | `/screenshot.png` | GET | 當前頁編號截圖（PNG；敏感元素區域黑塊遮罩） |
-| `/ws` | GET→WS | 人通道：下行 screencast 幀與狀態；上行輸入事件（見 §9） |
-| `/stream/{rend}/{name}` | GET | HLS 播放列表與分片。有效列表請求可啟動合流，12 秒沒有有效請求即回收 |
+| `/ws` | GET→WS | 人通道：連上後 3 秒內首幀 `{type:auth,access}` 認證；下行 screencast 幀與狀態；上行輸入事件（見 §9） |
+| `/stream/{key}/{rend}/{name}` | GET | HLS 播放列表與分片；`{key}` 是登錄後下發的只讀路徑鑰匙。有效列表請求可啟動合流，12 秒沒有有效請求即回收 |
 
 **通道閘門語義**：AI 關閉時 `/observe`、`/act`、`/screenshot.png` 回 409；
 人通道關閉時會斷開既有觀看連線，停止輸入並釋放 DOM、RTC 與 JPEG 需求。

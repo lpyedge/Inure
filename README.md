@@ -1,35 +1,80 @@
 # Edge Browser — Chromium 控制与 AI/人双通道
 
-同机或局域网直连即完整形态：边缘程序 `rig-edge-browser` 直连 Chromium（CDP），
-同时 serving AI 通道（观察/动作）与人通道（观看页/音视频流）。
+一个 Rust 二进制 `rig-edge-browser`，直连 Chromium（CDP），把**同一个真实浏览器**同时开放给：
+
+- **AI 通道**：语义快照（无障碍树）+ 「帧号 + 元素 id」动作，执行前校验；
+- **人通道**：画面与声音流（WebRTC / HLS / DOM 镜像）+ 鼠标键盘剪贴板输入。
+
+人能看到 AI 在做什么，并随时强制接管。同机（stdio / 回环 HTTP）或局域网（HTTPS + 令牌）直连即完整形态。
+
+## 快速开始
 
 ```bash
-cargo build
-cargo test
-python3 eval/verify_fixtures.py               # 用真实 Chromium 校验评估任务（需要 playwright）
-python3 -m unittest discover -s tests/eval_report -v
+# 编译（依赖见 docs/04-依赖与环境.md）
+cargo build --release
+
+# 人在本机看：打开 http://127.0.0.1:39871/ 并输入令牌
+TOKEN=$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')
+target/release/rig-edge-browser --listen 127.0.0.1:39871 --token "$TOKEN" --human --url https://example.com
+
+# AI 本机子进程（MCP stdio）：由智能体宿主拉起
+target/release/rig-edge-browser --stdio --url https://example.com
 ```
 
-本地构建缓存与 Python 缓存重定向（保持仓库干净）：
+## 文档
+
+**从 [docs/README.md](docs/README.md) 开始**（10 篇文档集）：
+
+| | |
+|---|---|
+| [01 产品与业务功能](docs/01-产品与业务功能.md) | 是什么、能做什么、不做什么 |
+| [02 架构与技术方案](docs/02-架构与技术方案.md) | 模块、数据流、技术选型 |
+| [03 关键技术难点与解决](docs/03-关键技术难点与解决.md) | 踩过的坑与方案 |
+| [04 依赖与环境](docs/04-依赖与环境.md) | 依赖、全局安装、便携放置 |
+| [05 编译、部署与运行](docs/05-编译部署与运行.md) | 编译、参数、运行配方、部署、运维 |
+| [06 接口与调用](docs/06-接口与调用.md) | HTTP / MCP / 观看页 / 内嵌 |
+| [07 智能体接入方案](docs/07-智能体接入方案.md) | Hermes、OpenClaw 等（预设计） |
+| [08 安全模型](docs/08-安全模型.md) | 信任边界、令牌、威胁与对策 |
+| [09 测试与评估](docs/09-测试与评估.md) | 测试分层、集成测试、度量规范 |
+| [10 路线图与已知局限](docs/10-路线图与已知局限.md) | 需求、差距、局限 |
+
+开发约束见 [CLAUDE.md](CLAUDE.md) 与 [AGENTS.md](AGENTS.md)。
+
+## 常用脚本
+
+| 脚本 | 用途 |
+|---|---|
+| `scripts/build.sh [debug\|release]` | 编译并检查动态库依赖 |
+| `scripts/test.sh [unit\|it\|av\|py\|all]` | 测试入口（`it` 为真 Chromium 集成测试） |
+| `scripts/local-gate.sh` | 提交前完整门禁 |
+| `scripts/release.sh` | 发布打包到 `dist/`（tar.gz + sha256） |
+| `scripts/run.sh` | 本地快速运行（随机令牌 + 观看页） |
+| `scripts/clean-tmp.sh` | 清理 `/tmp` 残余临时目录 |
+
+详见 [docs/05 §1.3](docs/05-编译部署与运行.md)。
+
+## 开发
 
 ```bash
-source scripts/local-env.sh   # CARGO_TARGET_DIR=.temp/target 等
+source scripts/local-env.sh          # 构建缓存重定向到 .temp/（可选）
+cargo fmt --all --check
+cargo clippy --all-targets -- -D warnings
+cargo test --all
+RIG_EDGE_IT=1 cargo test --all       # 真 Chromium 集成测试（见 docs/09）
+python3 -m unittest discover -s tests/eval_report -p 'test_*.py' -v
 ```
 
 ## 目录
 
 | 路径 | 内容 |
 |---|---|
-| `crates/rig-edge-browser` | 边缘程序：Chromium 拉起/挂靠（CDP）、AI 通道（HTTP/MCP）、人通道（观看页 `viewer.html/js`、RTC/HLS） |
-| `crates/rig-proto` | 共享协议类型：`Observation`/`Action` 等 AI 通道契约 |
-| `crates/rig-eval` | 感知层评估框架：任务定义、指标汇总、泄密检测 |
-| `eval/` | 评估任务（`tasks/`）、测试页面（`fixtures/`）、历史运行证据（`results/`，只读） |
-| `docs/` | 边缘程序、感知层、评估方法与历史结论 |
-| `scripts/` | `eval_report.py`（RunRecord 汇总）、`local-env.sh`（本地缓存重定向）、`local-gate.sh`（提交门禁，含真实 Chromium 集成测试） |
-| `.temp/` | 本地可再生输出：构建缓存、测量结果、日志（git 忽略，可随时删除） |
+| `crates/rig-edge-browser` | 边缘程序：Chromium 拉起/挂靠（CDP）、AI 通道（HTTP/MCP）、人通道（观看页、RTC/HLS）、鉴权 |
+| `crates/rig-proto` | AI 通道契约：`Observation`/`Action` 等共享类型 |
+| `crates/rig-eval` | 感知层评估框架 |
+| `eval/` | 评估任务、测试页面、历史运行证据（`results/` 只读） |
+| `docs/` | 文档集（入口 `docs/README.md`） |
+| `scripts/` | 构建/测试/发布/运行/清理脚本（见上表）、`edge-lan.sh`、`with-pulse.sh`、`local-env.sh`、`eval_report.py` |
+| `.temp/` | 本地可再生产物：构建缓存、日志、便携 PulseAudio（git 忽略，可随时删除） |
 
-评估数字必须来自实际运行，注明环境；历史结论见 `docs/EVAL_REPORT_2026-11-18.md` 等。
-网关/传输层相关代码已整仓移除（另有备份），本仓库只保留 Chromium 控制与 AI/人双通道。
-
-> 并发说明：当前按**单人受信工具**设计——多观看端并发时 `/channels` 等
-> 全局状态不保证相互独立（见审查 U02/S4）。未来多用户再引入连接级策略。
+> 并发说明：按**单人受信工具**设计——多观看端并发时全局状态不保证相互独立。
+> 网关/传输层已整仓移除（另有备份），本仓库只保留 Chromium 控制与 AI/人双通道。

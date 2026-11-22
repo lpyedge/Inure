@@ -6,8 +6,8 @@
 ## 每次开始时的读取顺序
 
 1. `AGENTS.md`、`README.md`、`CLAUDE.md`。
-2. 与本次任务相关的 `docs/EDGE_BROWSER.md` / `docs/PERCEPTION.md` / `docs/EVAL.md` /
-   `docs/SECURITY_DESIGN_2026-11-19.md` / `docs/PITFALLS.md`。
+2. `docs/README.md`（文档地图），再读与本次任务相关的专题：`docs/02-架构与技术方案.md`、`docs/08-安全模型.md`、
+   `docs/EDGE_BROWSER.md` / `docs/PERCEPTION.md` / `docs/EVAL.md` / `docs/PITFALLS.md`。
 3. 当前任务对应的代码与测试；无需整仓重写。
 
 ## 推荐首轮命令（仓库根目录）
@@ -34,6 +34,7 @@ python3 -m unittest discover -s tests/eval_report -p 'test_*.py' -v
 
 ## 项目协作辅助文件
 
+- `docs/README.md`：文档集入口（10 篇：产品、架构、难点、依赖、部署、接口、接入、安全、测试、路线图）。
 - `docs/EDGE_BROWSER.md`：边缘程序设计与双通道说明。
 - `docs/PERCEPTION.md`：感知层设计（语义优先、坐标、动作校验）。
 - `docs/EVAL.md`：评估方法；`scripts/eval_report.py`：RunRecord 汇总（不自动下结论）。

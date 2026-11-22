@@ -3,7 +3,7 @@
 本仓库只做一件事：**Chromium 控制与 AI/人双通道**。边缘程序 `rig-edge-browser`
 直连 Chromium（CDP），同机（stdio/回环 HTTP）或局域网（HTTP+令牌）直连即完整形态。
 
-文档：`docs/EDGE_BROWSER.md`（边缘程序设计）、`docs/PERCEPTION.md`（感知层设计）、
+文档入口：`docs/README.md`（10 篇文档集）；专题：`docs/EDGE_BROWSER.md`（边缘程序设计）、`docs/PERCEPTION.md`（感知层设计）、
 `docs/EVAL.md`（评估方法）、`docs/SECURITY_DESIGN_2026-11-19.md`（快照会话隔离等安全整改）、
 `docs/PITFALLS.md`（踩坑手册）、`docs/DOM_SPIKE_2026-11-19.md`（CDP 探针结论）。
 
