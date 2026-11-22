@@ -14,7 +14,12 @@ step "2/4 cargo clippy --all-targets -- -D warnings"
 cargo clippy --all-targets -- -D warnings
 
 step "3/4 cargo test --all (含 Chromium 集成测试)"
-RIG_EDGE_IT=1 cargo test --all
+if [ -x .temp/pulseaudio/usr/bin/pulseaudio ]; then
+  # 有便携 PulseAudio 时自动带上（音视频用例需要）；见 docs/04-依赖与环境.md §4.2
+  RIG_EDGE_IT=1 scripts/with-pulse.sh cargo test --all
+else
+  RIG_EDGE_IT=1 cargo test --all
+fi
 
 step "4/4 Python 评估工具自测"
 python3 -m unittest discover -s tests/eval_report -p 'test_*.py' -v
