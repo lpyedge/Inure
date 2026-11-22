@@ -50,16 +50,6 @@ pub struct EncoderConfig {
     pub low_latency: bool,
 }
 
-/// 字节形态 packet：RTC 路（rtc.rs）消费。
-#[derive(Debug)]
-pub struct EncodedPacket {
-    pub data: Vec<u8>,
-    /// 是否关键帧（str0m 自行解析 NAL 类型判定，此字段暂无消费方，
-    /// 保留作 GOP 诊断与后续关键帧策略用）
-    #[allow(dead_code)]
-    pub key: bool,
-}
-
 struct HwCandidate {
     encoder: &'static str,
     device: sys::AVHWDeviceType,
@@ -260,18 +250,11 @@ impl VideoEncoder {
 
     /// 编码一帧 RGB（合成帧），返回字节形态 packet（RTC 路用）。
     /// force_key=true 时本帧强制为关键帧（PLI 响应）。
-    pub fn encode(
-        &mut self,
-        rgb: &RgbImage,
-        force_key: bool,
-    ) -> Result<Vec<EncodedPacket>, ff::Error> {
+    pub fn encode(&mut self, rgb: &RgbImage, force_key: bool) -> Result<Vec<Vec<u8>>, ff::Error> {
         Ok(self
             .encode_raw(rgb, force_key)?
             .iter()
-            .map(|p| EncodedPacket {
-                data: p.data().map(|d| d.to_vec()).unwrap_or_default(),
-                key: p.is_key(),
-            })
+            .map(|packet| packet.data().unwrap_or_default().to_vec())
             .collect())
     }
 
@@ -455,18 +438,21 @@ mod tests {
         let img = RgbImage::from_pixel(320, 240, image::Rgb([180, 60, 60]));
         let mut all = Vec::new();
         for _ in 0..3 {
-            all.extend(enc.encode(&img, false).expect("encode"));
+            all.extend(enc.encode_raw(&img, false).expect("encode"));
         }
         assert!(!all.is_empty(), "应至少产出一个 packet");
-        assert!(all[0].key, "首个 packet 应为关键帧");
+        assert!(all[0].is_key(), "首个 packet 应为关键帧");
     }
 
     #[test]
     fn force_key_marks_packet() {
         let mut enc = VideoEncoder::new(CodecKind::H264, &cfg()).expect("encoder");
         let img = RgbImage::from_pixel(320, 240, image::Rgb([60, 180, 60]));
-        let _ = enc.encode(&img, false).expect("encode");
-        let pkts = enc.encode(&img, true).expect("encode forced");
-        assert!(pkts.iter().any(|p| p.key), "强制关键帧应产出 key packet");
+        let _ = enc.encode_raw(&img, false).expect("encode");
+        let pkts = enc.encode_raw(&img, true).expect("encode forced");
+        assert!(
+            pkts.iter().any(ff::Packet::is_key),
+            "强制关键帧应产出 key packet"
+        );
     }
 }

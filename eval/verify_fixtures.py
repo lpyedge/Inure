@@ -4,9 +4,8 @@
   2. 按"标准答案"操作后满足成功判据（任务可解）；
   3. 走"陷阱路径"后不满足成功判据（判据能区分对错）。
 
-需要：pip install playwright && playwright install chromium
+需要：Python 3.11+；python3 -m pip install playwright && python3 -m playwright install chromium
 用法：python3 eval/verify_fixtures.py
-这个脚本也是 P1 运行器的起点：它展示了如何读取任务 TOML 并用确定性判据判断成败。
 """
 import pathlib
 import sys
@@ -28,7 +27,7 @@ def check(page, s) -> bool:
         return loc.count() == 0
     if kind == "dom_text":
         return loc.count() > 0 and s["contains"] in loc.first.inner_text()
-    raise ValueError(f"未知判据: {kind}")
+    raise ValueError(f"Unsupported automated assertion: {kind}")
 
 
 # 标准答案与陷阱路径。键为任务 id。
@@ -81,7 +80,10 @@ CASES = {
 
 
 def main() -> int:
-    tasks = [tomllib.loads(p.read_text()) for p in sorted((ROOT / "tasks" / "web").glob("*.toml"))]
+    tasks = [
+        tomllib.loads(path.read_text(encoding="utf-8"))
+        for path in sorted((ROOT / "tasks" / "web").glob("*.toml"))
+    ]
     for t in tasks:
         if t["id"] == "web-login-01":
             CREDS.update(t.get("credentials", {}))
@@ -91,7 +93,7 @@ def main() -> int:
         for t in tasks:
             tid = t["id"]
             if tid not in CASES:
-                failures.append(f"{tid}: 缺少标准答案/陷阱路径")
+                failures.append(f"{tid}: missing success or failure steps")
                 continue
             ok_steps, bad_steps = CASES[tid]
             url = (FIX / t["fixture"]).as_uri()
@@ -103,26 +105,26 @@ def main() -> int:
 
             pg = fresh()
             if check(pg, t["success"]):
-                failures.append(f"{tid}: 初始状态就满足判据")
+                failures.append(f"{tid}: initial state already satisfies the assertion")
             ok_steps(pg)
             if not check(pg, t["success"]):
-                failures.append(f"{tid}: 标准答案未通过判据")
+                failures.append(f"{tid}: expected success steps failed the assertion")
             pg.close()
 
             pg = fresh()
             bad_steps(pg)
             if check(pg, t["success"]):
-                failures.append(f"{tid}: 陷阱路径竟然通过了判据")
+                failures.append(f"{tid}: expected failure steps satisfied the assertion")
             pg.close()
             print(f"  checked {tid}")
         browser.close()
 
     if failures:
-        print("\n失败:")
+        print("\nFixture checks failed:", file=sys.stderr)
         for f in failures:
-            print("  -", f)
+            print("  -", f, file=sys.stderr)
         return 1
-    print("\n所有任务校验通过")
+    print("\nAll fixture checks passed")
     return 0
 
 

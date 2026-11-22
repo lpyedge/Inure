@@ -1,6 +1,6 @@
 # rig-edge-browser —— 瀏覽器邊緣程序說明
 
-> **入口與當前狀態的權威說明見 [docs/README.md](README.md)（10 篇文檔集）。** 本文保留各專題的逐項細節（觀看端設計、DOM 鏡像、輸入與剪貼板、音視頻、提交索引），其中令牌/路由相關內容以 [08 安全模型](08-安全模型.md) 與 [06 接口与调用](06-接口与调用.md) 為準。
+> **入口與當前狀態的權威說明見 [docs/README.md](README.md)（10 篇文檔集）。** 本文保留各專題的逐項細節（觀看端設計、DOM 鏡像、輸入與剪貼板、音視頻），其中令牌/路由相關內容以 [08 安全模型](08-安全模型.md) 與 [06 接口与调用](06-接口与调用.md) 為準。
 >
 > 本文是 `crates/rig-edge-browser` 的權威使用與實現說明，供後續開發與外部 review 使用。
 > 定位见 `README.md` 与 `CLAUDE.md`；感知語義細節見 `docs/PERCEPTION.md`；
@@ -121,7 +121,7 @@ platform/arch——版本取 product 的真實完整版本，UA 串裡的是約�
 | `--profile-dir <path>` | 環境變數 `RIG_EDGE_PROFILE_DIR`；未給 = 一次性臨時目錄 | **持久化目錄**（LIU 2026-11-20 定）：Chromium 用戶數據目錄。登入態、Cookie、LocalStorage / IndexedDB / Session Storage、Service Worker 與 Cache Storage、保存的密碼、擴展、已安裝應用、站點權限全在其中——邊緣重啟原樣續用，**整目錄搬到新環境重部署即可無損打開之前的網站**。密碼存儲固定 `--password-store=basic`：OSCrypt 密鑰隨 profile 的 Local State 走，新機器可解密；用宿主 keyring 則密鑰不跟目錄走、遷移即全滅。同一目錄同一時間只能被一個邊緣使用（Chromium 單例鎖）。PWAs 的系統層快捷方式不在目錄內、需在新環境重建，應用數據本身隨目錄走 |
 | `--cache-dir <path>` | 環境變數 `RIG_EDGE_CACHE_DIR`；未給 = profile 內 | 可棄緩存目錄：Chromium 磁盤緩存（HTTP / 媒體）經 `--disk-cache-dir` 放到這裡，與 profile 分開存、遷移時可不帶。GPU / 著色器等小緩存無官方分離參數、仍留在 profile 內（體積小、可自愈重建） |
 
-**臨時目錄清理**（LIU 2026-11-22）：未專門指定的目錄（一次性 profile `<tmp>/rig-edge-<pid>`、上傳目錄 `<tmp>/rig-edge-<pid>-uploads`、PulseAudio 私有運行目錄 `<tmp>/rig-edge-<pid>-pulse`、HLS 分片 `<tmp>/rig-edge-hls-<pid>`）於退出時清理；指定的 profile/cache 目錄不動。SIGKILL 與崩潰可能留下殘餘，使用 `scripts/clean-tmp.sh` 按 PID 檢查，避免通配符刪除仍運行實例的資料。
+**臨時目錄清理**（LIU 2026-11-22）：未專門指定的目錄（一次性 profile `<tmp>/rig-edge-<pid>`、上傳目錄 `<tmp>/rig-edge-<pid>-uploads`、PulseAudio 私有運行目錄 `<tmp>/rig-edge-<pid>-pulse`、HLS 分片 `<tmp>/rig-edge-hls-<pid>`）於退出時清理；指定的 profile/cache 目錄不動。SIGKILL 與崩潰可能留下殘餘，Linux 可用 `scripts/clean-tmp.sh` 按 PID 檢查，避免通配符刪除仍運行實例的資料。
 
 持久化與停機口徑：邊緣收到 SIGINT / SIGTERM 時先請 Chromium 以 `Browser.close` **落盤關閉**再退出（HTTP 與 stdio 兩模式同）——強殺（SIGKILL）會丟掉最近未提交的 Cookie / Local Storage 寫入（IT 實測：數秒前的寫入被整組強殺即丟失，IndexedDB 因事務即時提交幸免）。部署側停機請用 TERM 而非 KILL。集成測試 `edge_profile_persistence` 驗證：寫入 Cookie / LocalStorage / IndexedDB → SIGTERM 優雅停機（附落盤實據斷言）→ 同雙目錄重啟 → 三值全數恢復。
 
@@ -773,101 +773,16 @@ AI 通道的 Upload 或站點自身的其他入口。
 斷言）與單選截斷（Done.note 註明、頁面只收到第一個文件）；
 rig-proto 單元測試鎖定 upload/新拒絕碼/Done.note 的線格式。
 
-## 11. 已知限制與未做事項
+## 11. 已知限制
 
-- **遠端轉發不在本倉庫**：網關/傳輸層已移除；邊緣由同機或局域網直連使用（見 §1）。
-- **人通道呈現是 CDP screencast（JPEG 幀流）+ WebRTC + HLS**，不是 RDP；
-  RDP 呈現（IronRDP）與 RDP 音頻是後續里程碑。
-- **人通道文件粘貼不做**：觀看端讀不到使用者本機文件；AI 通道的文件
-  需求由 Upload 動作承擔（§10.1）。
-- **增量觀察的基幀池只留最近 8 幀**：基幀更舊的 since_frame
-  回完整視圖（協議即如此設計，客戶端重新定基即可）。
-- **DOM 模式邊界**：頭部已與視頻模式一致（邊緣 chrome 條帶流，
-  含標籤條與下拉菜單，見 §9.2）；同源 iframe 內容整棵鏡像；
-  大畫布（單邊 >1024px，如遊戲畫面）同樣走區域子流（2026-11-22；`regions()` 的 `k:'c'`，約 4fps，快照標 `big:1`）。跨源 iframe 與 video 走**區域子流**（邊緣按 rect 截圖貼回
-  佔位，見 §9.2）——驗證碼部件可看可點（坐標型 CDP 輸入由
-  瀏覽器合成層路由、可穿透跨源 iframe，探針實測），但 iframe
-  內部滾動不同步、內部 DOM 不鏡像；canvas 子流限制見 §9.2
-  （單邊 >1024px、單幀 >1.5MB、WebGL 空白、跨源污染不捕獲）；
-  頁面自身 JS 行為不在鏡像執行。內聯 SVG 按命名空間重建
-  （2026-11-20 修，PITFALLS §34），圖標類元素可正常顯示。
-- **YouTube 等站點的機器人門檻（站點側限制，非邊緣缺陷）**：
-  數據中心出口 IP + 自動化瀏覽器會被 YouTube 判為機器人，播放器
-  位置直接換成「登入以確認你不是機器人」提示、媒體不加載
-  （video readyState 0、無 src），視頻與 DOM 兩模式同樣播不了
-  （2026-11-20 CDP 直讀實頁定因，PITFALLS §34 旁證）。出路在
-  部署/帳號層：觀看端登入 Google 帳號（持久化雙目錄已落地，
-  見 §4——登入一次跨重啟保留）、或換住宅出口；邊緣代碼無可修。
-- **Bilibili 同屬站點側門檻**：視頻頁被直接重定向到日本版首頁
-  錯誤路由（`/ja?spm_id_from=…selfDef.erro`），播放器根本不
-  創建（2026-11-20 實測）。邊緣播放機件本身已全量驗清：
-  H.264/AAC/AV1 的 canPlayType 與 MSE、Widevine 均可用，本地
-  WebM/MP4 與公網 MP4 實播時間軸正常推進，DOM 模式視頻區域
-  子流持續出幀——「播不了」先查站點對出口的處置，再疑邊緣。
-- **瀏覽器內部頁（chrome:// 設置/下載/擴展等）僅視頻模式**：
-  WebUI 界面全在 shadow DOM 裡，序列化器只能拿到空殼樹、鏡像
-  顯示不出實內容。DOM 通道按 scheme 把關（chrome://、
-  chrome-extension://、about:、devtools:// 等）：不產快照、
-  直接報「內部頁面不支持 DOM 鏡像」狀態，觀看端回落視頻模式
-  並給出提示（screencast 對 WebUI 正常出幀，實測）。
-- **右鍵菜單為觀看端自繪**：原生上下文菜單是瀏覽器 UI 層、不在
-  截幀內（探針實測），自繪是唯一路。現行實現畫在觀看端：菜單項
-  是橋接動作（複製選區/貼上/全選/後退/重新載入 + 異步追加的
-  「複製圖片」），右鍵本身照常轉發頁面——頁面自帶 contextmenu
-  邏輯不再被污染（上一版頁內注入菜單的取捨已消除）。
-- **剪貼板在非安全上下文降級**：觀看頁經局域網 HTTP 打開時
-  Async Clipboard API 不可用——文字複製降級為手動複製框（選區
-  文本已備好，Ctrl+C 即走），圖片回拷不可用；正道是開 HTTPS
-  （`--tls-cert/--tls-key`，LIU 2026-11-20 定版路徑），安全
-  上下文下全走標準 API（實測通過）。
-- **RTC 唇音同步殘差**：已按共享紀元對齊（見 §9.1），殘差為
-  兩側管線延遲差（約幾十 ms），未做採樣級實測校準。
-- **人/AI 幀無統一編號（R-15 輕量處置）**：人通道視頻幀與 AI
-  Observation 幀是兩條管線，沒有共同幀號；關聯性由 observe
-  採集前後的主文檔 loaderId 代次校驗保證（採集期間導航會在
-  觀察文本裡警告，見 R-14）。完整版跨通道幀號方案曾存檔於已移除的
-  评审文档，LIU 2026-11-20 指示：出現跨通道對證/新鮮度/時間對齊類
-  問題時提醒他，可重寫一版實測。
-- **多標籤的 AI 對象（R-24 口徑澄清）**：AI 通道只觀察/操作
-  人當前活動標籤的頁面樹（快照按主會話圈定範圍）；用戶切換
-  標籤後，舊幀的元素校驗必然拒絕後續動作，屬預期行為——
-  AI 應重新 observe。`docs/SECURITY_DESIGN_2026-11-19.md`
-  B1 的早期設想（觀察剝離非活動標籤）已被現行實現取代：
-  非活動標籤根本不進快照。
-- 桌面版邊緣程序（UIA/AT-SPI2/AX）未開工，排在 Android（P5）之後；
-  純像素理解為 P6 兜底，未立項。
-- CI 未設瀏覽器 E2E job（GPT review R-13）：集成測試目前靠提交前
-  本地 local-gate 執行。
-- R02（DB 跨租戶約束）經 LIU 2026-11-19 裁定 **de-scope**：RIG 是
-  個人/受信環境、人工監督的工具，不做多租戶隔離（评审记录随网关
-  文档一并归档，不在本仓库演进）。
-- **踩坑手冊**：本子項目兩晚踩過的坑（症狀/根因/解法/驗證）統一
-  收在 `docs/PITFALLS.md`（LIU 2026-11-20 定版要求），新坑先落
-  該冊再回頭改本節。
+目前的支援範圍、呈現限制與待驗證事項見 [10 路線圖與已知局限](10-路线图与已知局限.md)。DOM 鏡像與區域子流的具體行為見 §9.2，存儲與停機見 §4。
 
-## 12. 集成測試
+## 12. 整合測試
 
-`crates/rig-edge-browser/tests/edge_it.rs`：`scripts/test.sh unit` 始終跳過真 Chromium；`it`、`av`、`all` 才執行集成測試。源码测试从 PATH 和平台默认位置查找 Chromium；`RIG_EDGE_TEST_CHROMIUM_DIR` 可显式指定目录，不探测 Playwright 缓存。`scripts/test.sh` 在 `.temp/media-deps/root/` 已由 `scripts/prepare-media.sh` 准备时自动使用其中的 PulseAudio，也可用 `RIG_EDGE_TEST_PULSEAUDIO_DIR` 指定。
+測試入口、依賴與覆蓋範圍見 [09 測試與評估](09-测试与评估.md)。
 
-| 測試 | 覆蓋 |
-|---|---|
-| `edge_browser_end_to_end` | 登入流程全鏈：observe → 填表 → 點擊 → 歡迎語斷言；iframe 內表單；陳舊幀拒絕 |
-| `edge_text_keys_clipboard` | 文本鍵入、組合鍵（Ctrl+A/C/V 跨框複製）、IME 整段送入 |
-| `edge_av_and_image_clipboard` | HLS 雙版本播放列表與分片、440Hz 音調非靜音驗證、圖片剪貼板雙向（尺寸驗證） |
-| `edge_token_auth` | 無令牌拒絕啟動、令牌只認 Bearer（URL 令牌 401）、換票、access 不得調 AI 路由、refresh 輪換與舊票重放 401、靜態殼免令牌 |
-| `edge_stdio_mcp_and_attach` | MCP：initialize/tools/list/observe/act/screenshot 全流程 + stdin EOF 正常退出；掛靠：`--cdp-url` 連現成 Chromium、邊緣退出後瀏覽器存活 |
-| `edge_chrome_ui_and_takeover` | chrome UI：地址欄導航、後退、菜單尋找條、標籤新建/關閉；Point 越界與陳舊幀拒絕；執行期遮蔽 + 強制接管（在途 act 回 Aborted{UserTakeover}、頁面動作未落地） |
-| `edge_dom_channel` | DOM 通道全鏈：快照建成、val/add/scr 差分、seq 嚴格遞增、resync 收斂；DOM 模式幽靈指針下發與落點；canvas 子流幀（節點 id 對應、PNG data URL）；同源 iframe 內容經 f 子樹進快照、內嵌突變觸發重同步 |
-| `edge_profile_persistence` | 持久化雙目錄：Cookie / LocalStorage / IndexedDB 寫入 → SIGTERM 優雅停機（cookie 名與 ls 值落盤實據斷言）→ 同 `--profile-dir` / `--cache-dir` 重啟 → 三值全數恢復 |
-| `edge_internal_gate_and_dblclick` | 雙擊透傳（視頻/DOM 兩路 count=2 → 遠端 dblclick 計數遞增，判據走 DOM 快照——observe 判據會按 §7.1 遮蔽人手勢自鎖）；內部頁把關：切 chrome://settings 後只收內部頁狀態、無該頁快照 |
-| `edge_act_fast_precheck` | 動作前單元素快速複核：頁面沒變時主頁面元素全部命中快路徑（證明單元素算出的 role/name/states/bbox 與整頁構建一致）；子幀元素退回整頁；頁面自己變了（移位/禁用/消失/換文檔）仍必須被拒 |
-| `edge_observe_unchanged_vs_changed` | 呈現一側：沒變 → 空增量且不採集；頁面自己變了/視口滾動（無人操作）→ 必須重新採集並帶出變化；點擊後 act 立即返回、按需取增量（不引起變化 → 空增量；改文字 → 增量帶出新文字） |
-| `edge_dom_subscription_keeps_jpeg_frames` | 後台 DOM 感知訂閱不得停發 WS JPEG 幀；`jpeg-demand off` 後才停 |
-| `edge_upload_action` | Upload 動作：正例（頁面 change 收到文件名:大小）、負例按碼斷言（not_file_input / file_not_found）、單選文件框多文件截斷（Done.note 註明、頁面只收首個） |
-| `edge_observe_modes_budget` | observe 全字段：mode=text/tree/tree_image 響應組成、budget_tokens 裁剪響應視圖且存儲幀不動（裁剪後點擊仍成）、subtree 子樹與不存在 id 回 400、include_offscreen 默認過濾視口外元素、since_frame 增量（基幀對齊、upsert 含新值、未知基幀回完整、text 模式不走增量） |
-| `edge_dom_sub_idempotent_and_cleanup` | D01/D02：同連接重複 dom-start 只訂閱一次；配對 stop 回零、多餘 stop 不倒扣；直接斷開（不發 dom-stop）名額照常回收（/health `dom_viewers` 斷言） |
+測試環境的注意事項：
 
-測試側約定（實測教訓，勿退回）：
 
 - 全部測試以 tokio Mutex **串行**執行——每項都拉 Chromium（AV 項另跑 x265
   編碼），在共享開發機上全並行會互相擠兌造成假失敗（clippy 不許 std 鎖跨
@@ -884,85 +799,3 @@ rig-proto 單元測試鎖定 upload/新拒絕碼/Done.note 的線格式。
   期望名。
 
 全倉提交門禁 `scripts/local-gate.sh` 依序運行 fmt、clippy 與 `scripts/test.sh all`。真 Chromium 集成測試需要完整 Chromium；音視頻測試另需 PulseAudio、`ffprobe` 與 `ffmpeg` 命令行。
-
-## 13. 本批次提交索引
-
-| 提交 | 內容 |
-|---|---|
-| `54c182c` | v1：AI 通道（AX 快照 + 陳舊校驗動作 + 編號截圖）+ 人通道（screencast + WS 觀看頁）+ 通道閘門 |
-| `851a5b9` | AV 合流（虛擬聲卡 + ffmpeg，HEVC 主 + H.264 兜底）、圖片剪貼板雙向、輸入法與組合鍵修復（key_spec 根因） |
-| `26dc971` | 直連鑑權：令牌中介層 + 非回環無令牌拒絕啟動 + 播放列表令牌改寫 |
-| `4bf5d08` | MCP stdio 前端 + `--cdp-url` 掛靠模式 + 虛擬聲卡自愈 + 測試串行化 |
-| `47dfd43` | GPT review A 批正確性修復（R-05 沙箱收緊、R-08 CDP 資源清理、R-09 令牌解碼、R-10 渲染轉義、R-11 調試脫敏、R-12 pulse 自有進程、R-14/15/16 動作保真、R-17 start 復位）；同提交附 B 批安全設計稿 `docs/SECURITY_DESIGN_2026-11-19.md`（待批） |
-| `c9da3ea` | B4+交互模型協議側：rig-proto Aborted{UserTakeover} + ai.rs 執行狀態/中斷檢查點 |
-| `8413591` | 人通道補強：邊緣合成 chrome UI、canvas 薄客戶端、AI 幽靈指針與遮蔽/接管、視口釘死、幀高湊偶 |
-| `08827b3` | 集成測試：chrome UI/強制接管/Point 負例 |
-| `8950f47` | docs：§7.1/§9.1 改「已實現」並補實現筆記 |
-| `e342dd0` | Phase 0：WS 二進制幀（8 字節頭 + JPEG 原始字節） |
-| `2a72ab7` | Phase 1a：進程內編碼層 encode.rs（libavcodec + hw_frames_ctx 運行時協商） |
-| `8b01cd6` | Phase 1a：HLS/AV 合流遷進程內管線（libavformat + avdevice 音頻採集） |
-| `4638bdd` | docs：§8/§9.1 進程內編碼管線與音頻實測教訓 |
-| `c117cba` | Phase 1b：WebRTC 主路 rtc.rs（str0m offerer+ICE-lite、共享 feeder、PLI/BWE 回寫） |
-| `1b17ee5` | Phase 1b：WS 信令與按連接 transport 模式 |
-| `aa46fca` | docs：§9.1 Phase 1b 與 UDP 綁候選地址教訓 |
-| `2f9c589` | Phase 1c：觀看端 WebRTC 接入與自適應回退 |
-| `275a057` | docs：§9.1 Phase 1c 回退語義 |
-| `97442b9` | P2P 直連檔：`--stun` 全 ICE + 自寫 STUN 客戶端 |
-| `52a48f2` | docs：§9.1 P2P 實測與 Gateway 信令待軌道 T |
-| `fb1d03e` | docs：DOM 鏡像 spike 報告 `docs/DOM_SPIKE_2026-11-19.md` |
-| `83f11f7` | Phase 2：DOM 鏡像通道 dom.rs（頁內序列化器 + 邊緣轉發） |
-| `2e882fd` | Phase 2：人通道 current_view + DOM 模式輸入直達 |
-| `492c746` | Phase 2：DOM 模式接線與觀看端鏡像渲染器 |
-| `303eae2` | docs：§9.2 改已實現（架構口徑、驗收數據、序列化器教訓） |
-| `f619d3d` | docs：Phase 2 提交索引補入 |
-| `c10d477` | docs：子項目定位定版（邊緣不依賴 Gateway 獨立可用、受控接入為擴展）入 §1/§1.1，ARCHITECTURE/ROADMAP 同步 |
-| `806fdfd` | 集成測試：DOM 通道用例（快照/差分/seq/resync） |
-| `180540c` | DOM over RTC DataChannel：rig-dom 可靠有序通道，開啟後快照/差分走 DC、關閉回落 WS |
-| `f6454e5` | RTC 音頻軌（Opus）+ 觀看端 AV 優先級翻轉（RTC 優先、HLS 兜底） |
-| `3e13975` | 集成測試進程守衛：整組擊殺 + 配置目錄清掃，杜絕孤兒進程 |
-| `134a75c` | Upload 動作：rig-proto 協議擴展（Action::Upload、新拒絕碼、Done.note）+ CDP DOM.setFileInputFiles + 集成測試 |
-| `de82e17` | R-18：/observe 與 MCP observe 落實 ObserveRequest（mode/budget/subtree） |
-| `1e7853c` | DOM 模式補完：AI 幽靈指針 overlay（WS 下發頁面坐標）+ canvas 子流（快照式） |
-| `7c108a3` | docs：§11 已知限制刷新、§12 測試表補全、§13 索引補本輪提交；review/STATUS.md 補 RIG-R02 de-scope 記錄 |
-| `7610a30` | observe 補完：include_offscreen 落實（默認過濾視口外元素）+ since_frame 增量（rig-proto diff/apply 落地、8 幀基幀池、HTTP delta 字段/MCP 雙文本塊） |
-| `a95064a` | DOM 鏡像補完：同源 iframe 內容經 f 子樹鏡像（內嵌突變走重同步）+ canvas 上限 640→1024/單幀 1.5MB |
-| `c52ed6e` | RTC 唇音同步：音視頻共享紀元打戳（視頻按合成幀時刻、音頻首幀錨定） |
-| `f0cb830` | §9.1 工具欄條帶緩存（狀態哈希鍵控單條緩存，菜單/指針不進） |
-| （本提交） | docs：§11/§12/§9.1/§9.2 隨上述四項刷新（ObserveRequest 全字段落實、DOM iframe 邊界改寫、唇音殘差與條帶緩存條目更新） |
-| `91a94f3` | RTC 觀看端黑屏修復：ontrack 改為把音視頻軌累加進同一 MediaStream（音頻軌後到曾把只含音頻的流蓋到 video 上） |
-| `052ff54` | screencast JPEG 解碼修復：image/zune-jpeg 解 Chromium 真實幀系統性綠偏，改走 ffmpeg 解碼 + 真實幀 fixture 回歸測試 |
-| `6fd1f7c` | 觀看端輸入整批修復：DOM 按鈕不再被 AV 靜默攔截、鼠標消息帶 button/buttons、剪貼板和弦放行 keydown 默認動作、地址欄編輯態退出與字符鍵入 |
-| `ec86881` | 拖選修復：mouseMoved 同時帶 button=<按下鍵> 與 buttons 掩碼；觀看端 mousemove 節流加尾幀補發 |
-| `a0fd18b` | DOM over DC 大消息分片：dom-chunk 應用層分片（16KB/幀）+ 觀看端重組 + 分片單測 |
-| `23ef07e` | DC 分片背壓修復：分片入會話待發隊列、每輪排空重試；ChannelOpen 設 bufferedAmountLow 閾值 |
-| `56dd0f7` | pollAv 競態修復：domAvOffPending 標記防進 DOM 時被自己的輪詢誤殺 |
-| （本提交） | docs：§9.2 補 DC 分片/背壓口徑、§13 補 2026-11-20 凌晨實測修復諸提交 |
-| `96d7e9c` | 觀看端整批修復（LIU 2026-11-20 復測反饋）：頁內自繪右鍵菜單（原生菜單不在截幀內，注入腳本 + `__rigMenu` binding 回傳動作，裸頁面有導航兜底項）、剪貼板同步兑現（邊緣 700ms 同步剪貼板+選區推送，copy 事件內以選區兑現，繞非安全上下文限制）、`#ime` 光標改 default、DOM 條帶頭部（chrome 合成幀裁條帶經 WS 疊加鏡像，dbar 退役；發送側 DOM 優先於 RTC 跳幀）、DOM 輸入根因修復（`#ime` 全屏覆蓋截走鏡像事件且坐標換算為 null——DOM 模式覆蓋層 pointer-events:none，鏡像補 paste/copy/cut）、序列化器 scroll 節流改尾隨推送（停穩位置不丟） |
-| `adbad8f` | 觀看端第二輪修復（LIU 2026-11-20 再復測反饋）：DOM 資源 URL 全量絕對化 + `<base>` 建樹前插入（YouTube CSS 向邊緣源請求 401 根治）、剪貼板顯式模型（clipboard-get 請求/回應 + 手動兜底框，整刪 700ms 同步與暫存補寫；clipboard-read-image 恢復為顯式讀回；DOM 複製以鏡像選區為準）、右鍵菜單改觀看端繪製（橋接動作 + 按節點 id 取圖，拆頁內注入菜單）、跨源 iframe/video 區域子流（rect 截圖 dom-region；佔位 display 保真 inline→inline-block）、鏡像輸入 attach-once、增量節流 30ms、UA 規範化去 Headless（YouTube 實播通過）、TLS 自簽名服務（`--tls-cert/--tls-key`）、DOM 增量靜默死亡三修（viewers 斷線泄漏/導航後無人 start/pollAv 誤殺）；新建 `docs/PITFALLS.md` 踩坑手冊。驗證：local-gate 全綠、IT 9/9、probe-batch4 22/22×2、HTTPS 剪貼板直寫、YouTube 實播 |
-| `acc5361` | 瀏覽器人格補完（LIU 定向：不保留無頭/CDP 開發形態痕跡）：UA 覆蓋連帶 userAgentMetadata（版本取 product 真實完整版）、acceptLanguage 經覆蓋下發（不帶 q 值）、時區覆蓋（默認 Asia/Tokyo）、去 `--disable-gpu` + `--enable-unsafe-swiftshader` 恢復 WebGL、device metrics 連帶 screen 尺寸；僅自拉瀏覽器生效、掛靠真實瀏覽器跳過。PITFALLS §25。驗證：指紋電池 dbg24 前後對照全項達標、local-gate 全綠、IT 9/9 |
-| `31d7b47` | LIU 復測三修（2026-11-20）：地址欄右鍵（中/右鍵落地址欄例外進編輯態、DOM 條帶右鍵開菜單、菜單加「粘貼並轉到」；§9、PITFALLS §26）、視頻流暢度（RTC_FPS 15→30、BWE 上限 8M、幀泵排水到最新幀、JPEG 編碼改 ffmpeg mjpeg、合成快路徑、幀泵分段計時 bench；§9.1、PITFALLS §27）、DOM 保真（快照帶 compatMode + 鏡像模式對齊重載、鏡像焦點/選區恢復；§9.2、PITFALLS §28）。驗證：dbg27 雙模式右鍵粘貼導航、dbg28 動態重建頁粘貼落遠端、dbg29 運動源 30.3–30.4fps、dbg30 點擊落點定因、local-gate 全綠、IT 9/9 |
-| `99bc6f8` | 整改第一期·控制閉環（GPT 審查 R-01/R-02/R-03，計劃見 `docs/REVIEW_REMEDIATION_2026-11-20.md`）：ExecControl 改取消代次 + 在途計數 + 接管闩鎖（observe 解鎖）；ai.rs 副作用注入逐步檢查代次（ExecErr 區分 Aborted/Rejected，press/release 與 key down/up 之間補釋放再報中斷）；exec 單測三項（保持窗/代次不復活/闩鎖）；IT 接管用例加闩鎖與恢復斷言。§7.1 實現筆記同步 |
-| `4325bf4` | 整改第三期·性能調度（F-01/02/03/04/05/06 + R-20）：區域採集拆獨立任務（100ms 節拍）、播放中 video 區域 280→150ms；JPEG 按連接顯示模式記賬（jpeg-demand，僅 canvas 模式編碼、斷開兜底釋放）；合成/原始幀 Arc 共享（RTC feeder 零克隆）；條帶與畫布 mousemove 最新值合併（~24ms+尾點補發）；canvas 尺寸守衛 + 過期 bitmap 必 close；音頻隊列有界 64 滿丟包、HLS 讀文件鎖外 IO。同提交存檔 R-15 協議版為待啟用提案（見整改計劃「待啟用方案存檔」）。驗證：local-gate 全綠、IT 9/9、dbg31 探針（demand 關=0 幀、DOM 模式 region/delta 並行） |
-| `6da9adc` | 整改第二期·隱私與穩定速修：TLS 強制（非回環未給證書自動自簽名 `~/.rig-edge/`、私鑰 0600 原子建立 R-22 後半；探針實測 HTTPS 通/HTTP 拒）、調試 URL 去 userinfo（R-22 前半）、WS 收包按幀型分發 Ping/Pong/Binary 不拆連（R-10）、人通道啟動失敗如實降級 + `human_error` 可查（R-11，啟動與 /channels 兩路）、序列化器 rm 清子樹映射 + 增量 3000 條上限轉 resync、觀看端 mirMap rm 清子樹（R-08）、request_id 冪等（鍵 = id + 請求指紋；同 id 不同內容照常執行；Aborted 不緩存；IT 加真重試斷言）（R-06）、快照提交單調性 + focus_session 用配對幀（R-05）、副作用 Point/Key 動作實時復核命中/焦點（R-04）、次級 frame 失敗警告到達觀察者 + 主 frame 失敗報錯（R-12）、CDP 總截止 20s（含排隊發送）+ 讀泵結束 fail 全部 pending + 在途上限 512（R-13）、observe 採集前後 loaderId 代次校驗警告（R-14）、§11 補 R-15/R-24 口徑。驗證：local-gate 全綠、IT 9/9（65.9s，含幂等新斷言）、TLS 探針實測 |
-| `ef484d3` | 整改第四期·量化與自適應：metrics 分段計量底座 + /health 可觀測字段 + /ready 就緒探針（F-09/R-19）；R-16 先量測後批量化（captureSnapshot 一次建幾何表，observe 743→294ms、CDP 1100→15 次）；F-08 觀看端自動模式（進入時點裁決、組合判據、PITFALLS §29）；F-07 本地即時反饋（漣漪/拖選框/滾動預覽，結果態不偽造）。驗證：local-gate 全綠、IT 9/9（71.0s）、dbg35 雙場景自動命中 + 反饋可見、dbg36 滾動預覽確定性斷言 |
-| （本提交） | docs：整改計劃第四期執行記錄、§5 /ready 與 health 字段、§9.2 自動模式/本地反饋、§10 批量幾何、PITFALLS §29 與 pkill 括號教訓 |
-| `a67720f` | 整改第五期·header 拆分：觀看頁原生 DOM 工具欄（Chrome/Edge 形態，viewer.html/viewer.js include_str 嵌入 = R-17）+ 邊緣 chrome-state 推送/命令 + 純頁面幀（WS 透傳原始 JPEG）+ 幽靈指針全模式 overlay + chrome.rs 去合成（fontdue 退役）；起始 URL 直達初始標籤（PITFALLS §31）；last_frame 幀泵無條件記錄（PITFALLS §30）。驗證：local-gate 全綠、IT 9/9（50.2s）、dbg37 系列真觀看頁探針（導航/前後態/菜單/尋找/標籤增刪/雙模式共用頭部/幽靈落點/接管提示） |
-| （本提交） | docs：整改計劃第五期執行記錄、§9.1 整節改寫（原生 header + chrome-state 協議 + 純頁面幀）、§5 加 /viewer.js、§2/§7.1/§9/§9.2 隨改、PITFALLS §30/§31 與 §六 pkill 同行自匹配補條 |
-| （本提交） | LIU 第二輪實測缺陷修復：DOM 模式文字粘貼恢復本地回顯（遠端落字不變，PITFALLS §33）；鏡像 SVG 按命名空間重建、圖標恢復（PITFALLS §34）；§11 補 YouTube 機器人門檻為站點側限制。驗證：local-gate 全綠、IT 9/9（49.4s）、dbg39 粘貼鏡像/遠端雙斷言、dbg40 YouTube 鏡像截圖目檢（圖標全數渲染） |
-| （本提交） | 持久化雙目錄（LIU 定版）：`--profile-dir` / `--cache-dir`（含環境變數回落）+ `--password-store=basic` 可遷移口徑 + SIGINT/SIGTERM 優雅停機（Browser.close 落盤，HTTP/stdio 同口徑）；§4 補參數與停機口徑、§12 補用例行。驗證：local-gate 全綠、IT 10/10（52.1s，含新 `edge_profile_persistence`：三類存儲寫入→TERM 停機落盤實據→重啟全恢復） |
-| （本提交） | LIU 第三輪實測三項：內部頁 DOM 把關（dom.rs 按 scheme 不產快照、報狀態回落視頻，PITFALLS §37）；雙擊歸遠端（拆觀看頁自綁 dblclick 全屏、count 透傳進 CDP clickCount、缺省 1，PITFALLS §36）；視頻播放全量驗清為站點側門檻（編解碼/MSE/Widevine/實播/區域子流皆正常，YouTube 機器人牆與 Bilibili 錯誤路由跳轉，§11）。驗證：local-gate 全綠、IT 11/11（58.4s，含新 `edge_internal_gate_and_dblclick`），dbg45–49/53/54 探針（播放矩陣、區域幀、四變體點擊、§7.1 遮蔽歸因） |
-| （本提交） | LIU 第四輪實測（Bilibili）三項：幀泵幀分類（screencast 視頻區幀貼回整頁合成、整頁 RGB 歸一化基準尺寸，RTC 編碼器重建 468→2 次/45s，PITFALLS §39）；鏡像 no-referrer（hdslb 縮略圖 3/35→31/36 載入，§40）；鏡像布局視口對齊遠端 + 等比縮放（進度條點擊偏差 −100~150px→+7px，§41）。驗證：local-gate 全綠、IT 11/11（59.0s），dbg56–63 探針（基線對照、幀尺寸普查、編碼器日誌、兩 DPR 點擊實測） |
-| （本提交） | LIU 第五輪實測兩項：無聲定因在觀看端狀態機——domStart 關影音後退出不恢復 + vid 静音無收斂點（§42）；修復 avWasOn/restoreAvAfterDom 三路徑恢復 + showDisplay 静音收斂。視頻仍跳：reportSize 改 900ms 安定滯後 + 幀泵視口對照重定基準（§43）。音頻鏈全程探針洗清（源頭 audioDec、monitor 電平、RTC ~300B/包、觀看端渲染電平皆實測非零；途中兩度被自家探針夾具誤導，§44）。驗證：local-gate 全綠、IT 11/11（59.9s），dbg64–68 探針（DOM 往返後電平 0.21、尺寸橫跳 8 次僅 1 次安定重建） |
-| （本提交） | LIU 第六輪：仍無聲——生產 /channels 實測 av:false 恒關（§42 的同會話恢復沒覆蓋「恢復代碼沒跑到」的情形：舊版緩存頁/DOM 期間關標籤；且觀看頁菜單無 AV 開關、用戶無從手動恢復，§45）。修復：pollAv 兜底自愈（視頻模式見 av 關且可用即開回，DOM 不搶）+ 觀看頁/腳本 no-store。視頻固定分辨率下偶爾小跳：本會話編碼器零重建（固定模式尺寸恒定），疑內容幀貼圖 rect/sf，幀泵加 rect 取樣診斷日誌待下輪取證。驗證：local-gate 全綠、IT 11/11（58.9s），dbg69 探針（外部強關 8s 內自愈、DOM 期間不搶、退出恢復） |
-| `94abd21` | 獨立審查批次 1（控制正確性）：接管闩鎖單臨界區原子化（C01）+ 舊 observe 不得解闩（C02，需接管後新句柄）+ 在途計數改 Drop guard 取消安全（A02）+ Done 攜本次刷新幀號、刷新失敗如實註明需重 observe（A01）。驗證：local-gate 全綠、exec 6/6（含風暴/舊代次/abort 回歸） |
-| `3d39ffb` | 獨立審查批次 2（連接生命週期）：DOM 訂閱同連接冪等守衛（D01，自動感知+前台共用一份）+ 釋放點收斂父作用域（D02，任一側先結束不丟清理）+ RTC DC 待發隊列有界（T01，4MB/512 幀/5s 駐留，超限整代次丟棄+請求重同步）。驗證：local-gate 全綠、新增 `edge_dom_sub_idempotent_and_cleanup` 真 WS 集成測試 |
-| `04d95c3` | 獨立審查批次 3（視頻 P1）：內容幀改貼乾淨整頁底圖（V02，舊位置殘影根除）+ rect 緩存 400ms TTL（V01）+ 唯一歸屬匹配（V04，多 video 近尺寸拒貼）+ `RIG_PUMP_FULL_ONLY` 整頁幀回退開關（待拍板#2）。驗證：local-gate 全綠、純函數單測（分類/唯一匹配/無殘影/越界裁剪） |
-| `2f35b6a` | 獨立審查批次 4（音視頻成本）：AV 意圖與 HLS 運行分離（M01，RTC 連通 grace 5s 後停 HLS、歸零起兜底）+ 音頻線程持有句柄並 join（M02，首幀未來即停不泄漏）+ /channels 與 /health 報 media_state/media_error（M03）。驗證：local-gate 全綠、M01 策略表單測 |
-| `301382a` | 獨立審查批次 5（產品體驗與觀測）：DOM 默認保留 RTC 聲音（U01，HLS-only 明示無聲；pollAv 按 av_wanted 決策；RTC 連通切流跟到 RTC）+ DC 分片重組有界（D03，16 條/8MB/10s 過期，會話換代清空）+ region 緩存頁代次隔離與上限（D04，雙端）+ 自適應連續 2 次+3s 間隔遲滯（U03）+ /health 補 pump/rtc/dom_viewers 計數、[pump] 改 30s 定期匯總、libav 日誌收斂 Warning（O01/S6）+ README 單人併發聲明（U02/S4）。驗證：local-gate 全綠、viewer.js 語法檢查、/channels 新字段真進程 curl 驗證 |
-
-## 14. 獨立審查整改（2026-11-20，輸入見 `plan/`）
-
-- 待拍板三項的處置（均取報告推薦值，負責人可推翻）：① DOM 默認保留 RTC 聲音（已實現；HLS-only 無獨立聲軌仍靜音並明示）；② reflow 頻發允許回退整頁幀（`RIG_PUMP_FULL_ONLY=1`，非常駐）；③ 保持單人受信口徑（README 已聲明，見 U02）。
-- 未做（需條件/另議）：V03 尺寸啟發式（高度疑似，未證實不動）；HLS 單 rendition（可選優化）；S5 HLS 音頻端到端探針、測試#4（observe_full 失敗注入）、#11（四路渲染全路徑）、#12（HLS 無首幀十次啟停）需 PulseAudio/真機環境（本機無聲卡未驗）；S7（WS 推送替代輪詢、真 shadow-DOM）列為後續；audio_rms 未接入健康（儀表缺口）。
-- 架構重寫不在本輪：狀態所有者拆分（ViewerConnection/MediaCoordinator/ExecControl）只做增量——本輪的 ConnSubs/DcPending/owned guard 即按此方向落地。
-| `0254b67` | 报告测试#4：ai.rs 内置可编排假 CDP（HTTP /json/version + WS 双端口，主会话事件在 setAutoAttach 后推，避 broadcast 竞态）——动作后刷新注入失败回归网（Done 必带校验帧+重观察附注）与 CDP 全挂干净拒绝；V03 帧分类加长宽比一致性（±5%）；HLS 单 rendition（`RIG_HLS_SINGLE=h264|hevc`，非法值显式报错，/channels 与 /health 暴露 `hls_renditions`，观看端按提供表选流）。验证：local-gate 全绿、单测 43/43、真进程 curl（`hls_renditions:["h264"]`） |

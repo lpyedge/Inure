@@ -29,7 +29,8 @@ For persistent slim dependencies, mount a writable named volume at /opt/rig
 so the launcher can atomically swap runtime/ and chromium/:
   docker volume create rig-data
   docker run -v rig-data:/opt/rig IMAGE --install-deps
-  docker run -v rig-data:/opt/rig IMAGE
+  TOKEN=$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')
+  docker run -v rig-data:/opt/rig -p 127.0.0.1:39871:39871 -e RIG_EDGE_TOKEN="$TOKEN" IMAGE
 
 Debian 13 Chromium and CA certificates are already hydrated at image build time.
 Use --install-deps when the selected release bundle supports runtime hydration.

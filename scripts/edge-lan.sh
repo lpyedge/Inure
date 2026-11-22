@@ -31,9 +31,12 @@ if [ -n "$(find crates -type f \( -name '*.rs' -o -name '*.js' -o -name '*.html'
 fi
 echo "Using binary: $BIN" >&2
 # 端口已被占用（例如上一次启动的旧实例还在跑）→ 直接报错，别让旧实例冒充新实例应答健康检查
-OWNER="$(ss -ltnp 2>/dev/null | awk -v p=":$PORT" '$4 ~ p"$" {print $NF}' | head -1 || true)"
-if [ -n "$OWNER" ]; then
-  echo "Port $PORT is already in use ($OWNER). Stop that instance first or set PORT to another port." >&2
+if ! LISTENERS="$(ss -H -ltn "sport = :$PORT")"; then
+  echo "Could not check whether port $PORT is available." >&2
+  exit 1
+fi
+if [ -n "$LISTENERS" ]; then
+  echo "Port $PORT is already in use. Stop that instance first or set PORT to another port." >&2
   exit 1
 fi
 mkdir -p "$ROOT/.temp"
@@ -44,7 +47,7 @@ echo "$EDGE_PID" >"$ROOT/.temp/edge-lan.pid"
 
 deadline=$((SECONDS + 20))
 while (( SECONDS < deadline )) && kill -0 "$EDGE_PID" 2>/dev/null; do
-  if curl -kf --max-time 1 --silent "https://$IP:$PORT/ready" >/dev/null &&
+  if curl -kf --max-time 1 --silent --noproxy "$IP" "https://$IP:$PORT/ready" >/dev/null &&
      kill -0 "$EDGE_PID" 2>/dev/null; then
     echo "OK  pid=$EDGE_PID" >&2
     echo "URL: https://$IP:$PORT/" >&2

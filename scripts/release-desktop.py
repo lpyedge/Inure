@@ -84,7 +84,7 @@ def ffmpeg_abi(prefix: Path) -> str:
     raise ReleaseError(f"Could not read LIBAVCODEC_VERSION_MAJOR from FFmpeg headers under {headers}")
 
 
-def build(stage: Path, kind: str, triplet: str, target: str, executable: str) -> Path:
+def build(stage: Path, kind: str, triplet: str, target: str, executable: str) -> None:
     vcpkg_root, vcpkg = find_vcpkg()
     # 内置 macOS triplet 默认是静态库；Windows 媒体 DLL 使用静态 CRT。
     with tempfile.TemporaryDirectory(dir=ROOT / ".temp") as overlay:
@@ -123,10 +123,9 @@ def build(stage: Path, kind: str, triplet: str, target: str, executable: str) ->
     if not target_dir.is_absolute():
         target_dir = ROOT / target_dir
     built = target_dir / target / "release"
-    core_name = "rig-edge-browser.exe" if kind == "windows" else "rig-edge-browser"
     launcher_name = "rig-launcher.exe" if kind == "windows" else "rig-launcher"
     launcher = built / launcher_name
-    core = built / core_name
+    core = built / executable
     if not launcher.is_file() or not core.is_file():
         raise ReleaseError(f"Expected native build outputs at {launcher} and {core}")
 
@@ -151,7 +150,6 @@ def build(stage: Path, kind: str, triplet: str, target: str, executable: str) ->
         run([codesign, "--force", "--sign", "-", str(staged_core)])
         run([codesign, "--force", "--sign", "-", str(stage / executable)])
     print(f"Staged {kind} {platform.machine()} media ABI {abi} at {stage}")
-    return stage
 
 
 def copy_license_notices(prefix: Path, destination: Path) -> None:

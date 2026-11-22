@@ -9,12 +9,17 @@
 # 提交前的完整门禁请用 scripts/local-gate.sh（含 fmt/clippy）。
 set -euo pipefail
 cd "$(dirname "$0")/.."
-ROOT="$PWD"
 WHAT="${1:-unit}"
+if (( $# > 1 )); then
+  echo "Usage: $0 [unit|it|av|py|all]" >&2
+  exit 2
+fi
 
 run_with_it() {
-  if [ -x "$ROOT/.temp/media-deps/root/usr/bin/pulseaudio" ]; then
-    export RIG_EDGE_TEST_PULSEAUDIO_DIR="${RIG_EDGE_TEST_PULSEAUDIO_DIR:-$ROOT/.temp/media-deps/root}"
+  local media_root="${RIG_MEDIA_DIR:-$PWD/.temp/media-deps}/root"
+  if [[ -z "${RIG_EDGE_TEST_PULSEAUDIO_DIR:-}" && -x "$media_root/usr/bin/pulseaudio" ]]; then
+    RIG_EDGE_TEST_PULSEAUDIO_DIR="$(cd "$media_root" && pwd)"
+    export RIG_EDGE_TEST_PULSEAUDIO_DIR
   fi
   RIG_EDGE_IT=1 cargo test "$@"
 }

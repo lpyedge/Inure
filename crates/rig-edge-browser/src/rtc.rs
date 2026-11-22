@@ -358,9 +358,9 @@ fn feeder_loop(
                                         as u64)
                                         * 90
                                         / 1000;
-                                    for p in pkts {
+                                    for packet in pkts {
                                         let _ = au_tx.send(Arc::new(Au {
-                                            data: Arc::from(p.data.into_boxed_slice()),
+                                            data: Arc::from(packet.into_boxed_slice()),
                                             pts90,
                                         }));
                                     }

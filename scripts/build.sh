@@ -5,6 +5,10 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 MODE="${1:-release}"
+if (( $# > 1 )); then
+  echo "Usage: $0 [debug|release]" >&2
+  exit 2
+fi
 case "$MODE" in
   debug)   cargo build -p rig-edge-browser ;;
   release) cargo build --release --locked -p rig-edge-browser ;;

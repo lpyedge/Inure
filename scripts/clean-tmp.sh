@@ -1,14 +1,22 @@
 #!/usr/bin/env bash
-# 清理边缘程序在 TMPDIR（默认 /tmp）下残留的临时目录。
+# 清理 Linux 上边缘程序在 TMPDIR（默认 /tmp）下残留的临时目录。
 # 用法：scripts/clean-tmp.sh [--yes]     默认只列出（dry run），加 --yes 才删除
 # 判据：目录名里的 pid 对应的进程已不存在才算残余；仍在运行的实例的目录不动。
 # 覆盖：rig-edge-<pid>、rig-edge-<pid>-uploads、rig-edge-<pid>-pulse、rig-edge-hls-<pid>。
 set -euo pipefail
 TMP="${TMPDIR:-/tmp}"
-YES=0; [ "${1:-}" = "--yes" ] && YES=1
+case "$#:${1:-}" in
+  0:) YES=0 ;;
+  1:--yes) YES=1 ;;
+  *) echo "Usage: $0 [--yes]" >&2; exit 2 ;;
+esac
+if [ ! -d "/proc/$$" ]; then
+  echo "Temporary directory cleanup requires Linux /proc for process checks." >&2
+  exit 1
+fi
 n=0
 for d in "$TMP"/rig-edge-[0-9]* "$TMP"/rig-edge-hls-[0-9]*; do
-  [ -d "$d" ] || continue
+  [[ -d "$d" && ! -L "$d" && -O "$d" ]] || continue
   name="${d##*/}"
   if [[ "$name" =~ ^rig-edge-([0-9]+)(-(uploads|pulse))?$ || "$name" =~ ^rig-edge-hls-([0-9]+)$ ]]; then
     pid="${BASH_REMATCH[1]}"

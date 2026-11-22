@@ -28,9 +28,9 @@
 
 | 文档 | 内容 | 性质 |
 |---|---|---|
-| [EDGE_BROWSER.md](EDGE_BROWSER.md) | 边缘程序逐项细节（观看端设计、DOM 镜像、输入与剪贴板、音视频、提交索引） | 详细设计，持续维护 |
+| [EDGE_BROWSER.md](EDGE_BROWSER.md) | 边缘程序设计（观看端、DOM 镜像、输入与剪贴板、音视频） | 详细设计 |
 | [PERCEPTION.md](PERCEPTION.md) | 感知层设计：语义来源、`Observation`/`Action` 契约、动作校验、操作与呈现解耦 | 详细设计，持续维护 |
-| [PITFALLS.md](PITFALLS.md) | 53 条踩坑的症状/根因/解法/验证与探针方法论 | 踩坑手册，新坑先落这里 |
+| [PITFALLS.md](PITFALLS.md) | 常见故障的症状、根因、解法及探针方法 | 踩坑手册 |
 | [EVAL.md](EVAL.md) | 感知层评估方法与决策门 | 方法文档 |
 | [SECURITY_DESIGN_2026-11-19.md](SECURITY_DESIGN_2026-11-19.md) | 快照会话隔离等安全整改设计 | 设计记录 |
 | [HARDENING_PLAN_2026-11-22.md](HARDENING_PLAN_2026-11-22.md) | 2026-11-22 安全整改计划与完成状态（认证重做、Upload 限目录等） | 整改记录 |
