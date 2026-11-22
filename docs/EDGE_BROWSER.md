@@ -139,7 +139,8 @@ platform/arch——版本取 product 的真實完整版本，UA 串裡的是約�
 | `/stream/{rend}/{name}` | GET | HLS 播放列表與分片。有效列表請求可啟動合流，12 秒沒有有效請求即回收 |
 
 **通道閘門語義**：AI 關閉時 `/observe`、`/act`、`/screenshot.png` 回 409；
-人通道關閉時不推任何幀；AV 關閉時合流管線停機。三通道全關時僅控制介面可用。
+人通道關閉時會斷開既有觀看連線，停止輸入並釋放 DOM、RTC 與 JPEG 需求。
+從 `/channels` 重開後，觀看端需重新連線。AV 關閉時合流管線停機。三通道全關時僅控制介面可用。
 閘門在 HTTP 與 MCP 兩個前端一致生效。
 
 ## 6. 直連鑑權（提交 `26dc971`）
@@ -713,7 +714,9 @@ HTTP act 點擊後 ghost 到達且落點在目標中心 40px 內。
 - `Done.frame_id` 表示動作的校驗幀。需要更新時，`observe(since_frame)` 使用客戶端最後套用的觀察幀。
   每次請求都採集候選，靜止頁回空增量並推進幀號。分頁、文件、座標空間或投影不相容時回整幀。
 - 密碼框整棵子樹脫敏（掩碼字符會經子文本節點洩漏，故按子樹清除，不做值替換）。
-- Navigate 受 origin 白名單約束（`--url` 的 origin + `--allow-origin` 追加）。
+  DOM 映射失敗時，主幀回觀察錯誤，子幀略過並附診斷。
+- Navigate 受 origin 白名單約束（`--url` 的 origin + `--allow-origin` 追加）。Chromium 回報導航錯誤時，動作回拒絕原因。
+- Select 在改值並發送事件前驗證原生選擇框與所有指定值。未知或停用的選項會被拒絕。
 - `tree_image` 與獨立截圖共用採集、驗證及遮罩流程。編號取自回應投影，遮罩涵蓋完整觀察與 DOM 中識別的敏感欄位。
   截圖前後核對文件、視口和敏感欄位的邊框。跨行程子幀含敏感欄位時遮罩其宿主框。無法確認時，
   `tree_image` 保留文字與樹並附診斷，獨立截圖回錯誤。
@@ -862,8 +865,8 @@ rig-proto 單元測試鎖定 upload/新拒絕碼/Done.note 的線格式。
 - 測試頁元素的 AX 名稱來自 `<label>` 文本（如「用戶名」），勿憑假設寫
   期望名。
 
-全倉提交門禁：`scripts/local-gate.sh`（fmt / clippy -D warnings / 全測試 /
-集成測試），提交前必須全綠。
+全倉提交門禁 `scripts/local-gate.sh` 包含 fmt、clippy、單元測試、真 Chromium 集成測試和 Python 報表測試。
+執行前備妥完整 Chromium、PulseAudio 虛擬聲卡與 `ffprobe`，提交前須全綠。
 
 ## 13. 本批次提交索引
 

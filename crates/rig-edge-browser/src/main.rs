@@ -53,6 +53,7 @@ use rig_proto::observation::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use tokio::sync::{watch, Mutex};
 
 use ai::{AiChannel, ObserveOut};
 use browser::Browser;
@@ -74,12 +75,19 @@ struct App {
     listen_ip: Option<std::net::IpAddr>,
     av_capable: bool,
     gate_ai: AtomicBool,
-    gate_human: AtomicBool,
+    gate_human: watch::Sender<bool>,
+    gate_transition: Mutex<()>,
     /// 人通道最近一次启动失败的原因（R-11：状态必须如实——
     /// 启动失败不得把 gate 报成已启用，错误要可查询）
     human_error: std::sync::Mutex<Option<String>>,
     /// 直连鉴权令牌（--token / RIG_EDGE_TOKEN）；None = 不鉴权（仅回环允许）
     token: Option<String>,
+}
+
+impl App {
+    fn human_enabled(&self) -> bool {
+        *self.gate_human.borrow()
+    }
 }
 
 /// 直连鉴权中间件：设了令牌时，除 /health 外所有接口都要带令牌——
@@ -256,7 +264,7 @@ async fn channel_state(app: &Arc<App>, av: bool) -> ChannelState {
     .to_string();
     ChannelState {
         ai: app.gate_ai.load(Ordering::SeqCst),
-        human: app.gate_human.load(Ordering::SeqCst),
+        human: app.human_enabled(),
         av,
         av_available: app.av_capable,
         human_error: app.human_error.lock().unwrap().clone(),
@@ -429,7 +437,8 @@ async fn main() {
         browser,
         av_capable,
         gate_ai: AtomicBool::new(ai_default),
-        gate_human: AtomicBool::new(human_default),
+        gate_human: watch::channel(human_default).0,
+        gate_transition: Mutex::new(()),
         human_error: std::sync::Mutex::new(None),
         token,
     });
@@ -439,11 +448,11 @@ async fn main() {
         if let Err(e) = app.human.start().await {
             // R-11：启动失败如实降级——gate 不报已启用，错误可查
             eprintln!("人通道启动失败: {e}");
-            app.gate_human.store(false, Ordering::SeqCst);
+            app.gate_human.send_replace(false);
             *app.human_error.lock().unwrap() = Some(e);
             app.human.set_gate_display(ai_default, false).await;
         }
-        if av_default && av_capable {
+        if av_default && av_capable && app.human_enabled() {
             app.media.apply_wanted(true).await;
         }
     }
@@ -596,7 +605,7 @@ async fn health(State(app): State<Arc<App>>) -> Json<serde_json::Value> {
         "ok": true,
         "ready": cdp_connected && sessions > 0,
         "ai": app.gate_ai.load(Ordering::SeqCst),
-        "human": app.gate_human.load(Ordering::SeqCst),
+        "human": app.human_enabled(),
         "human_running": app.human.is_running(),
         "frame_size": [fw, fh],
         "sessions": sessions,
@@ -672,35 +681,41 @@ async fn get_channels(State(app): State<Arc<App>>) -> Json<ChannelState> {
 
 /// 应用通道开关（HTTP /channels 与观看端菜单共用同一逻辑），
 /// 并同步观看端菜单里的勾选态显示。
-async fn apply_gate_flags(app: &Arc<App>, ai: Option<bool>, human: Option<bool>) {
+async fn apply_gate_flags(app: &Arc<App>, ai: Option<bool>, human: Option<bool>, av: Option<bool>) {
+    let _transition = app.gate_transition.lock().await;
     if let Some(h) = human {
-        let cur = app.gate_human.load(Ordering::SeqCst);
+        let cur = app.human_enabled();
         if h && !cur {
             // R-11：start 成功才置 gate；失败保留关闭并记录原因
             match app.human.start().await {
                 Ok(()) => {
                     *app.human_error.lock().unwrap() = None;
-                    app.gate_human.store(true, Ordering::SeqCst);
+                    app.gate_human.send_replace(true);
                 }
                 Err(e) => {
                     eprintln!("人通道启动失败: {e}");
                     *app.human_error.lock().unwrap() = Some(e);
                 }
             }
-        } else if !h && cur {
-            app.media.apply_wanted(false).await;
+        } else if !h {
+            // 先通知旧连接停收发，再停止共享画面与 HLS 管线。
+            if cur {
+                app.gate_human.send_replace(false);
+            }
             let _ = app.human.stop().await;
-            app.gate_human.store(false, Ordering::SeqCst);
+            app.media.apply_wanted(false).await;
         }
     }
     if let Some(a) = ai {
         app.gate_ai.store(a, Ordering::SeqCst);
     }
+    if let Some(av) = av {
+        if !av || app.av_capable && app.human_enabled() {
+            app.media.apply_wanted(av).await;
+        }
+    }
     app.human
-        .set_gate_display(
-            app.gate_ai.load(Ordering::SeqCst),
-            app.gate_human.load(Ordering::SeqCst),
-        )
+        .set_gate_display(app.gate_ai.load(Ordering::SeqCst), app.human_enabled())
         .await;
 }
 
@@ -708,19 +723,14 @@ async fn set_channels(
     State(app): State<Arc<App>>,
     Json(set): Json<ChannelSet>,
 ) -> Json<ChannelState> {
-    apply_gate_flags(&app, set.ai, set.human).await;
-    if let Some(av) = set.av {
-        if !av || app.av_capable && app.gate_human.load(Ordering::SeqCst) {
-            app.media.apply_wanted(av).await;
-        }
-    }
+    apply_gate_flags(&app, set.ai, set.human, set.av).await;
     let av = app.media.running().await;
     Json(channel_state(&app, av).await)
 }
 
 /// 观看端「打印」菜单的产物取回（打印一次取一次，取后清空）
 async fn print_pdf(State(app): State<Arc<App>>) -> Response {
-    if !app.gate_human.load(Ordering::SeqCst) {
+    if !app.human_enabled() {
         return channel_off();
     }
     match app.human.take_print_pdf().await {
@@ -734,7 +744,7 @@ async fn stream_file(
     State(app): State<Arc<App>>,
     axum::extract::Path((rend, name)): axum::extract::Path<(String, String)>,
 ) -> Response {
-    if !app.gate_human.load(Ordering::SeqCst) {
+    if !app.human_enabled() {
         return channel_off();
     }
     match app.media.read_file(&rend, &name).await {
@@ -877,10 +887,12 @@ async fn ws_handler(
     ws: WebSocketUpgrade,
     axum::extract::ConnectInfo(remote): axum::extract::ConnectInfo<std::net::SocketAddr>,
 ) -> Response {
-    if !app.gate_human.load(Ordering::SeqCst) {
+    // 升级期间若发生关开，已获准的旧连接也必须退出。
+    let gate = app.gate_human.subscribe();
+    if !*gate.borrow() {
         return channel_off();
     }
-    ws.on_upgrade(move |socket| ws_session(app, socket, remote))
+    ws.on_upgrade(move |socket| ws_session(app, socket, remote, gate))
 }
 
 /// RTC host 候选的通告地址：监听地址是具体 IP 时用它；绑通配地址时
@@ -972,20 +984,16 @@ async fn first_viewer_frame(
     (app.browser.active_page().await.as_ref() == Ok(&page)).then_some(frame)
 }
 
-async fn ws_session(app: Arc<App>, socket: WebSocket, remote: std::net::SocketAddr) {
-    let (mut sink, mut stream) = socket.split();
-    // hello：告知 CSS 视口尺寸，观看端据此换算输入坐标
-    if let Ok(main) = app.browser.main().await {
-        if let Ok((w, h, _)) = app.browser.layout(&main).await {
-            let _ = sink
-                .send(Message::Text(
-                    json!({"type": "hello", "cssWidth": w, "cssHeight": h})
-                        .to_string()
-                        .into(),
-                ))
-                .await;
-        }
+async fn ws_session(
+    app: Arc<App>,
+    socket: WebSocket,
+    remote: std::net::SocketAddr,
+    mut gate: watch::Receiver<bool>,
+) {
+    if gate.has_changed().unwrap_or(true) {
+        return;
     }
+    let (mut sink, mut stream) = socket.split();
     // 订阅先于声明需求，让首帧可以直接接收。
     let mut frames = app.human.subscribe();
     let mut jpeg_lease = Some(app.human.request_capture());
@@ -1011,6 +1019,19 @@ async fn ws_session(app: Arc<App>, socket: WebSocket, remote: std::net::SocketAd
     let exec_ghost = app.exec.clone();
     let human2 = app.human.clone();
     let mut send_task = tokio::spawn(async move {
+        // hello：告知 CSS 视口尺寸，关闭通道时可中断这次读取。
+        if let Ok(main) = send_app.browser.main().await {
+            if let Ok((w, h, _)) = send_app.browser.layout(&main).await {
+                let hello = json!({"type": "hello", "cssWidth": w, "cssHeight": h});
+                if sink
+                    .send(Message::Text(hello.to_string().into()))
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        }
         if let Some(f) = first_viewer_frame(&send_app, &mut frames).await {
             let wanted = *jpeg_watch.borrow();
             if wanted && sink.send(frame_message(&f)).await.is_err() {
@@ -1109,6 +1130,7 @@ async fn ws_session(app: Arc<App>, socket: WebSocket, remote: std::net::SocketAd
         }
     });
     let (send_done, mut stop_recv) = tokio::sync::oneshot::channel::<()>();
+    let recv_gate = gate.clone();
     let mut recv_task = tokio::spawn(async move {
         let mut pointer = human::ViewerPointer::default();
         let mut keys = human::ViewerKeys::default();
@@ -1122,6 +1144,9 @@ async fn ws_session(app: Arc<App>, socket: WebSocket, remote: std::net::SocketAd
                 msg = stream.next() => msg,
             };
             let Some(msg) = msg else { break };
+            if recv_gate.has_changed().unwrap_or(true) {
+                break;
+            }
             let text = match msg {
                 Ok(Message::Text(t)) => t,
                 Ok(Message::Ping(_)) | Ok(Message::Pong(_)) | Ok(Message::Binary(_)) => continue,
@@ -1159,6 +1184,7 @@ async fn ws_session(app: Arc<App>, socket: WebSocket, remote: std::net::SocketAd
                             video_active: rtc_active.clone(),
                             dom_open: dom_dc_open.clone(),
                             dom_wanted: subs2.dom_held.clone(),
+                            gate: recv_gate.clone(),
                         },
                         rtc_tracks(&v),
                     ));
@@ -1217,15 +1243,22 @@ async fn ws_session(app: Arc<App>, socket: WebSocket, remote: std::net::SocketAd
                     // 输入分发全在人通道（chrome 命中/编辑器/遮蔽接管）；
                     // 菜单里的通道开关以返回值带回这里应用 gate
                     if let Some((a, h)) = app2.human.handle_ws(&v, &out_tx).await {
-                        apply_gate_flags(&app2, Some(a), Some(h)).await;
+                        apply_gate_flags(&app2, Some(a), Some(h), None).await;
                     }
                 }
             }
         }
+        drop(rtc_session);
         app2.human.release_pointer(&mut pointer).await;
         app2.human.release_keys(&mut keys).await;
     });
     tokio::select! {
+        _ = gate.changed() => {
+            let _ = send_done.send(());
+            send_task.abort();
+            let _ = send_task.await;
+            let _ = recv_task.await;
+        }
         _ = &mut send_task => {
             // Let any in-flight subscription transition finish before cleanup.
             let _ = send_done.send(());

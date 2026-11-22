@@ -136,6 +136,8 @@ pub struct AiChannel {
     ids: Mutex<IdMap>,
     frame: AtomicU64,
     state: Mutex<Option<Arc<FrameState>>>,
+    /// 最近成功呈現給呼叫方的觀察；內部動作校驗採集不推進此基準。
+    presented: Mutex<Option<Arc<FrameState>>>,
     /// 最近 8 个已输出的结构化观察。动作内部校验帧不进入这个池。
     history: Mutex<Vec<PresentedFrame>>,
     /// act 串行锁：同一时刻只执行一个动作，避免多客户端动作交错
@@ -168,6 +170,7 @@ impl AiChannel {
             ids: Mutex::new(IdMap::default()),
             frame: AtomicU64::new(0),
             state: Mutex::new(None),
+            presented: Mutex::new(None),
             history: Mutex::new(Vec::new()),
             act_lock: Mutex::new(()),
             idem: Mutex::new(Vec::new()),
@@ -297,7 +300,7 @@ impl AiChannel {
     /// 用客户端实际拿到的投影做差分；结果无法按现有增量契约重建时回整帧。
     async fn present(
         &self,
-        frame: &FrameState,
+        frame: &Arc<FrameState>,
         req: &ObserveRequest,
         deadline: tokio::time::Instant,
     ) -> Result<ObserveOut, String> {
@@ -369,6 +372,7 @@ impl AiChannel {
             }
         }
         if let Some(delta) = delta {
+            self.note_presented(frame).await;
             return Ok(delta_out(delta, note.as_deref()));
         }
         let mut text = render(&view);
@@ -378,7 +382,19 @@ impl AiChannel {
         for warning in warnings {
             text.push_str(&format!("[⚠ {warning}]\n"));
         }
+        self.note_presented(frame).await;
         Ok(ObserveOut::Full(view, text, image))
+    }
+
+    async fn note_presented(&self, frame: &Arc<FrameState>) {
+        let mut presented = self.presented.lock().await;
+        if presented
+            .as_ref()
+            .is_some_and(|previous| previous.obs.frame_id >= frame.obs.frame_id)
+        {
+            return;
+        }
+        *presented = Some(Arc::clone(frame));
     }
 
     async fn capture_marked(
@@ -620,12 +636,26 @@ impl AiChannel {
             }
         }
 
-        // 陈旧校验：以请求帧为基准对照当前帧。seen 是动作前的状态
-        // 快照，(current, locate) 是同一快照的配对（B4 帧原子性）。
-        // 含 Element 目标的动作先刷新一帧再跨帧比对元素同一性；
-        // 只含 Point/无目标的动作直接以存储帧为 current——Point 的
-        // 校验要求帧号严格一致，先刷新反而会让它永远过期。
-        let seen_state = self.state.lock().await.clone();
+        let focus_targeted = matches!(
+            &req.action,
+            Action::Key { .. } | Action::Type { target: None, .. }
+        );
+        // 焦点动作须与调用方看到的焦点比较，内部复核帧只供执行端使用。
+        // Point 则先校验存储帧号，先刷新会让请求帧过期。
+        let seen_state = if focus_targeted {
+            let presented = self.presented.lock().await.clone();
+            let current_frame = presented.as_ref().map(|frame| frame.obs.frame_id);
+            if current_frame != Some(req.frame_id) {
+                return ActionResult::Rejected {
+                    reason: RejectReason::StaleFrame {
+                        current_frame: current_frame.unwrap_or(0),
+                    },
+                };
+            }
+            presented
+        } else {
+            self.state.lock().await.clone()
+        };
         let seen = seen_state.as_ref().map(|fs| &fs.obs);
         let has_element = req
             .action
@@ -833,12 +863,11 @@ impl AiChannel {
         if !space.contains(x, y) {
             return None;
         }
-        let hit = self
-            .browser
-            .hit_backend_node(session, x as i32, y as i32)
+        self.browser
+            .element_receives_pointer(session, backend, x, y)
             .await
-            .ok()?;
-        (hit == backend).then_some((x, y))
+            .ok()?
+            .then_some((x, y))
     }
 
     /// 元素中心点使用会话本地坐标。中心当前可命中时可直接执行，
@@ -847,7 +876,7 @@ impl AiChannel {
         &self,
         frame: &FrameState,
         id: &str,
-        pulse: bool,
+        click: bool,
     ) -> Result<(String, f32, f32), RejectReason> {
         let (session, backend) = self.locate_session_backend(&frame.locate, id).await?;
         let (x, y) = if let Some(point) = self
@@ -866,11 +895,30 @@ impl AiChannel {
                 .quads(&session, backend)
                 .await
                 .map_err(|e| RejectReason::PolicyDenied { detail: e })?
-                .ok_or_else(|| RejectReason::NotInteractable { id: String::new() })?;
-            BBox(quad).center()
+                .ok_or_else(|| RejectReason::NotInteractable { id: id.into() })?;
+            let (x, y) = BBox(quad).center();
+            if click {
+                let (x, y) = (x.round(), y.round());
+                if !self
+                    .browser
+                    .element_receives_pointer(&session, backend, x, y)
+                    .await
+                    .unwrap_or(false)
+                    || !self
+                        .browser
+                        .frame_receives_pointer(&frame.context.page.session, &session, x, y)
+                        .await
+                        .unwrap_or(false)
+                {
+                    return Err(RejectReason::NotInteractable { id: id.into() });
+                }
+                (x, y)
+            } else {
+                (x, y)
+            }
         };
         if let Some(label) = self.pending_label.lock().await.clone() {
-            self.exec.record(x, y, &label, pulse).await;
+            self.exec.record(x, y, &label, click).await;
         }
         Ok((session, x, y))
     }
@@ -1096,21 +1144,54 @@ impl AiChannel {
                         "Runtime.callFunctionOn",
                         serde_json::json!({
                             "objectId": object_id,
-                            // 全部 values 透传（GPT review R-16：此前只取第一个）；
-                            // 单选框收到多个值时回 ERR_MULTI_ON_SINGLE 明确拒绝
-                            "functionDeclaration": "function(vals){ if(!this.multiple && vals.length>1){ return 'ERR_MULTI_ON_SINGLE'; } const set=new Set(vals.map(String)); for(const o of this.options){ o.selected=set.has(o.value); } this.dispatchEvent(new Event('input',{bubbles:true})); this.dispatchEvent(new Event('change',{bubbles:true})); return 'OK'; }",
+                            // 先完成所有验证，再更改选中项并触发事件；验证错误不产生部分副作用。
+                            "functionDeclaration": r#"function(vals) {
+                                if (this.localName !== 'select') return 'ERR_NOT_SELECT';
+                                if (!this.multiple && vals.length > 1) return 'ERR_MULTI_ON_SINGLE';
+                                const wanted = vals.map(String);
+                                const options = Array.from(this.options);
+                                const eligible = o => !o.disabled && !(o.parentElement?.localName === 'optgroup' && o.parentElement.disabled);
+                                for (const value of wanted) {
+                                    if (options.some(o => o.value === value && eligible(o))) continue;
+                                    return options.some(o => o.value === value) ? 'ERR_DISABLED_OPTION' : 'ERR_UNKNOWN_OPTION';
+                                }
+                                if (this.multiple) {
+                                    const set = new Set(wanted);
+                                    for (const o of options) o.selected = eligible(o) && set.has(o.value);
+                                } else {
+                                    this.selectedIndex = options.findIndex(o => wanted.includes(o.value) && eligible(o));
+                                }
+                                this.dispatchEvent(new Event('input', {bubbles: true}));
+                                this.dispatchEvent(new Event('change', {bubbles: true}));
+                                return 'OK';
+                            }"#,
                             "arguments": [{"value": values}],
                             "returnByValue": true,
                         }),
                     )
                     .await
                     .map_err(denied)?;
-                if out
+                if out.get("exceptionDetails").is_some() {
+                    return Err(denied("Select 評估發生例外".into()));
+                }
+                let result = out
                     .pointer("/result/value")
-                    .and_then(serde_json::Value::as_str)
-                    == Some("ERR_MULTI_ON_SINGLE")
-                {
-                    return Err(denied("单选 Select 收到多个 values".into()));
+                    .and_then(serde_json::Value::as_str);
+                match result {
+                    Some("OK") => {}
+                    Some("ERR_MULTI_ON_SINGLE") => {
+                        return Err(denied("单选 Select 收到多个 values".into()))
+                    }
+                    Some("ERR_NOT_SELECT") => {
+                        return Err(denied("Select 目标不是原生 select 元素".into()))
+                    }
+                    Some("ERR_UNKNOWN_OPTION") => {
+                        return Err(denied("Select 包含未知选项值".into()))
+                    }
+                    Some("ERR_DISABLED_OPTION") => {
+                        return Err(denied("Select 包含禁用选项".into()))
+                    }
+                    _ => return Err(denied("Select 评估未成功".into())),
                 }
                 Ok(None)
             }
@@ -1553,13 +1634,21 @@ mod tests {
         commands: std::sync::Mutex<Vec<String>>,
         location_queries: std::sync::Mutex<Vec<(f64, f64)>>,
         hit_backend: std::sync::atomic::AtomicI64,
+        hit_after_scroll: std::sync::atomic::AtomicI64,
+        dom_failure_session: std::sync::Mutex<Option<&'static str>>,
     }
 
     impl FakeCdp {
         /// 返回 (是否为注入错误, result 主体)
-        fn reply(&self, method: &str) -> (bool, serde_json::Value) {
+        fn reply(&self, method: &str, session: Option<&str>) -> (bool, serde_json::Value) {
             use serde_json::json;
             self.commands.lock().unwrap().push(method.to_string());
+            if method == "DOM.getDocument"
+                && session.is_some()
+                && session == *self.dom_failure_session.lock().unwrap()
+            {
+                return (true, json!(null));
+            }
             let captured = self.screenshot_calls.load(Ordering::SeqCst) > 0;
             if let Some(case) = self.screenshot {
                 match (method, captured, case) {
@@ -1652,6 +1741,13 @@ mod tests {
                     false,
                     json!({"backendNodeId":self.hit_backend.load(Ordering::SeqCst)}),
                 ),
+                "DOM.scrollIntoViewIfNeeded" => {
+                    let next = self.hit_after_scroll.load(Ordering::SeqCst);
+                    if next != 0 {
+                        self.hit_backend.store(next, Ordering::SeqCst);
+                    }
+                    (false, json!({}))
+                }
                 "Page.getFrameTree" => {
                     let loader =
                         if self.navigate_on_first_ax && self.ax_calls.load(Ordering::SeqCst) > 0 {
@@ -1707,6 +1803,8 @@ mod tests {
             commands: std::sync::Mutex::new(Vec::new()),
             location_queries: std::sync::Mutex::new(Vec::new()),
             hit_backend: std::sync::atomic::AtomicI64::new(7),
+            hit_after_scroll: std::sync::atomic::AtomicI64::new(0),
+            dom_failure_session: std::sync::Mutex::new(None),
         });
         // WS 端
         let ws_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1746,7 +1844,10 @@ mod tests {
                                 .unwrap_or(f64::NAN);
                             fake.location_queries.lock().unwrap().push((x, y));
                         }
-                        let (is_err, body) = fake.reply(method);
+                        let (is_err, body) = fake.reply(
+                            method,
+                            v.get("sessionId").and_then(serde_json::Value::as_str),
+                        );
                         let resp = if is_err {
                             serde_json::json!({"id": id, "error": {"message": "injected failure"}})
                         } else {
@@ -1804,6 +1905,34 @@ mod tests {
         let exec = Arc::new(ExecControl::default());
         let ch = AiChannel::new(browser.clone(), vec![], exec);
         (browser, ch)
+    }
+
+    #[tokio::test]
+    async fn observation_requires_dom_metadata_for_each_emitted_session() {
+        let (base, fake) = spawn_fake_cdp(usize::MAX, false, None).await;
+        let browser = Browser::attach(&base).await.unwrap();
+        let ch = AiChannel::new(browser.clone(), vec![], Arc::new(ExecControl::default()));
+        *fake.dom_failure_session.lock().unwrap() = Some("S1");
+        assert!(ch.observe().await.is_err(), "主帧 DOM 不可用时应拒绝观察");
+
+        browser.sessions.lock().await.insert(
+            "S2".into(),
+            crate::browser::SessionInfo {
+                target_id: "T2".into(),
+                target_type: "iframe".into(),
+                parent: Some("S1".into()),
+            },
+        );
+        *fake.dom_failure_session.lock().unwrap() = Some("S2");
+        let (obs, text) = ch.observe().await.unwrap();
+        let mut buttons = 0;
+        obs.each_element(&mut |el| {
+            if el.role == "button" {
+                buttons += 1;
+            }
+        });
+        assert_eq!(buttons, 1, "仅主帧的 AX 节点可以输出");
+        assert!(text.contains("S2") && text.contains("已跳过"));
     }
 
     #[tokio::test]
@@ -1923,6 +2052,7 @@ mod tests {
     async fn mismatched_element_center_hit_keeps_scroll_command() {
         let (base, fake) = spawn_fake_cdp(usize::MAX, false, None).await;
         fake.hit_backend.store(8, Ordering::SeqCst);
+        fake.hit_after_scroll.store(7, Ordering::SeqCst);
         let browser = Browser::attach(&base).await.expect("假 CDP attach");
         let ch = AiChannel::new(browser, vec![], Arc::new(ExecControl::default()));
         let (obs, _) = ch.observe().await.expect("首帧观察");
@@ -1947,6 +2077,9 @@ mod tests {
             hit < scroll,
             "中心命中其他节点后应回到滚动路径: {commands:?}"
         );
+        assert!(commands[scroll + 1..]
+            .iter()
+            .any(|method| method == "DOM.getNodeForLocation"));
     }
 
     /// 操作与呈现解耦：act 不再做动作后整页刷新。Done 携带的是动作所基于

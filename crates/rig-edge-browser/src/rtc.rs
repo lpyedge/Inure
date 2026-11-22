@@ -34,7 +34,7 @@ use str0m::media::{Direction, MediaKind, MediaTime, Mid};
 use str0m::net::{Protocol, Receive};
 use str0m::{Candidate, Event, IceConnectionState, Input, Output, Rtc};
 use tokio::net::UdpSocket;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, watch};
 
 use crate::encode::{CodecKind, EncoderConfig, VideoEncoder};
 use crate::human::HumanChannel;
@@ -207,6 +207,7 @@ pub struct ViewerTransport {
     pub video_active: Arc<AtomicBool>,
     pub dom_open: Arc<AtomicBool>,
     pub dom_wanted: Arc<AtomicBool>,
+    pub gate: watch::Receiver<bool>,
 }
 
 #[derive(Default)]
@@ -674,6 +675,7 @@ async fn run_session(
         video_active: active,
         dom_open,
         dom_wanted,
+        mut gate,
     } = transport;
     let mut demand = SessionDemand::default();
     demand.update(&hub, tracks);
@@ -761,7 +763,11 @@ async fn run_session(
     // 用本会话的 ICE 状态配对 hub 连通计数的增减。
     let mut connected_here = false;
     'session: loop {
+        if gate.has_changed().unwrap_or(true) {
+            break;
+        }
         tokio::select! {
+            _ = gate.changed() => break 'session,
             r = socket.recv_from(&mut buf) => {
                 if let Ok((n, src)) = r {
                     if let Ok(contents) = buf[..n].try_into() {

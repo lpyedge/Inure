@@ -469,6 +469,150 @@ async fn edge_browser_end_to_end() {
     assert_eq!(status, 200, "AI 通道重开后 observe 应恢复");
 }
 
+#[tokio::test]
+async fn edge_navigate_reports_chromium_navigation_errors() {
+    if std::env::var("RIG_EDGE_IT").is_err() {
+        eprintln!("跳过：未设置 RIG_EDGE_IT");
+        return;
+    }
+    let _serial = SERIAL.lock().await;
+    let page_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let page_port = page_listener.local_addr().unwrap().port();
+    let origin = format!("http://127.0.0.1:{page_port}");
+    serve(
+        page_listener,
+        vec![("/ok.html".into(), "<title>ok</title>".into())],
+    );
+
+    let closed_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let closed_port = closed_listener.local_addr().unwrap().port();
+    drop(closed_listener);
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let edge_port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let unreachable_origin = format!("http://127.0.0.1:{closed_port}");
+    let _edge = spawn_edge(&[
+        "--listen".into(),
+        format!("127.0.0.1:{edge_port}"),
+        "--url".into(),
+        format!("{origin}/ok.html"),
+        "--allow-origin".into(),
+        unreachable_origin,
+    ]);
+    wait_health(edge_port).await;
+
+    let initial = observe(edge_port);
+    let frame = initial["observation"]["frame_id"].as_u64().unwrap();
+    let success = act(
+        edge_port,
+        frame,
+        json!({"kind":"navigate", "url":format!("{origin}/ok.html")}),
+    );
+    assert_eq!(success["result"], "done", "有效本機導航應成功: {success}");
+
+    let current = observe(edge_port);
+    let frame = current["observation"]["frame_id"].as_u64().unwrap();
+    let failed = act(
+        edge_port,
+        frame,
+        json!({"kind":"navigate", "url":format!("http://127.0.0.1:{closed_port}/unreachable")}),
+    );
+    assert_eq!(
+        failed["result"], "rejected",
+        "不可達本機導航應被拒絕: {failed}"
+    );
+    let detail = failed["reason"]["detail"].as_str().unwrap_or_default();
+    assert!(
+        detail.contains("Chromium navigation failed"),
+        "應回傳安全且具體的導航錯誤: {failed}"
+    );
+    assert!(
+        !detail.contains(&closed_port.to_string()),
+        "錯誤不得帶入導航 URL: {failed}"
+    );
+}
+
+#[tokio::test]
+async fn edge_click_requires_a_hit_on_the_requested_element() {
+    if std::env::var("RIG_EDGE_IT").is_err() {
+        eprintln!("跳过：未设置 RIG_EDGE_IT");
+        return;
+    }
+    let _serial = SERIAL.lock().await;
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let page = format!(
+        r#"<!doctype html><meta charset="utf-8">
+        <button style="position:absolute;left:20px;top:100px;width:180px;height:50px"
+            onclick="statusText.textContent='Main clicked'"><span>Main target</span></button>
+        <iframe style="position:absolute;left:260px;top:100px;width:300px;height:160px"
+            src="http://localhost:{port}/inner"></iframe>
+        <button class="cover" style="position:absolute;left:80px;top:105px;width:60px;height:40px"
+            onclick="statusText.textContent='Wrong click'">Cover</button>
+        <div class="cover" style="position:absolute;left:265px;top:105px;width:185px;height:65px;background:white"></div>
+        <button onclick="document.querySelectorAll('.cover').forEach(node=>node.remove())">Reveal</button>
+        <p id="statusText">Main ready</p>"#
+    );
+    let inner = r#"<!doctype html><meta charset="utf-8">
+        <button style="position:absolute;top:10px;left:20px;width:100px;height:40px"
+            onclick="statusText.textContent='Inner clicked'"><span>Inner target</span></button>
+        <p id="statusText" style="margin-top:60px">Inner ready</p>"#;
+    serve(
+        listener,
+        vec![("/".into(), page), ("/inner".into(), inner.into())],
+    );
+    let edge_port = free_port();
+    let _edge = spawn_edge(&[
+        "--listen".into(),
+        format!("127.0.0.1:{edge_port}"),
+        "--url".into(),
+        format!("http://127.0.0.1:{port}/"),
+    ]);
+    wait_health(edge_port).await;
+
+    let click = |obs: &Value, name| {
+        let obs = &obs["observation"];
+        let target = find_element(obs, "button", name).expect("应观察到按钮");
+        act(
+            edge_port,
+            obs["frame_id"].as_u64().unwrap(),
+            json!({"kind":"click","target":{"by":"element","id":target["id"]}}),
+        )
+    };
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut obs = loop {
+        let obs = observe(edge_port);
+        if find_element(&obs["observation"], "button", "Inner target").is_some() {
+            break obs;
+        }
+        assert!(Instant::now() < deadline, "应观察到跨进程子帧");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    for name in ["Main target", "Inner target"] {
+        let rejected = click(&obs, name);
+        assert_eq!(
+            rejected["reason"]["code"], "not_interactable",
+            "{name}: {rejected}"
+        );
+        obs = observe(edge_port);
+        let text = obs["text"].as_str().unwrap();
+        assert!(
+            text.contains("Main ready")
+                && text.contains("Inner ready")
+                && !text.contains("Wrong click")
+        );
+    }
+    assert_eq!(click(&obs, "Reveal")["result"], "done");
+    for name in ["Main target", "Inner target"] {
+        obs = observe(edge_port);
+        assert_eq!(click(&obs, name)["result"], "done", "{name} 应可点击");
+    }
+    let obs = observe(edge_port);
+    let text = obs["text"].as_str().unwrap();
+    assert!(text.contains("Main clicked") && text.contains("Inner clicked"));
+}
+
 const TEXT_HTML: &str = r#"<!DOCTYPE html><html lang="zh"><head><meta charset="utf-8"><title>文本</title></head>
 <body>
 <textarea id="ta" aria-label="甲框" rows="4" cols="40"></textarea>
@@ -1255,8 +1399,24 @@ async fn edge_text_keys_clipboard() {
         "重复请求不得二次输入（值应恰好一份）"
     );
 
+    let old_frame = o2["observation"]["frame_id"].as_u64().unwrap();
+    for action in [
+        json!({"kind": "key", "key": "Control+A"}),
+        json!({"kind": "type", "text": "STALE-INPUT", "submit": false}),
+    ] {
+        let r = act(edge_port, old_frame, action);
+        assert_eq!(r["result"], "rejected", "舊觀察幀的焦點動作應拒絕: {r}");
+        assert_eq!(r["reason"]["code"], "stale_frame", "應回 StaleFrame: {r}");
+    }
+    let after_stale = observe(edge_port);
+    assert_eq!(
+        elem_value(&after_stale["observation"], "textbox", "甲框"),
+        cjk,
+        "拒絕舊幀焦點動作後文字不得改變"
+    );
+
     // ── 2. 页内复制粘贴：Ctrl+A / Ctrl+C → 点乙框 → Ctrl+V ──
-    let frame2 = o2["observation"]["frame_id"].as_u64().unwrap();
+    let frame2 = after_stale["observation"]["frame_id"].as_u64().unwrap();
     for keys in ["Control+A", "Control+C"] {
         let r = act(edge_port, frame2, json!({"kind": "key", "key": keys}));
         assert_eq!(r["result"], "done", "{keys} 应成功: {r}");
@@ -2972,6 +3132,150 @@ document.getElementById('up').addEventListener('change', (e) => {
 </script>
 </body></html>"#;
 
+const SELECT_HTML: &str = r#"<!doctype html><html lang="zh"><meta charset="utf-8"><body>
+<label>選項 <select id="choice" aria-label="選項">
+  <option value="alpha">Alpha</option><option value="beta">Beta</option>
+  <option value="disabled" disabled>Disabled</option>
+  <optgroup label="Disabled group" disabled><option value="group-disabled">Group disabled</option></optgroup>
+</select></label>
+<label>多選 <select id="multi" aria-label="多選" multiple>
+  <option value="one">One</option><option value="two">Two</option><option value="three">Three</option>
+</select></label>
+<button id="other" aria-label="一般按鈕">按鈕</button>
+<p aria-label="狀態" id="state">value=;changes=0</p>
+<script>const s=document.querySelector('#choice'), m=document.querySelector('#multi');
+const state=document.querySelector('#state');
+function update(){state.textContent=`value=${s.value};changes=${window.changes=(window.changes||0)+1};multi=${Array.from(m.selectedOptions).map(o=>o.value).join(',')}`;}
+s.addEventListener('change',update);m.addEventListener('change',()=>{state.textContent=`value=${s.value};changes=${window.changes||0};multi=${Array.from(m.selectedOptions).map(o=>o.value).join(',')}`;});
+</script></body></html>"#;
+
+#[tokio::test]
+async fn edge_select_validates_target_and_values_before_mutation() {
+    if std::env::var("RIG_EDGE_IT").is_err() {
+        eprintln!("跳过：未设置 RIG_EDGE_IT");
+        return;
+    }
+    let _serial = SERIAL.lock().await;
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let origin = format!("http://127.0.0.1:{port}");
+    serve(listener, vec![("/select.html".into(), SELECT_HTML.into())]);
+    let edge_port = free_port();
+    let _edge = spawn_edge(&[
+        "--listen".into(),
+        format!("127.0.0.1:{edge_port}"),
+        "--url".into(),
+        format!("{origin}/select.html"),
+    ]);
+    wait_health(edge_port).await;
+
+    let obs = observe(edge_port);
+    let select = find_by_name(&obs["observation"], "選項").expect("應觀察到 select");
+    let select_id = select["id"].as_str().unwrap().to_string();
+    let button = find_by_name(&obs["observation"], "一般按鈕").expect("應觀察到按鈕");
+    let button_id = button["id"].as_str().unwrap().to_string();
+
+    let selected = act(
+        edge_port,
+        obs["observation"]["frame_id"].as_u64().unwrap(),
+        json!({"kind":"select", "target":{"by":"element", "id":select_id}, "values":["beta"]}),
+    );
+    assert_eq!(selected["result"], "done", "合法選項應成功: {selected}");
+    let after_valid = observe(edge_port);
+    assert!(
+        after_valid["text"]
+            .as_str()
+            .unwrap_or("")
+            .contains("value=beta;changes=1"),
+        "應改變值並送出 change: {}",
+        after_valid["text"]
+    );
+    let multi = find_by_name(&after_valid["observation"], "多選").expect("應觀察到多選框");
+    let multi_id = multi["id"].as_str().unwrap();
+    let selected_many = act(
+        edge_port,
+        after_valid["observation"]["frame_id"].as_u64().unwrap(),
+        json!({"kind":"select", "target":{"by":"element", "id":multi_id}, "values":["one", "two"]}),
+    );
+    assert_eq!(
+        selected_many["result"], "done",
+        "多選框應保留多值支援: {selected_many}"
+    );
+    let after_many = observe(edge_port);
+    assert!(
+        after_many["text"]
+            .as_str()
+            .unwrap_or("")
+            .contains("multi=one,two"),
+        "多選框應同時選中兩個值: {}",
+        after_many["text"]
+    );
+
+    let stale_option = act(
+        edge_port,
+        after_many["observation"]["frame_id"].as_u64().unwrap(),
+        json!({"kind":"select", "target":{"by":"element", "id":select_id}, "values":["missing"]}),
+    );
+    assert_eq!(
+        stale_option["result"], "rejected",
+        "未知值應拒絕: {stale_option}"
+    );
+    let after_unknown = observe(edge_port);
+    assert!(
+        after_unknown["text"]
+            .as_str()
+            .unwrap_or("")
+            .contains("value=beta;changes=1;multi=one,two"),
+        "未知值不得改變值或送 change: {}",
+        after_unknown["text"]
+    );
+
+    let disabled = act(
+        edge_port,
+        after_unknown["observation"]["frame_id"].as_u64().unwrap(),
+        json!({"kind":"select", "target":{"by":"element", "id":select_id}, "values":["group-disabled"]}),
+    );
+    assert_eq!(disabled["result"], "rejected", "禁用選項應拒絕: {disabled}");
+    let after_disabled = observe(edge_port);
+    assert!(
+        after_disabled["text"]
+            .as_str()
+            .unwrap_or("")
+            .contains("value=beta;changes=1;multi=one,two"),
+        "禁用選項不得改變狀態: {}",
+        after_disabled["text"]
+    );
+
+    let wrong_target = act(
+        edge_port,
+        after_disabled["observation"]["frame_id"].as_u64().unwrap(),
+        json!({"kind":"select", "target":{"by":"element", "id":button_id}, "values":["beta"]}),
+    );
+    assert_eq!(
+        wrong_target["result"], "rejected",
+        "非 select 元素應拒絕: {wrong_target}"
+    );
+
+    let single_multiple = act(
+        edge_port,
+        after_disabled["observation"]["frame_id"].as_u64().unwrap(),
+        json!({"kind":"select", "target":{"by":"element", "id":select_id}, "values":["alpha", "beta"]}),
+    );
+    assert_eq!(
+        single_multiple["result"], "rejected",
+        "單選框多值仍應拒絕: {single_multiple}"
+    );
+    let after_single_multiple = observe(edge_port);
+    assert!(
+        after_single_multiple["text"]
+            .as_str()
+            .unwrap_or("")
+            .contains("value=beta;changes=1;multi=one,two"),
+        "單選框多值拒絕後頁面狀態不得改變: {}",
+        after_single_multiple["text"]
+    );
+}
+
 /// 按无障碍名找元素（不限角色）：文件框在 AX 里的角色随实现而异，
 /// 测试只按 aria-label 给定的名字定位。
 fn find_by_name<'a>(obs: &'a Value, name: &str) -> Option<&'a Value> {
@@ -3909,6 +4213,52 @@ async fn edge_dom_sub_idempotent_and_cleanup() {
     wait_viewers(edge_port, 1, "重入").await;
     drop(ws);
     wait_viewers(edge_port, 0, "断开连接后名额应回收").await;
+
+    let ws_url = format!("ws://127.0.0.1:{edge_port}/ws");
+    let (mut ws, _) = tokio_tungstenite::connect_async(&ws_url).await.unwrap();
+    for command in [
+        json!({"type":"dom-start"}),
+        json!({"type":"rtc-start","video":true,"audio":false}),
+    ] {
+        ws.send(tokio_tungstenite::tungstenite::Message::Text(
+            command.to_string().into(),
+        ))
+        .await
+        .unwrap();
+    }
+    wait_viewers(edge_port, 1, "关闭前应订阅 DOM").await;
+    let rtc_want = || {
+        http_json(edge_port, "GET", "/health", None).1["rtc_video_want"]
+            .as_u64()
+            .expect("应提供 RTC 需求数")
+    };
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while rtc_want() == 0 {
+        assert!(Instant::now() < deadline, "关闭前应有 RTC 视频需求");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let (_, state) = http_json(edge_port, "POST", "/channels", Some(json!({"human":false})));
+    assert_eq!(state["human"], false);
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while let Some(Ok(msg)) = ws.next().await {
+            if msg.is_close() {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("关闭人通道应断开已有连接");
+    wait_viewers(edge_port, 0, "关闭人通道应回收 DOM 订阅").await;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while rtc_want() != 0 {
+        assert!(Instant::now() < deadline, "关闭人通道应回收 RTC 视频需求");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(tokio_tungstenite::connect_async(&ws_url).await.is_err());
+    let (_, state) = http_json(edge_port, "POST", "/channels", Some(json!({"human":true})));
+    assert_eq!(state["human"], true);
+    assert!(tokio_tungstenite::connect_async(&ws_url).await.is_ok());
     drop(proc);
 }
 

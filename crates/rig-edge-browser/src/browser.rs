@@ -880,7 +880,8 @@ impl Browser {
             .call(
                 Some(session),
                 "DOMSnapshot.captureSnapshot",
-                json!({"computedStyles": [], "includePaintOrder": false, "includeDOMRects": true}),
+                // 只使用 layout.bounds，避免额外传输 offset、client 和 scroll 矩形。
+                json!({"computedStyles": [], "includePaintOrder": false}),
             )
             .await
         else {
@@ -1074,18 +1075,115 @@ impl Browser {
     }
 
     /// 当前 CSS 视口坐标实际命中的 DOM 节点。
-    pub async fn hit_backend_node(&self, session: &str, x: i32, y: i32) -> CdpResult<i64> {
+    async fn hit_backend_node(&self, session: &str, x: f32, y: f32) -> CdpResult<i64> {
         let hit = self
             .cdp
             .call(
                 Some(session),
                 "DOM.getNodeForLocation",
-                json!({"x": x, "y": y, "ignorePointerEventsNone": false}),
+                json!({"x": x.round() as i32, "y": y.round() as i32, "ignorePointerEventsNone": false}),
             )
             .await?;
         hit.get("backendNodeId")
             .and_then(Value::as_i64)
             .ok_or_else(|| "命中未返回节点".to_string())
+    }
+
+    pub async fn element_receives_pointer(
+        &self,
+        session: &str,
+        backend: i64,
+        x: f32,
+        y: f32,
+    ) -> CdpResult<bool> {
+        let hit = self.hit_backend_node(session, x, y).await?;
+        if hit == backend {
+            return Ok(true);
+        }
+        // 按钮内部的文本或图标可以接收指针，但遮住按钮的兄弟节点不行。
+        let tree = self
+            .cdp
+            .call(
+                Some(session),
+                "DOM.describeNode",
+                json!({
+                    "backendNodeId": backend, "depth": -1, "pierce": true,
+                }),
+            )
+            .await?;
+        Ok(tree
+            .get("node")
+            .is_some_and(|node| dom_contains_backend(node, hit)))
+    }
+
+    /// 子会话可直接接收 CDP 输入，仍须确认同一点在每层父会话命中 iframe 宿主。
+    pub async fn frame_receives_pointer(
+        &self,
+        main: &str,
+        session: &str,
+        mut x: f32,
+        mut y: f32,
+    ) -> CdpResult<bool> {
+        let mut session = session.to_owned();
+        while session != main {
+            let parent = self
+                .sessions
+                .lock()
+                .await
+                .get(&session)
+                .and_then(|info| info.parent.clone())
+                .ok_or("子帧会话无父会话")?;
+            let view = self.view_state(&session).await?.space;
+            if !view.contains(x, y) {
+                return Ok(false);
+            }
+            let frame_id = self.root_frame_id(&session).await?;
+            let owner = self
+                .cdp
+                .call(
+                    Some(&parent),
+                    "DOM.getFrameOwner",
+                    json!({"frameId": frame_id}),
+                )
+                .await?;
+            let backend = owner
+                .get("backendNodeId")
+                .and_then(Value::as_i64)
+                .ok_or("无法定位子帧宿主")?;
+            let model = self
+                .cdp
+                .call(
+                    Some(&parent),
+                    "DOM.getBoxModel",
+                    json!({"backendNodeId": backend}),
+                )
+                .await?;
+            let content = model
+                .pointer("/model/content")
+                .and_then(Value::as_array)
+                .filter(|quad| quad.len() == 8)
+                .ok_or("子帧宿主无有效内容边框")?;
+            let mut quad = [0.0; 8];
+            for (point, value) in quad.iter_mut().zip(content) {
+                *point = value
+                    .as_f64()
+                    .map(|value| value as f32)
+                    .filter(|value| value.is_finite())
+                    .ok_or("子帧宿主坐标无效")?;
+            }
+            let (u, v) = (x / view.width, y / view.height);
+            let project = |axis: usize| {
+                let top = quad[axis] + u * (quad[axis + 2] - quad[axis]);
+                let bottom = quad[axis + 6] + u * (quad[axis + 4] - quad[axis + 6]);
+                top + v * (bottom - top)
+            };
+            (x, y) = (project(0), project(1));
+            if self.hit_backend_node(&parent, x, y).await? != backend {
+                return Ok(false);
+            }
+            session = parent;
+        }
+        Ok(true)
     }
 
     pub async fn scroll_into_view(&self, session: &str, backend: i64) -> CdpResult<()> {
@@ -1581,11 +1679,30 @@ impl Browser {
     }
 
     pub async fn navigate(&self, session: &str, url: &str) -> CdpResult<()> {
-        self.cdp
+        let response = self
+            .cdp
             .call(Some(session), "Page.navigate", json!({"url": url}))
             .await?;
+        if let Some(error) = response.get("errorText").and_then(Value::as_str) {
+            if !error.is_empty() {
+                return Err(format!("Chromium navigation failed: {error}"));
+            }
+        }
         Ok(())
     }
+}
+
+fn dom_contains_backend(node: &Value, backend: i64) -> bool {
+    node.get("backendNodeId").and_then(Value::as_i64) == Some(backend)
+        || ["children", "shadowRoots"].into_iter().any(|key| {
+            node.get(key)
+                .and_then(Value::as_array)
+                .is_some_and(|nodes| {
+                    nodes
+                        .iter()
+                        .any(|child| dom_contains_backend(child, backend))
+                })
+        })
 }
 
 fn collect_dom(node: &Value, map: &mut DomMap) {

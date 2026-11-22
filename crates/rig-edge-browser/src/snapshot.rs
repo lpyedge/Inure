@@ -18,20 +18,24 @@ use crate::cdp::CdpResult;
 /// 这类节点多为待剪枝的壳，不可动作）。
 #[derive(Default)]
 pub struct IdMap {
-    map: HashMap<(String, String), String>,
+    map: HashMap<String, HashMap<String, String>>,
     next: u64,
 }
 
 impl IdMap {
     pub fn id_for(&mut self, session: &str, key: &str) -> String {
-        let k = (session.to_string(), key.to_string());
-        if let Some(id) = self.map.get(&k) {
+        let session_map = self.map.entry(session.to_string()).or_default();
+        if let Some(id) = session_map.get(key) {
             return id.clone();
         }
         self.next += 1;
         let id = format!("e{}", self.next);
-        self.map.insert(k, id.clone());
+        session_map.insert(key.to_string(), id.clone());
         id
+    }
+
+    fn retain_sessions(&mut self, mut is_attached: impl FnMut(&str) -> bool) {
+        self.map.retain(|session, _| is_attached(session));
     }
 }
 
@@ -214,6 +218,7 @@ pub async fn build_observation(
     // 不进快照（多标签时 AI 看到的必须与人当前看的标签一致）
     let session_ids: Vec<String> = {
         let map = browser.sessions.lock().await;
+        ids.retain_sessions(|session| map.contains_key(session));
         let scope = frame_scope(&map, main);
         map.iter()
             .filter(|(sid, info)| {
@@ -243,11 +248,16 @@ pub async fn build_observation(
             // 只打计数：原始 AX 节点可能含未脱敏的页面内容（GPT review R-11）
             eprintln!("[debug] session {sid} AX nodes: {}", nodes.len());
         }
-        let dom = browser.dom_map(&sid).await.unwrap_or_else(|e| {
-            warnings.push(format!("frame {sid} 的 DOM 映射失败（{e}），位置可能缺失"));
-            Default::default()
-        });
         let placed = sid == main;
+        // 密码等敏感状态来自 DOM，AX 节点未经这一步不能对外输出。
+        let dom = match browser.dom_map(&sid).await {
+            Ok(dom) => dom,
+            Err(_) if placed => return Err("主 frame DOM 映射失败，无法确认脱敏".into()),
+            Err(_) => {
+                warnings.push(format!("frame {sid} 的 DOM 映射失败，无法确认脱敏，已跳过"));
+                continue;
+            }
+        };
         let root_frame = if placed {
             String::new()
         } else {
@@ -849,6 +859,25 @@ mod tests {
         let mut e = Element::new(format!("x{}", role.len()), role, Origin::A11y);
         e.name = name.map(str::to_string);
         e
+    }
+
+    #[test]
+    fn id_map_prunes_detached_sessions_without_reusing_ids() {
+        let mut ids = IdMap::default();
+        let main = ids.id_for("main", "node");
+        let background = ids.id_for("background-tab", "node");
+        let retired = ids.id_for("retired", "node");
+        let attached = HashSet::from(["main", "background-tab"]);
+
+        ids.retain_sessions(|session| attached.contains(session));
+
+        assert_eq!(ids.id_for("main", "node"), main);
+        assert_eq!(ids.id_for("background-tab", "node"), background);
+        let replacement = ids.id_for("retired", "node");
+        assert_ne!(
+            replacement, retired,
+            "retired element ID must never be reused"
+        );
     }
 
     #[test]

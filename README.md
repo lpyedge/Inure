@@ -25,7 +25,7 @@ source scripts/local-env.sh   # CARGO_TARGET_DIR=.temp/target 等
 | `crates/rig-eval` | 感知层评估框架：任务定义、指标汇总、泄密检测 |
 | `eval/` | 评估任务（`tasks/`）、测试页面（`fixtures/`）、历史运行证据（`results/`，只读） |
 | `docs/` | 边缘程序、感知层、评估方法与历史结论 |
-| `scripts/` | `eval_report.py`（RunRecord 汇总）、`local-env.sh`（本地缓存重定向）、`local-gate.sh`（本地等价 CI） |
+| `scripts/` | `eval_report.py`（RunRecord 汇总）、`local-env.sh`（本地缓存重定向）、`local-gate.sh`（提交门禁，含真实 Chromium 集成测试） |
 | `.temp/` | 本地可再生输出：构建缓存、测量结果、日志（git 忽略，可随时删除） |
 
 评估数字必须来自实际运行，注明环境；历史结论见 `docs/EVAL_REPORT_2026-11-18.md` 等。
