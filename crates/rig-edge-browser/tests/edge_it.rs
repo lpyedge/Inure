@@ -218,6 +218,7 @@ impl Drop for EdgeProc {
         let tmp = std::env::temp_dir();
         let _ = std::fs::remove_dir_all(tmp.join(format!("rig-edge-{}", self.0.id())));
         let _ = std::fs::remove_dir_all(tmp.join(format!("rig-edge-{}-uploads", self.0.id())));
+        let _ = std::fs::remove_dir_all(tmp.join(format!("rig-edge-hls-{}", self.0.id())));
     }
 }
 
@@ -936,6 +937,7 @@ async fn edge_av_and_image_clipboard() {
         max_db > -40.0,
         "合流音频不应是静音（440Hz 音调应被虚拟声卡捕获），max_volume={max_db} dB"
     );
+    let _ = std::fs::remove_file(&tmp);
     let deadline = Instant::now() + Duration::from_secs(18);
     loop {
         let (_, state) = http_json(av_port, "GET", "/channels", None);

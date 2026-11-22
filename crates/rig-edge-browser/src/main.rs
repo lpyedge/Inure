@@ -7,9 +7,10 @@
 //! - AI 通道前端二选一：HTTP（/observe、/act、/screenshot.png），或
 //!   --stdio 的 MCP（stdin/stdout JSON-RPC，智能体子进程形态，进程
 //!   边界即信任边界）。人通道（观看页/影音流）恒走 HTTP/WS。
-//! - 反向接入转发中心是后续增量（待轨道 T Step 1–2），不构成使用前置。
-//! - 直连鉴权：--token / RIG_EDGE_TOKEN 设令牌后 HTTP 全接口需带令牌；
-//!   绑非回环地址必须设令牌，否则拒绝启动。
+//! - 直连鉴权：对外提供 HTTP 时 --token / RIG_EDGE_TOKEN 必设（启动令牌，
+//!   由启动程序随机生成）；令牌只走请求头与换票 body，换 access/refresh 票据
+//!   后访问 Viewer 路由，AI 路由只认启动令牌（见 auth.rs、docs/08-安全模型.md）。
+//!   非回环监听强制 TLS。
 //! - 持久化双目录（LIU 2026-11-20 定）：--profile-dir（/ RIG_EDGE_
 //!   PROFILE_DIR）指定 Chromium 用户数据目录——登录态、Cookie、
 //!   LocalStorage/IndexedDB、保存的密码、扩展、应用全在其中，整目录
@@ -447,7 +448,7 @@ async fn main() {
     std::fs::create_dir_all(&upload_root).expect("创建上传目录失败");
     // 没有专门指定的目录都是本进程的一次性临时目录：退出时清理，
     // 不在磁盘上留登录态/下载的文件（SIGKILL 无法兜底）
-    let mut temp_dirs: Vec<std::path::PathBuf> = Vec::new();
+    let mut temp_dirs: Vec<std::path::PathBuf> = vec![media::hls_dir()];
     if cache_dir.is_none() {
         temp_dirs.push(upload_root.clone());
     }

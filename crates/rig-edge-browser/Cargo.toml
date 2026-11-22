@@ -36,9 +36,3 @@ ffmpeg-sys-next = "8"
 # WebRTC 栈（Phase 1b）：纯 Rust Sans-IO 实现，边缘作 offerer + ICE-lite
 # 向观看端推 H.264 单向视频；比 webrtc-rs 轻、无原生库依赖（默认 aws-lc-rs）。
 str0m = "0.25"
-
-[dev-dependencies]
-tokio = { version = "1", features = ["full"] }
-serde_json = "1"
-tokio-tungstenite = { version = "0.26", features = ["connect"] }
-futures-util = "0.3"

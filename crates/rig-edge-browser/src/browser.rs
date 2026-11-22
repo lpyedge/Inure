@@ -18,8 +18,6 @@ pub type DomMap = HashMap<i64, DomInfo>;
 
 #[derive(Clone, Debug)]
 pub struct SessionInfo {
-    /// 预留：目标过滤与日志（当前按 target_type 路由）
-    #[allow(dead_code)]
     pub target_id: String,
     pub target_type: String,
     /// 挂靠事件所在的父会话：浏览器级挂靠（顶层页面）为 None，

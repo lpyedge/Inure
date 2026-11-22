@@ -58,11 +58,6 @@ pub struct EncodedPacket {
     /// 保留作 GOP 诊断与后续关键帧策略用）
     #[allow(dead_code)]
     pub key: bool,
-    /// 编码器侧 pts（1/fps 时基）。RTC 路改用合成帧时刻对共享
-    /// 纪元打戳后（音视频同钟，见 rtc.rs）不再消费此值，保留
-    /// 作编码管线诊断（核对编码器延迟/攒帧行为时用）
-    #[allow(dead_code)]
-    pub pts: i64,
 }
 
 struct HwCandidate {
@@ -241,14 +236,8 @@ impl VideoEncoder {
         })
     }
 
-    #[allow(dead_code)] // 诊断用（协商结果日志），暂无调用点
     pub fn name(&self) -> &str {
         &self.name
-    }
-
-    #[allow(dead_code)] // 诊断用（协商结果日志），暂无调用点
-    pub fn is_hw(&self) -> bool {
-        self.hw.is_some()
     }
 
     /// 运行时调整码率（拥塞控制反馈）；编码器尽力而为地在后续帧生效。
@@ -279,7 +268,6 @@ impl VideoEncoder {
             .map(|p| EncodedPacket {
                 data: p.data().map(|d| d.to_vec()).unwrap_or_default(),
                 key: p.is_key(),
-                pts: p.pts().unwrap_or(0),
             })
             .collect())
     }

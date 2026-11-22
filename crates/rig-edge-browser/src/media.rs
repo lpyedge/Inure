@@ -134,6 +134,11 @@ pub struct MediaPipeline {
     last_error: std::sync::Mutex<Option<String>>,
 }
 
+/// HLS 分片的一次性临时目录（本进程专属；含屏幕画面，退出时由 main 清理）
+pub fn hls_dir() -> std::path::PathBuf {
+    std::env::temp_dir().join(format!("rig-edge-hls-{}", std::process::id()))
+}
+
 impl MediaPipeline {
     pub fn new(human: Arc<HumanChannel>) -> Self {
         Self {
@@ -166,7 +171,7 @@ impl MediaPipeline {
         if let Some(old) = guard.take() {
             Self::stop_pipeline(old).await;
         }
-        let dir = std::env::temp_dir().join(format!("rig-edge-hls-{}", std::process::id()));
+        let dir = hls_dir();
         let _ = tokio::fs::remove_dir_all(&dir).await;
         tokio::fs::create_dir_all(dir.join("hevc"))
             .await
