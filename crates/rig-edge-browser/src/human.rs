@@ -138,13 +138,6 @@ pub struct HumanChannel {
     chrome: Arc<Mutex<ChromeState>>,
     /// 当前观看的页面会话
     view_session: Arc<Mutex<Option<String>>>,
-    /// DOM 镜像模式下指针是否按下（move 需带 buttons 拖动）
-    dom_press: AtomicBool,
-    /// 本次指针按下始于页面区（up/move 继续送页面）
-    press_on_page: AtomicBool,
-    /// 本次按下的键位（JS button 编码 0 左 / 1 中 / 2 右，存编码+1；
-    /// 0 = 未按下）：up 要按同键释放，move 缺 buttons 时据此补掩码
-    press_btn: std::sync::atomic::AtomicU8,
     /// 接管提示已弹出待答（避免同一手势重复弹）
     prompt_out: AtomicBool,
     print_pdf: Arc<Mutex<Option<Vec<u8>>>>,
@@ -155,16 +148,30 @@ pub struct HumanChannel {
     last_state_json: Arc<Mutex<String>>,
 }
 
-/// JS MouseEvent.button 编码 → CDP 键名（0 左 / 1 中 / 2 右，其余按左）。
-/// 注意：拖动中的 mouseMoved 必须同时带 button=<按下键> 与 buttons
-/// 位掩码——只带 buttons、button 缺省/none 时 Chromium 不扩展选区
-/// （2026-11-20 探针实测：Playwright 的拖动序列带的正是 button:left）
-fn btn_name(btn: u8) -> &'static str {
-    match btn {
-        1 => "middle",
-        2 => "right",
-        _ => "left",
-    }
+// MouseEvent.button 是索引，中键和右键的遮罩遵循 buttons / CDP 的顺序。
+const MOUSE_BUTTONS: [(&str, u32); 5] = [
+    ("left", 1),
+    ("middle", 4),
+    ("right", 2),
+    ("back", 8),
+    ("forward", 16),
+];
+
+#[derive(Default)]
+pub struct ViewerPointer {
+    session: Option<String>,
+    buttons: u32,
+    drag_button: Option<usize>,
+}
+
+#[derive(Default)]
+pub struct ViewerKeys {
+    session: Option<String>,
+    pressed: Vec<(String, String, u32)>,
+}
+
+fn input_modifiers(v: &Value) -> u32 {
+    (v.get("modifiers").and_then(Value::as_u64).unwrap_or(0) & 15) as u32
 }
 
 /// 内容帧 rect 缓存有效期（V01）：无滚动的 reflow 会移动/改变元素，
@@ -370,9 +377,6 @@ impl HumanChannel {
             rgb_seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             chrome: Arc::new(Mutex::new(ChromeState::default())),
             view_session: Arc::new(Mutex::new(None)),
-            dom_press: AtomicBool::new(false),
-            press_on_page: AtomicBool::new(false),
-            press_btn: std::sync::atomic::AtomicU8::new(0),
             prompt_out: AtomicBool::new(false),
             print_pdf: Arc::new(Mutex::new(None)),
             pending_gate: Mutex::new(None),
@@ -391,103 +395,6 @@ impl HumanChannel {
         let kind = v.get("type").and_then(Value::as_str).unwrap_or("");
         let f = |k: &str| v.get(k).and_then(Value::as_f64).unwrap_or(0.0) as f32;
         match kind {
-            "mouse" => {
-                let action = v.get("action").and_then(Value::as_str).unwrap_or("");
-                let (x, y) = (f("x"), f("y"));
-                // 键位来自观看端消息（JS 编码 0 左 / 1 中 / 2 右）；
-                // 旧实现写死左键：右键菜单、拖选在 DOM 模式同样失效
-                let btn = v.get("button").and_then(Value::as_u64).unwrap_or(0) as u8;
-                let btns = v.get("buttons").and_then(Value::as_u64).unwrap_or(0) as u32;
-                // 点击计数与视频路径同口径（双击语义进 CDP；
-                // 缺省 1 的理由见 handle_ws 的注释）
-                let count = v
-                    .get("count")
-                    .and_then(Value::as_u64)
-                    .map(|c| c as u32)
-                    .filter(|c| *c > 0)
-                    .or(Some(1));
-                match action {
-                    "down" => {
-                        if self.masked_gesture().await {
-                            return;
-                        }
-                        self.dom_press.store(true, Ordering::SeqCst);
-                        self.press_btn.store(btn + 1, Ordering::SeqCst);
-                        let _ = self
-                            .page_mouse(
-                                "mousePressed",
-                                x,
-                                y,
-                                Some(btn_name(btn)),
-                                count,
-                                None,
-                                Some(1u32 << btn),
-                            )
-                            .await;
-                    }
-                    "up" => {
-                        self.dom_press.store(false, Ordering::SeqCst);
-                        let pressed = self.press_btn.swap(0, Ordering::SeqCst);
-                        let b = if pressed > 0 { pressed - 1 } else { btn };
-                        let _ = self
-                            .page_mouse(
-                                "mouseReleased",
-                                x,
-                                y,
-                                Some(btn_name(b)),
-                                count,
-                                None,
-                                Some(0),
-                            )
-                            .await;
-                    }
-                    "move" => {
-                        // 拖动：mouseMoved 必须同时带 button=<按下键> 与
-                        // buttons 位掩码，缺一页面都不扩展选区
-                        let mask = if btns > 0 {
-                            Some(btns)
-                        } else if self.dom_press.load(Ordering::SeqCst) {
-                            let p = self.press_btn.load(Ordering::SeqCst);
-                            Some(if p > 0 { 1u32 << (p - 1) } else { 1 })
-                        } else {
-                            None
-                        };
-                        let held = if mask.is_some() {
-                            let p = self.press_btn.load(Ordering::SeqCst);
-                            Some(btn_name(if p > 0 { p - 1 } else { 0 }))
-                        } else {
-                            None
-                        };
-                        let _ = self
-                            .page_mouse("mouseMoved", x, y, held, None, None, mask)
-                            .await;
-                    }
-                    _ => {}
-                }
-            }
-            "wheel" => {
-                if self.masked_gesture().await {
-                    return;
-                }
-                let _ = self
-                    .page_mouse(
-                        "mouseWheel",
-                        f("x"),
-                        f("y"),
-                        None,
-                        None,
-                        Some((f("dx"), f("dy"))),
-                        None,
-                    )
-                    .await;
-            }
-            "key" => {
-                let action = v.get("action").and_then(Value::as_str).unwrap_or("down");
-                let key = v.get("key").and_then(Value::as_str).unwrap_or("");
-                let code = v.get("code").and_then(Value::as_str).unwrap_or("");
-                let modifiers = v.get("modifiers").and_then(Value::as_u64).unwrap_or(0) as u32;
-                self.key_event(action, key, code, modifiers).await;
-            }
             "text" => {
                 if let Some(t) = v.get("text").and_then(Value::as_str) {
                     // 与视频模式同一路：chrome 条带在 DOM 模式同样在场，
@@ -1366,36 +1273,6 @@ impl HumanChannel {
         let kind = v.get("type").and_then(Value::as_str).unwrap_or("");
         let f = |k: &str| v.get(k).and_then(Value::as_f64).unwrap_or(0.0) as f32;
         match kind {
-            "mouse" => {
-                let action = v.get("action").and_then(Value::as_str).unwrap_or("");
-                let btn = v.get("button").and_then(Value::as_u64).unwrap_or(0) as u8;
-                let btns = v.get("buttons").and_then(Value::as_u64).unwrap_or(0) as u32;
-                // 点击计数（观看端 MouseEvent.detail）：双击/三击
-                // 的语义靠它进 CDP clickCount，远端页面才收得到
-                // dblclick（旧实现恒 1，远端双击永不触发）。缺省
-                // 必须给 1 而非不给：CDP 的 mousePressed 不带
-                // clickCount 时本机 Chromium 连普通 click 都不
-                // 产生（2026-11-20 dbg49 四变体实测：无 count
-                // c=0、count 1/2 则 c=2+dc=1）——旧硬编码 Some(1)
-                // 一直在默默兜底所有不带 count 的发送方
-                let count = v
-                    .get("count")
-                    .and_then(Value::as_u64)
-                    .map(|c| c as u32)
-                    .filter(|c| *c > 0)
-                    .or(Some(1));
-                self.pointer(action, f("x"), f("y"), btn, btns, count).await;
-            }
-            "wheel" => {
-                self.wheel(f("x"), f("y"), f("dx"), f("dy")).await;
-            }
-            "key" => {
-                let action = v.get("action").and_then(Value::as_str).unwrap_or("down");
-                let key = v.get("key").and_then(Value::as_str).unwrap_or("");
-                let code = v.get("code").and_then(Value::as_str).unwrap_or("");
-                let modifiers = v.get("modifiers").and_then(Value::as_u64).unwrap_or(0) as u32;
-                self.key_event(action, key, code, modifiers).await;
-            }
             "text" => {
                 if let Some(t) = v.get("text").and_then(Value::as_str) {
                     self.text_input(t).await;
@@ -1481,135 +1358,251 @@ impl HumanChannel {
         false
     }
 
-    /// 第五期：坐标即页面坐标（工具栏是观看页原生 DOM，不占
-    /// 帧像素、无命中测试）。全部按钮直达页面；悬停移动也转
-    /// 发（页面 :hover/悬停菜单与真实浏览器一致，旧合成条带
-    /// 时代悬停只重绘工具栏、页面收不到 hover）。
-    async fn pointer(&self, action: &str, x: f32, y: f32, btn: u8, btns: u32, count: Option<u32>) {
-        match action {
-            "move" => {
-                if self.press_on_page.load(Ordering::SeqCst) {
-                    // 拖动必须同时带 button=<按下键> 与 buttons 位
-                    // 掩码，缺一页面都不认拖拽（文字选区/拖放全灭
-                    // ——2026-11-20 探针实测定位）
-                    let mask = if btns > 0 {
-                        btns
-                    } else {
-                        let p = self.press_btn.load(Ordering::SeqCst);
-                        if p > 0 {
-                            1u32 << (p - 1)
-                        } else {
-                            1
-                        }
-                    };
-                    let p = self.press_btn.load(Ordering::SeqCst);
-                    let held = btn_name(if p > 0 { p - 1 } else { 0 });
-                    let _ = self
-                        .page_mouse("mouseMoved", x, y, Some(held), None, None, Some(mask))
-                        .await;
-                } else {
-                    let _ = self
-                        .page_mouse("mouseMoved", x, y, None, None, None, Some(0))
-                        .await;
-                }
-            }
-            "down" => {
-                if self.masked_gesture().await {
-                    return;
-                }
-                self.press_on_page.store(true, Ordering::SeqCst);
-                self.press_btn.store(btn + 1, Ordering::SeqCst);
+    /// 两种显示模式都发送相对于受控页面主视口的坐标。
+    pub async fn handle_pointer(&self, state: &mut ViewerPointer, v: &Value) {
+        let Some(session) = self.current_view().await else {
+            self.release_pointer(state).await;
+            return;
+        };
+        if state.session.as_deref() != Some(session.as_str()) {
+            self.release_pointer(state).await;
+        }
+
+        let number = |key| {
+            v.get(key)
+                .and_then(Value::as_f64)
+                .map(|n| n as f32)
+                .filter(|n| n.is_finite())
+        };
+        let (Some(x), Some(y)) = (number("x"), number("y")) else {
+            return;
+        };
+        let modifiers = input_modifiers(v);
+        if v.get("type").and_then(Value::as_str) == Some("wheel") {
+            if !self.masked_gesture().await {
+                let delta = (number("dx").unwrap_or(0.0), number("dy").unwrap_or(0.0));
                 let _ = self
-                    .page_mouse(
-                        "mousePressed",
+                    .browser
+                    .mouse_with_modifiers(
+                        &session,
+                        "mouseWheel",
                         x,
                         y,
-                        Some(btn_name(btn)),
-                        count,
                         None,
-                        Some(1u32 << btn),
+                        None,
+                        Some(delta),
+                        Some(state.buttons),
+                        modifiers,
                     )
                     .await;
             }
-            "up" => {
-                if self.press_on_page.swap(false, Ordering::SeqCst) {
-                    let pressed = self.press_btn.swap(0, Ordering::SeqCst);
-                    let b = if pressed > 0 { pressed - 1 } else { btn };
-                    let _ = self
-                        .page_mouse(
-                            "mouseReleased",
-                            x,
-                            y,
-                            Some(btn_name(b)),
-                            count,
-                            None,
-                            Some(0),
-                        )
-                        .await;
-                }
-                // 被遮蔽的手势结束 → 下一个新手势可再弹接管提示
-                if self.exec.is_executing().await {
-                    self.prompt_out.store(false, Ordering::SeqCst);
+            return;
+        }
+
+        let action = v.get("action").and_then(Value::as_str).unwrap_or("");
+        let count = v
+            .get("count")
+            .and_then(Value::as_u64)
+            .and_then(|n| u32::try_from(n).ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(1);
+        let button = v
+            .get("button")
+            .map_or(Some(0), Value::as_u64)
+            .and_then(|n| usize::try_from(n).ok())
+            .filter(|&i| i < MOUSE_BUTTONS.len());
+        let (kind, name, clicks, buttons) = match action {
+            "down" | "up" => {
+                let Some(i) = button else {
+                    return;
+                };
+                let (name, mask) = MOUSE_BUTTONS[i];
+                if action == "down" {
+                    if state.buttons & mask != 0 || self.masked_gesture().await {
+                        return;
+                    }
+                    (
+                        "mousePressed",
+                        Some(name),
+                        Some(count),
+                        state.buttons | mask,
+                    )
+                } else {
+                    if self.exec.is_executing().await {
+                        self.prompt_out.store(false, Ordering::SeqCst);
+                    }
+                    if state.buttons & mask == 0 {
+                        return;
+                    }
+                    (
+                        "mouseReleased",
+                        Some(name),
+                        Some(count),
+                        state.buttons & !mask,
+                    )
                 }
             }
-            _ => {}
-        }
-    }
-
-    async fn wheel(&self, x: f32, y: f32, dx: f32, dy: f32) {
-        if self.masked_gesture().await {
-            return;
-        }
-        let _ = self
-            .page_mouse("mouseWheel", x, y, None, None, Some((dx, dy)), None)
-            .await;
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    async fn page_mouse(
-        &self,
-        kind: &str,
-        x: f32,
-        y: f32,
-        button: Option<&str>,
-        click_count: Option<u32>,
-        delta: Option<(f32, f32)>,
-        buttons: Option<u32>,
-    ) -> Result<(), String> {
-        let session = self.view().await?;
-        self.browser
-            .mouse(&session, kind, x, y, button, click_count, delta, buttons)
-            .await
-    }
-
-    /// 第五期：按键直达页面——地址栏/寻找框是观看页原生输入
-    /// 框，焦点在它们身上时按键根本不经本通道（观看端只转发
-    /// 页面区输入），边缘侧不再有编辑态分发。
-    async fn key_event(&self, action: &str, key: &str, code: &str, modifiers: u32) {
-        if action == "down" && self.masked_gesture().await {
-            return;
-        }
-        let session = match self.view().await {
-            Ok(s) => s,
-            Err(_) => return,
+            "move" => (
+                "mouseMoved",
+                state.drag_button.map(|i| MOUSE_BUTTONS[i].0),
+                None,
+                state.buttons,
+            ),
+            _ => return,
         };
-        let text = if key.chars().count() == 1 && modifiers & 0b0110 == 0 {
-            Some(key)
-        } else {
-            None
-        };
-        let mk = if action == "up" { "keyUp" } else { "keyDown" };
-        let _ = self
+        let dispatched = self
             .browser
-            .key(&session, mk, key, code, text, modifiers)
+            .mouse_with_modifiers(
+                &session,
+                kind,
+                x,
+                y,
+                name,
+                clicks,
+                None,
+                Some(buttons),
+                modifiers,
+            )
             .await;
+        if dispatched.is_err() {
+            return;
+        }
+        state.buttons = buttons;
         if action == "down" {
-            if let Some(t) = text {
+            state.session = Some(session);
+            state.drag_button = button;
+        } else if action == "up" && state.drag_button == button {
+            state.drag_button = MOUSE_BUTTONS
+                .iter()
+                .position(|(_, mask)| buttons & mask != 0);
+        }
+        if buttons == 0 {
+            state.session = None;
+        }
+    }
+
+    pub async fn release_pointer(&self, state: &mut ViewerPointer) {
+        let ViewerPointer {
+            session,
+            mut buttons,
+            ..
+        } = std::mem::take(state);
+        let Some(session) = session else {
+            return;
+        };
+        // 取消手势时在页面外释放原标签页的按钮，点击次数为零。
+        for (name, mask) in MOUSE_BUTTONS {
+            if buttons & mask != 0 {
+                buttons &= !mask;
                 let _ = self
                     .browser
-                    .key(&session, "char", key, code, Some(t), modifiers)
+                    .mouse_with_modifiers(
+                        &session,
+                        "mouseReleased",
+                        -1.0,
+                        -1.0,
+                        Some(name),
+                        Some(0),
+                        None,
+                        Some(buttons),
+                        0,
+                    )
                     .await;
             }
+        }
+    }
+
+    pub async fn handle_key(&self, state: &mut ViewerKeys, v: &Value) {
+        let Some(session) = self.current_view().await else {
+            self.release_keys(state).await;
+            return;
+        };
+        if state.session.as_deref() != Some(session.as_str()) {
+            self.release_keys(state).await;
+        }
+        let string = |field| v.get(field).and_then(Value::as_str).unwrap_or("");
+        let (key, code) = (string("key"), string("code"));
+        if key.len() > 64 || code.len() > 64 || (key.is_empty() && code.is_empty()) {
+            return;
+        }
+        let location = v
+            .get("location")
+            .and_then(Value::as_u64)
+            .filter(|&n| n <= 3)
+            .map_or_else(|| Browser::key_location(code), |n| n as u32);
+        let held = state
+            .pressed
+            .iter()
+            .position(|(held_key, held_code, held_location)| {
+                location == *held_location
+                    && if code.is_empty() {
+                        key == held_key
+                    } else {
+                        code == held_code
+                    }
+            });
+        let modifiers = input_modifiers(v);
+        let (kind, text, repeat) = match string("action") {
+            "" | "down" => {
+                if (held.is_none() && state.pressed.len() >= 64) || self.masked_gesture().await {
+                    return;
+                }
+                let alt_graph =
+                    v.get("altGraph").and_then(Value::as_bool) == Some(true) && modifiers & 7 == 3;
+                if alt_graph && key.chars().count() == 1 {
+                    // CDP 只传 Ctrl/Alt，Chromium 会把两者当组合键。直接插入 AltGr 字符。
+                    let _ = self.browser.insert_text(&session, key).await;
+                    return;
+                }
+                let text = if modifiers & 7 == 0 {
+                    match key {
+                        "Enter" => Some("\r"),
+                        key if key.chars().count() == 1 => Some(key),
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+                let kind = if text.is_some() {
+                    "keyDown"
+                } else {
+                    "rawKeyDown"
+                };
+                let repeat = v.get("repeat").and_then(Value::as_bool).unwrap_or(false);
+                (kind, text, repeat)
+            }
+            "up" if held.is_some() => ("keyUp", None, false),
+            _ => return,
+        };
+        let sent = self
+            .browser
+            .dispatch_key(&session, kind, key, code, text, modifiers, location, repeat)
+            .await;
+        if kind == "keyUp" {
+            if let Some(i) = held {
+                state.pressed.remove(i);
+            }
+        } else if held.is_none() && sent.is_ok() {
+            state.session = Some(session);
+            state
+                .pressed
+                .push((key.to_owned(), code.to_owned(), location));
+        }
+        if state.pressed.is_empty() {
+            state.session = None;
+        }
+    }
+
+    pub async fn release_keys(&self, state: &mut ViewerKeys) {
+        let ViewerKeys { session, pressed } = std::mem::take(state);
+        let Some(session) = session else {
+            return;
+        };
+        for (key, code, location) in pressed.into_iter().rev() {
+            let _ = self
+                .browser
+                .dispatch_key(&session, "keyUp", &key, &code, None, 0, location, false)
+                .await;
         }
     }
 

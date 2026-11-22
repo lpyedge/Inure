@@ -1111,7 +1111,24 @@ impl Browser {
         delta: Option<(f32, f32)>,
         buttons: Option<u32>,
     ) -> CdpResult<()> {
-        let mut p = json!({"type": kind, "x": x, "y": y});
+        self.mouse_with_modifiers(session, kind, x, y, button, click_count, delta, buttons, 0)
+            .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn mouse_with_modifiers(
+        &self,
+        session: &str,
+        kind: &str,
+        x: f32,
+        y: f32,
+        button: Option<&str>,
+        click_count: Option<u32>,
+        delta: Option<(f32, f32)>,
+        buttons: Option<u32>,
+        modifiers: u32,
+    ) -> CdpResult<()> {
+        let mut p = json!({"type": kind, "x": x, "y": y, "modifiers": modifiers});
         if let Some(b) = button {
             p["button"] = json!(b);
         }
@@ -1142,27 +1159,85 @@ impl Browser {
         text: Option<&str>,
         modifiers: u32,
     ) -> CdpResult<()> {
-        // 浏览器编辑命令（全选/复制/粘贴）由浏览器进程按虚拟键码识别，
-        // 缺 vk 码的合成事件会被忽略——实测 Ctrl+A/C/V 因此失效。
-        // 与 Playwright 一致：按下用 rawKeyDown 并带虚拟键码。
         let kind = if kind == "keyDown" {
             "rawKeyDown"
         } else {
             kind
         };
-        let mut p = json!({"type": kind, "key": key, "code": code, "modifiers": modifiers});
-        if let Some(vk) = Self::virtual_key_code(code) {
+        self.dispatch_key(
+            session,
+            kind,
+            key,
+            code,
+            text,
+            modifiers,
+            Self::key_location(code),
+            false,
+        )
+        .await
+    }
+
+    // CDP keyDown 一并提交可打印字符。组合键及 AI 通道的独立键／字符事件使用 rawKeyDown。
+    #[allow(clippy::too_many_arguments)]
+    pub async fn dispatch_key(
+        &self,
+        session: &str,
+        kind: &str,
+        key: &str,
+        code: &str,
+        text: Option<&str>,
+        modifiers: u32,
+        location: u32,
+        repeat: bool,
+    ) -> CdpResult<()> {
+        let mut p = json!({
+            "type": kind, "key": key, "code": code, "modifiers": modifiers,
+            "autoRepeat": repeat, "isKeypad": location == 3,
+        });
+        if matches!(location, 1 | 2) {
+            p["location"] = json!(location);
+        }
+        let vk_code = if code.starts_with("Numpad")
+            && matches!(
+                key,
+                "Insert"
+                    | "Delete"
+                    | "Home"
+                    | "End"
+                    | "PageUp"
+                    | "PageDown"
+                    | "ArrowLeft"
+                    | "ArrowRight"
+                    | "ArrowUp"
+                    | "ArrowDown"
+            ) {
+            key
+        } else {
+            code
+        };
+        if let Some(vk) = Self::virtual_key_code(vk_code) {
             p["windowsVirtualKeyCode"] = json!(vk);
             p["nativeVirtualKeyCode"] = json!(vk);
         }
         if let Some(t) = text {
             p["text"] = json!(t);
-            p["unmodifiedText"] = json!(t);
+            if modifiers & 7 == 0 {
+                p["unmodifiedText"] = json!(t);
+            }
         }
         self.cdp
             .call(Some(session), "Input.dispatchKeyEvent", p)
             .await?;
         Ok(())
+    }
+
+    pub fn key_location(code: &str) -> u32 {
+        match code {
+            "ShiftLeft" | "ControlLeft" | "MetaLeft" | "AltLeft" => 1,
+            "ShiftRight" | "ControlRight" | "MetaRight" | "AltRight" => 2,
+            code if code.starts_with("Numpad") => 3,
+            _ => 0,
+        }
     }
 
     /// 由 code 推导 Windows 虚拟键码（字母/数字/常用键），推导不出返回 None。
@@ -1175,13 +1250,26 @@ impl Browser {
                 }
             }
         }
-        if let Some(rest) = code.strip_prefix("Digit") {
-            if rest.len() == 1 {
-                return rest.chars().next().map(|c| c as u32);
+        if let Some(digit) = code.strip_prefix("Digit") {
+            if let [n @ b'0'..=b'9'] = digit.as_bytes() {
+                return Some(u32::from(*n));
+            }
+        }
+        if let Some(digit) = code.strip_prefix("Numpad") {
+            if let [n @ b'0'..=b'9'] = digit.as_bytes() {
+                return Some(96 + u32::from(n - b'0'));
+            }
+        }
+        if let Some(number) = code
+            .strip_prefix('F')
+            .and_then(|key| key.parse::<u32>().ok())
+        {
+            if (1..=24).contains(&number) {
+                return Some(111 + number);
             }
         }
         Some(match code {
-            "Enter" => 13,
+            "Enter" | "NumpadEnter" => 13,
             "Tab" => 9,
             "Escape" => 27,
             "Backspace" => 8,
@@ -1199,6 +1287,32 @@ impl Browser {
             "ShiftLeft" | "ShiftRight" => 16,
             "ControlLeft" | "ControlRight" => 17,
             "AltLeft" | "AltRight" => 18,
+            "CapsLock" => 20,
+            "Pause" => 19,
+            "PrintScreen" => 44,
+            "MetaLeft" => 91,
+            "MetaRight" => 92,
+            "ContextMenu" => 93,
+            "NumLock" => 144,
+            "ScrollLock" => 145,
+            "NumpadMultiply" => 106,
+            "NumpadAdd" => 107,
+            "NumpadComma" => 108,
+            "NumpadSubtract" => 109,
+            "NumpadDecimal" => 110,
+            "NumpadDivide" => 111,
+            "Semicolon" => 186,
+            "Equal" | "NumpadEqual" => 187,
+            "Comma" => 188,
+            "Minus" => 189,
+            "Period" => 190,
+            "Slash" => 191,
+            "Backquote" => 192,
+            "BracketLeft" => 219,
+            "Backslash" => 220,
+            "BracketRight" => 221,
+            "Quote" => 222,
+            "IntlBackslash" => 226,
             _ => return None,
         })
     }

@@ -218,29 +218,116 @@ function fbScroll(dy) {
   clearTimeout(fbScrollTimer);
   fbScrollTimer = setTimeout(fbScrollReset, 180); /* 帧流追上后归位 */
 }
-ime.addEventListener('mousedown', e => { ime.focus(); if (!domOn && e.button === 0) { fbClick(e.clientX, e.clientY); fbDrag = { x: e.clientX, y: e.clientY }; } send({type:'mouse', action:'down', button: e.button, buttons: e.buttons, count: e.detail, ...toFrame(e)}); });
-ime.addEventListener('mouseup',   e => { flushMove(); fbDrag = null; setTimeout(() => { fbRect.style.display = 'none'; }, 120); send({type:'mouse', action:'up',   button: e.button, buttons: e.buttons, count: e.detail, ...toFrame(e)}); });
-let lastMove = 0, pendingMove = null, moveTimer = null;
+const mouseMasks = [1, 4, 2, 8, 16];
+let heldButtons = 0, lastMove = 0, pendingMove = null, moveTimer = null;
+
 function flushMove() {
-  if (moveTimer) { clearTimeout(moveTimer); moveTimer = null; }
-  if (pendingMove) { const p = pendingMove; pendingMove = null; lastMove = Date.now(); send({type:'mouse', action:'move', ...p}); }
+  clearTimeout(moveTimer);
+  moveTimer = null;
+  if (!pendingMove) return;
+  const move = pendingMove;
+  pendingMove = null;
+  lastMove = performance.now();
+  send(move);
 }
-ime.addEventListener('mousemove', e => {
-  if (!domOn) fbDragMove(e.clientX, e.clientY);
-  const n = Date.now();
-  /* F-05：最新值合并——窗口收紧到 ~24ms（原 60ms 拖动明显
-     跟不上手）；窗口内只留最新点，到点补发，终点不丢 */
-  if (n - lastMove > 24) { lastMove = n; send({type:'mouse', action:'move', buttons: e.buttons, ...toFrame(e)}); return; }
-  pendingMove = {buttons: e.buttons, ...toFrame(e)};
-  if (!moveTimer) moveTimer = setTimeout(flushMove, 26);
+function movePointer(e, point, dom) {
+  pendingMove = { type:'mouse', action:'move', dom, buttons:heldButtons, modifiers:mods(e), ...point };
+  if (performance.now() - lastMove >= 24) flushMove();
+  else if (!moveTimer) moveTimer = setTimeout(flushMove, 24);
+}
+function mouseButton(e, action, point, dom) {
+  const mask = mouseMasks[e.button];
+  if (!mask || (action === 'up' && !(heldButtons & mask))) return;
+  flushMove();
+  heldButtons = action === 'down' ? heldButtons | mask : heldButtons & ~mask;
+  send({type:'mouse', action, dom, button:e.button, buttons:heldButtons,
+    count:e.detail, modifiers:mods(e), ...point});
+}
+function resetInput() {
+  clearTimeout(moveTimer);
+  moveTimer = pendingMove = null;
+  heldButtons = 0;
+  heldKeys.clear();
+  fbDrag = null;
+  fbRect.style.display = 'none';
+  send({type:'input-reset'});
+}
+function overFrame({x, y}) {
+  return x >= 0 && y >= 0 && x < cssViewportW && y < cssViewportH;
+}
+function mirrorPoint(e) {
+  const r = mir.getBoundingClientRect();
+  const scale = r.width / Math.max(1, mirVW) || 1;
+  return { x:(e.clientX - r.left) / scale, y:(e.clientY - r.top) / scale };
+}
+function mirrorRootPoint(doc, x, y) {
+  for (let frame = doc.defaultView?.frameElement; frame && frame !== mir; frame = frame.ownerDocument.defaultView?.frameElement) {
+    const r = frame.getBoundingClientRect();
+    x = r.left + (x + frame.clientLeft) * r.width / Math.max(1, frame.offsetWidth);
+    y = r.top + (y + frame.clientTop) * r.height / Math.max(1, frame.offsetHeight);
+  }
+  return {x, y};
+}
+function mirrorContext(doc, x, y, target, keyboard = false) {
+  const point = mirrorRootPoint(doc, x, y);
+  const r = mir.getBoundingClientRect();
+  const scale = r.width / Math.max(1, mirVW) || 1;
+  const node = target?.closest?.('[data-rig-region]') || target;
+  const id = node?.__rigId;
+  const hit = id === undefined ? null : {kind:'node', i:id};
+  openCtx(r.left + point.x * scale, r.top + point.y * scale, hit, doc.activeElement, keyboard);
+}
+function wheelPixels(e) {
+  if (e.deltaMode === 2) return {dx:e.deltaX * cssViewportW, dy:e.deltaY * cssViewportH};
+  const unit = e.deltaMode === 1 ? 16 : 1;
+  return {dx:e.deltaX * unit, dy:e.deltaY * unit};
+}
+ime.addEventListener('mousedown', e => {
+  const point = toFrame(e);
+  if (!overFrame(point)) return;
+  e.preventDefault();
+  ime.focus({preventScroll:true});
+  if (e.button === 0) {
+    fbClick(e.clientX, e.clientY);
+    fbDrag = {x:e.clientX, y:e.clientY};
+  }
+  mouseButton(e, 'down', point, false);
 });
-ime.addEventListener('wheel', e => { e.preventDefault(); if (!domOn) fbScroll(e.deltaY); send({type:'wheel', dx: e.deltaX, dy: e.deltaY, ...toFrame(e)}); }, {passive:false});
-/* 右键菜单归远端页面：本地菜单挡掉，右键按下经 mouse 消息转发，
-   页面自己的菜单会出现在画面里（旧实现本地菜单弹出、远端收不到右键） */
-/* 右键：本地默认菜单挡掉，右键经 mouse 消息转发远端（页面自己
-   的菜单出现在画面里）；同时弹观看端桥接菜单（复制/粘贴/复制
-   图片等跨边界动作）。hit 为帧坐标，供边缘按坐标命中图片 */
-ime.addEventListener('contextmenu', e => { e.preventDefault(); openCtx(e.clientX, e.clientY, toFrame(e)); });
+/* 抬起可落在舞台之外。仍把它送回按下的页面，避免远端卡在拖动。 */
+document.addEventListener('mouseup', e => {
+  mouseButton(e, 'up', domOn ? mirrorPoint(e) : toFrame(e), domOn);
+  if (e.button === 0 && fbDrag) {
+    fbDrag = null;
+    setTimeout(() => { if (!fbDrag) fbRect.style.display = 'none'; }, 120);
+  }
+}, true);
+ime.addEventListener('mousemove', e => {
+  const point = toFrame(e);
+  if (heldButtons) fbDragMove(e.clientX, e.clientY);
+  movePointer(e, point, false);
+});
+ime.addEventListener('mouseleave', e => {
+  if (!heldButtons) movePointer(e, {x:-1, y:-1}, false);
+});
+ime.addEventListener('wheel', e => {
+  e.preventDefault();
+  const point = toFrame(e);
+  if (!overFrame(point)) return;
+  const delta = wheelPixels(e);
+  fbScroll(delta.dy);
+  send({type:'wheel', ...delta, modifiers:mods(e), ...point});
+}, {passive:false});
+ime.addEventListener('contextmenu', e => {
+  e.preventDefault();
+  const point = toFrame(e);
+  if (overFrame(point)) openCtx(e.clientX, e.clientY, point);
+});
+window.addEventListener('blur', () => {
+  setTimeout(() => { if (!document.hasFocus()) resetInput(); }, 0);
+});
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) resetInput();
+});
 /* 双击归远端页面：旧实现把输入层 dblclick 绑成观看页全屏
    切换，用户在远端页面里双击（选词/视频全屏）全被本地劫持
    （LIU 2026-11-20 指出）。现只挡默认行为；双击语义靠
@@ -248,32 +335,45 @@ ime.addEventListener('contextmenu', e => { e.preventDefault(); openCtx(e.clientX
    远端视频双击就在远端页内全屏。视频元素本体也挡一道，
    防输入层放行时浏览器对 <video> 的原生双击全屏 */
 ime.addEventListener('dblclick', e => { e.preventDefault(); });
+ime.addEventListener('auxclick', e => { e.preventDefault(); });
 vid.addEventListener('dblclick', e => { e.preventDefault(); });
 function mods(e) { return (e.altKey ? 1 : 0) | (e.ctrlKey ? 2 : 0) | (e.metaKey ? 4 : 0) | (e.shiftKey ? 8 : 0); }
-/* 剪贴板和弦（Ctrl/Cmd+V/C/X）不能 preventDefault：paste/copy/cut
-   事件是 keydown 默认动作的一部分，挡掉后 Ctrl+V 粘贴与 Ctrl+C
-   复制回读全灭（2026-11-20 实测：右键菜单粘贴可用、Ctrl+V 无效）。
-   V 完全放行给 paste 事件处理；C/X 照常转发由远端执行，本地
-   copy/cut 事件随后把远端剪贴板拉回本机。 */
-function clipChord(e) { return (e.ctrlKey || e.metaKey) && !e.altKey && ['v', 'c', 'x'].includes(e.key.toLowerCase()); }
-ime.addEventListener('keydown', e => {
-  if (e.isComposing) return;
-  const cc = clipChord(e);
-  if (cc && e.key.toLowerCase() === 'v') return;
-  if (!cc) { e.preventDefault(); ime.value = ''; }
-  send({type:'key', action:'down', key: e.key, code: e.code, modifiers: mods(e)});
-  /* Ctrl+C/X 照常转发远端执行复制/剪切，同时延一拍向边缘要选区
-     文本回写本地剪贴板（显式模型：只在用户按键时发生，无后台
-     同步、无暂存补写，不会覆盖用户在外部复制的内容） */
-  if (cc && e.key.toLowerCase() !== 'v') setTimeout(requestCopy, 160);
-});
-ime.addEventListener('keyup', e => {
-  if (e.isComposing) return;
-  const cc = clipChord(e);
-  if (cc && e.key.toLowerCase() === 'v') return;
-  if (!cc) e.preventDefault();
-  send({type:'key', action:'up', key: e.key, code: e.code, modifiers: mods(e)});
-});
+const heldKeys = new Set();
+function keyId(e) { return (e.code || e.key) + ':' + e.location; }
+function clipboardKey(e) {
+  if (e.altKey || e.getModifierState('AltGraph')) return '';
+  const primary = e.ctrlKey || e.metaKey;
+  const key = e.key.toLowerCase();
+  if (primary && key === 'c') return 'copy';
+  if (primary && key === 'x') return 'cut';
+  if (primary && key === 'v') return 'paste';
+  if (e.key === 'Insert') {
+    if (e.shiftKey && !primary) return 'paste';
+    if (e.ctrlKey && !e.shiftKey) return 'copy';
+  }
+  if (e.key === 'Delete' && e.shiftKey && !primary) return 'cut';
+  return '';
+}
+function sendViewerKey(e, action, dom) {
+  send({type:'key', action, dom, key:e.key, code:e.code, modifiers:mods(e),
+    repeat:e.repeat, location:e.location, altGraph:e.getModifierState('AltGraph')});
+}
+function keyDown(e, dom, editable) {
+  if (e.isComposing || e.key === 'Process' || e.key === 'Dead' || e.keyCode === 229) return;
+  const clipboard = clipboardKey(e);
+  if (clipboard === 'paste' || (dom && clipboard)) return;
+  if (!clipboard && !editable) e.preventDefault();
+  if (!dom && !clipboard) ime.value = '';
+  heldKeys.add(keyId(e));
+  sendViewerKey(e, 'down', dom);
+  // 保留本地剪贴板的粘贴事件，复制和剪切由边缘执行后读回。
+  if (!dom && clipboard && !e.repeat) setTimeout(requestCopy, 160);
+}
+function keyUp(e, dom) {
+  if (heldKeys.delete(keyId(e))) sendViewerKey(e, 'up', dom);
+}
+ime.addEventListener('keydown', e => keyDown(e, false, false));
+document.addEventListener('keyup', e => keyUp(e, domOn), true);
 /* 输入法：组字过程留在本地，只把成品整段送过去（边缘按状态路由：
    地址栏编辑时进编辑器，页面焦点时 insertText 直插页面） */
 ime.addEventListener('compositionend', e => { if (e.data) send({type:'text', text: e.data}); ime.value = ''; });
@@ -361,10 +461,33 @@ function flashHint(msg) {
    本菜单只提供跨边界桥接动作（复制选区/粘贴/复制图片）与导航
    兜底。旧实现把菜单注入远端页面：污染页面、与页面菜单互斥、
    DOM 模式还要靠镜像回传，均已弃。 */
-let ctxEl = null, ctxImgData = '';
-function closeCtx() {
-  if (ctxEl) { ctxEl.remove(); ctxEl = null; }
+let ctxEl = null, ctxImgData = '', ctxSource = null;
+function closeCtx(restoreFocus = false) {
+  if (!ctxEl) return;
+  ctxEl.remove();
+  ctxEl = null;
+  if (restoreFocus) {
+    if (ctxSource?.isConnected) ctxSource.focus({preventScroll:true});
+    else focusPage();
+  }
+  ctxSource = null;
   document.removeEventListener('pointerdown', ctxOutside, true);
+}
+function contextMenuKey(e) {
+  if (!ctxEl) return false;
+  if (e.key === 'Tab') { closeCtx(true); return false; }
+  if (!['Escape', 'ArrowDown', 'ArrowUp', 'Home', 'End'].includes(e.key)) return false;
+  e.preventDefault();
+  e.stopPropagation();
+  if (e.key === 'Escape') { closeCtx(true); return true; }
+  const items = [...ctxEl.querySelectorAll('button:not(:disabled)')];
+  const index = items.indexOf(document.activeElement);
+  let next = 0;
+  if (e.key === 'End' || (e.key === 'ArrowUp' && index < 0)) next = items.length - 1;
+  else if (e.key === 'ArrowDown') next = (index + 1) % items.length;
+  else if (e.key === 'ArrowUp') next = (index - 1 + items.length) % items.length;
+  items[next]?.focus({preventScroll:true});
+  return true;
 }
 function ctxOutside(e) { if (ctxEl && !ctxEl.contains(e.target)) closeCtx(); }
 function sendKeyChord(key, code, mod) {
@@ -379,15 +502,19 @@ async function readLocalClipText() {
   }
   return '';
 }
-function openCtx(cx, cy, hit) {
+function openCtx(cx, cy, hit, source = document.activeElement, keyboard = false) {
   closeCtx();
+  ctxSource = source;
   ctxImgData = '';
   const menu = document.createElement('div');
   menu.id = 'ctxMenu';
+  menu.setAttribute('role', 'menu');
+  menu.setAttribute('aria-label', '页面操作');
   const add = (label, fn) => {
     const b = document.createElement('button');
     b.type = 'button'; b.textContent = label;
-    b.onclick = () => { closeCtx(); fn(); };
+    b.tabIndex = -1; b.setAttribute('role', 'menuitem');
+    b.onclick = () => { closeCtx(true); fn(); };
     menu.appendChild(b);
   };
   add('复制', () => { if (domOn) copyMirrorSelection(); else requestCopy(); });
@@ -397,7 +524,7 @@ function openCtx(cx, cy, hit) {
     flashHint('请按 Ctrl+V 粘贴');
     ime.focus();
   });
-  add('全选', () => sendKeyChord('a', 'KeyA'));
+  add('全选', selectPage);
   add('自动模式：' + (modeAuto ? '开' : '关'), () => {
     modeAuto = !modeAuto;
     resetAutoMode();
@@ -407,6 +534,7 @@ function openCtx(cx, cy, hit) {
   /* 导航走 chrome 命令（双模式同一路；旧实现 DOM 模式走 nav
      消息、视频模式发 Alt+←/F5 和弦模拟，口径不一） */
   add('后退', () => chromeCmd('back'));
+  add('前进', () => chromeCmd('forward'));
   add('重新加载', () => chromeCmd('reload'));
   menu.style.left = cx + 'px'; menu.style.top = cy + 'px';
   document.body.appendChild(menu);
@@ -414,6 +542,7 @@ function openCtx(cx, cy, hit) {
   menu.style.left = Math.max(4, Math.min(cx, innerWidth - r.width - 4)) + 'px';
   menu.style.top = Math.max(4, Math.min(cy, innerHeight - r.height - 4)) + 'px';
   ctxEl = menu;
+  if (keyboard) menu.querySelector('button')?.focus({preventScroll:true});
   document.addEventListener('pointerdown', ctxOutside, true);
   /* 命中图片则异步多一项「复制图片」：视频模式按帧坐标在远端
      页命中测试；DOM 模式按节点 id 定位（镜像布局会漂移，坐标
@@ -427,14 +556,31 @@ function onImageAt(data) {
   if (ctxEl.querySelector('[data-act="copyimg"]')) return;
   const b = document.createElement('button');
   b.type = 'button'; b.textContent = '复制图片'; b.setAttribute('data-act', 'copyimg');
+  b.tabIndex = -1; b.setAttribute('role', 'menuitem');
   b.onclick = () => {
-    closeCtx();
+    closeCtx(true);
     if (!(navigator.clipboard && navigator.clipboard.write)) { flashHint('此环境不支持复制图片'); return; }
     fetch('data:image/png;base64,' + ctxImgData).then(r => r.blob()).then(blob =>
       navigator.clipboard.write([new ClipboardItem({'image/png': blob})])
         .then(() => flashHint('图片已复制')).catch(() => flashHint('复制图片失败')));
   };
   ctxEl.appendChild(b);
+}
+function activeMirrorDocument() {
+  let doc = mir.contentDocument;
+  while (doc?.activeElement?.tagName === 'IFRAME' && doc.activeElement.contentDocument) {
+    doc = doc.activeElement.contentDocument;
+  }
+  return doc;
+}
+function selectPage() {
+  if (domOn) {
+    const doc = activeMirrorDocument();
+    const field = doc?.activeElement;
+    if (typeof field?.select === 'function') field.select();
+    else if (doc?.body) doc.getSelection()?.selectAllChildren(field?.isContentEditable ? field : doc.body);
+  }
+  sendKeyChord('a', 'KeyA');
 }
 function mirrorSelText(doc) {
   const a = doc.activeElement;
@@ -444,7 +590,7 @@ function mirrorSelText(doc) {
   return String(doc.getSelection() || '');
 }
 function copyMirrorSelection() {
-  const doc = mir.contentDocument;
+  const doc = activeMirrorDocument();
   if (!doc) return;
   const t = mirrorSelText(doc);
   if (t) deliverLocalText(t); else requestCopy();
@@ -703,7 +849,8 @@ mir.addEventListener('load', () => {
 });
 function restoreMirFocus() {
   if (!mirFocusId && !mirFocusSig) return;
-  const doc = mir.contentDocument;
+  if (document.activeElement !== mir && document.activeElement !== document.body) return;
+  const doc = activeMirrorDocument();
   if (!doc) return;
   const ae = doc.activeElement;
   if (ae && ae !== doc.body && ae !== doc.documentElement) return;
@@ -767,6 +914,7 @@ setInterval(requestModeSummary, 1000);
 function domStart(auto) {
   if (!auto) modeLock = true;
   if (domOn) return;
+  resetInput();
   domOn = true; domSeq = 0; mirMap = new Map();
   if (hlsRequested) stopHls();
   showDisplay();
@@ -779,6 +927,7 @@ function domStart(auto) {
 function domStop(silent) {
   if (!domOn) return;
   if (!silent) modeLock = true;
+  resetInput();
   domOn = false;
   send({type:'dom-stop'});
   mirFocusId = 0; mirFocusSel = null; mirFocusSig = null;
@@ -934,11 +1083,15 @@ function buildNode(n, doc) {
   mirMap.set(n.i, el);
   for (const c of (n.c || [])) el.appendChild(buildNode(c, doc));
   if (n.g === 'IFRAME' && n.f) {
-    // 同源 iframe 内容：把序列化树建成该 iframe 自身文档的根
-    try {
-      const idoc = el.contentDocument;
-      if (idoc) idoc.replaceChild(buildNode(n.f, idoc), idoc.documentElement);
-    } catch (e) {}
+    // 尚未挂载的 iframe 没有内部文档。以本地空 srcdoc 套用原文档模式，避免加载受控站点。
+    el.addEventListener('load', () => {
+      const inner = el.contentDocument;
+      if (!domOn || !el.isConnected || inner?.URL !== 'about:srcdoc') return;
+      inner.replaceChild(buildNode(n.f, inner), inner.documentElement);
+      attachMirrorInput(inner);
+      restoreMirFocus();
+    });
+    el.srcdoc = (n.fm === 'CSS1Compat' ? '<!doctype html>' : '') + '<html><head></head><body></body></html>';
   }
   return el;
 }
@@ -1004,6 +1157,9 @@ function applyDelta(m) {
           const n = stack.pop();
           if (n.__rigId !== undefined) mirMap.delete(n.__rigId);
           if (n.childNodes) for (const c of n.childNodes) stack.push(c);
+          if (n.tagName === 'IFRAME' && n.contentDocument?.documentElement) {
+            stack.push(n.contentDocument.documentElement);
+          }
         }
         if (node.parentNode) node.parentNode.removeChild(node);
       }
@@ -1011,17 +1167,18 @@ function applyDelta(m) {
     } else if (op.o === 'add') {
       const p = mirMap.get(op.p);
       if (p) {
-        const nn = buildNode(op.n, doc);
+        const nn = buildNode(op.n, p.ownerDocument);
         const before = op.b ? mirMap.get(op.b) : null;
         p.insertBefore(nn, before || null);
       }
     } else if (op.o === 'at' && node && node.setAttribute) {
+      if (node.tagName === 'IFRAME' && ['src', 'srcdoc'].includes(op.n)) continue;
       if (op.v === null || op.v === undefined) node.removeAttribute(op.n);
       else node.setAttribute(op.n, op.v);
     } else if (op.o === 'tx' && node) {
       node.data = op.v;
     } else if (op.o === 'val' && node) {
-      if (doc.activeElement !== node) {
+      if (node.ownerDocument.activeElement !== node) {
         try { node.value = op.v; } catch (e) {}
         if ('checked' in node) node.checked = !!op.k;
       }
@@ -1042,18 +1199,16 @@ function attachMirrorInput(doc) {
   const cap = { capture: true };
   doc.addEventListener('pointerdown', resumeVid, cap);
   doc.addEventListener('keydown', resumeVid, cap);
-  const pos = (e) => ({ x: Math.round(e.clientX), y: Math.round(e.clientY) });
+  const pos = (e) => mirrorRootPoint(doc, e.clientX, e.clientY);
   const editable = (t) => t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT' || t.isContentEditable);
   /* 焦点记忆：focusin 记下可编辑目标的 rig id（mirMap 反查，
      焦点事件低频、线性扫可接受），selectionchange 跟踪输入
      选区；恢复动作在 restoreMirFocus（快照/增量后调用） */
-  doc.addEventListener('focusin', (e) => {
-    if (editable(e.target)) {
-      mirFocusId = 0;
-      for (const [i, n] of mirMap) { if (n === e.target) { mirFocusId = i; break; } }
-      mirFocusSel = null;
-      mirFocusSig = { tag: e.target.tagName, idAttr: e.target.id || '' };
-    } else { mirFocusId = 0; mirFocusSig = null; }
+  doc.addEventListener('focusin', e => {
+    const target = e.target;
+    mirFocusId = target.__rigId ?? 0;
+    mirFocusSel = null;
+    mirFocusSig = target.id ? {tag:target.tagName, idAttr:target.id} : null;
   }, cap);
   doc.addEventListener('selectionchange', () => {
     const a = doc.activeElement;
@@ -1061,29 +1216,26 @@ function attachMirrorInput(doc) {
       mirFocusSel = [a.selectionStart, a.selectionEnd];
     }
   });
-  doc.addEventListener('mousedown', (e) => { send({type:'mouse', action:'down', dom:true, button: e.button, buttons: e.buttons, count: e.detail, ...pos(e)}); }, cap);
-  doc.addEventListener('mouseup', (e) => { send({type:'mouse', action:'up', dom:true, button: e.button, buttons: e.buttons, count: e.detail, ...pos(e)}); }, cap);
-  let lm = 0;
-  doc.addEventListener('mousemove', (e) => {
-    const n = Date.now();
-    if (n - lm > 40) { lm = n; send({type:'mouse', action:'move', dom:true, buttons: e.buttons, ...pos(e)}); }
+  doc.addEventListener('mousedown', e => {
+    if (!domOn) return;
+    if (e.button !== 0 && e.button !== 2) e.preventDefault();
+    closeCtx();
+    mouseButton(e, 'down', pos(e), true);
   }, cap);
-  doc.addEventListener('wheel', (e) => {
+  doc.addEventListener('mouseup', e => { if (domOn) mouseButton(e, 'up', pos(e), true); }, cap);
+  doc.addEventListener('mousemove', e => { if (domOn) movePointer(e, pos(e), true); }, cap);
+  doc.addEventListener('mouseleave', e => {
+    if (domOn && !heldButtons && e.target === doc.documentElement) movePointer(e, {x:-1, y:-1}, true);
+  }, cap);
+  doc.addEventListener('wheel', e => {
+    if (!domOn) return;
     e.preventDefault();
-    send({type:'wheel', dom:true, dx: Math.round(e.deltaX), dy: Math.round(e.deltaY), ...pos(e)});
-  }, { capture: true, passive: false });
-  doc.addEventListener('keydown', (e) => {
-    if (e.isComposing) return;
-    /* Ctrl+V 不转发：粘贴内容以本地剪贴板为准，由 paste 事件带
-       clipboardData 直送（与视频模式同一口径，转发了会双重粘贴）。
-       Ctrl+C/X 不转发、在本地兑现：镜像选区就是用户选的内容，
-       远端没有对应选区，转发只会误剪远端旧选区。不压默认动作，
-       copy/cut 事件随后触发、由其处理器以镜像选区写本地剪贴板 */
-    if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'v') return;
-    const chord = (e.ctrlKey || e.metaKey) && ['c', 'x'].includes(e.key.toLowerCase());
-    if (chord) return;
-    if (!editable(e.target)) e.preventDefault();
-    send({type:'key', dom:true, action:'down', key: e.key, code: e.code, modifiers: mods(e)});
+    send({type:'wheel', dom:true, ...wheelPixels(e), modifiers:mods(e), ...pos(e)});
+  }, {capture:true, passive:false});
+  doc.addEventListener('dragstart', e => { if (domOn) e.preventDefault(); }, cap);
+  doc.addEventListener('keydown', e => {
+    if (viewerShortcut(e, doc)) return;
+    keyDown(e, true, editable(e.target) || e.key === 'Tab' || ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'a'));
   }, cap);
   doc.addEventListener('paste', (e) => {
     const cd = e.clipboardData || window.clipboardData;
@@ -1114,35 +1266,17 @@ function attachMirrorInput(doc) {
     const t = mirrorSelText(doc);
     if (t) { e.preventDefault(); e.clipboardData.setData('text/plain', t); }
   }, cap);
-  doc.addEventListener('keyup', (e) => {
-    if (e.isComposing) return;
-    if ((e.ctrlKey || e.metaKey) && ['c', 'x', 'v'].includes(e.key.toLowerCase())) return;
-    if (!editable(e.target)) e.preventDefault();
-    send({type:'key', dom:true, action:'up', key: e.key, code: e.code, modifiers: mods(e)});
-  }, cap);
+  doc.addEventListener('keyup', e => keyUp(e, true), cap);
   doc.addEventListener('compositionend', (e) => { if (e.data) send({type:'text', dom:true, text: e.data}); }, cap);
-  doc.addEventListener('click', (e) => {
-    const a = e.target && e.target.closest ? e.target.closest('a') : null;
-    if (a) e.preventDefault();
-  }, cap);
-  /* 镜像内右键：事件不冒泡到父文档，在此就地开观看端菜单——
-     菜单位置换算到观看页客户区；图片命中按节点 id 报给边缘
-     （镜像布局会漂移，坐标命中不可靠，按 id 永远准确） */
-  doc.addEventListener('contextmenu', (e) => {
+  for (const type of ['click', 'auxclick']) {
+    doc.addEventListener(type, e => {
+      if (e.target?.closest?.('a') || e.button >= 3) e.preventDefault();
+    }, cap);
+  }
+  doc.addEventListener('contextmenu', e => {
+    if (!domOn) return;
     e.preventDefault();
-    const r = mir.getBoundingClientRect();
-    let hit = null;
-    const host = e.target && e.target.closest ? e.target.closest('[data-rig-region]') : null;
-    if (host) hit = { kind: 'node', i: +host.getAttribute('data-rig-region') };
-    else {
-      let n = e.target;
-      while (n && !hit) {
-        for (const [i, el] of mirMap) { if (el === n) { hit = { kind: 'node', i }; break; } }
-        n = n.parentNode;
-      }
-    }
-    const k = mirVW ? r.width / mirVW : 1;
-    openCtx(Math.round(r.left + e.clientX * k), Math.round(r.top + e.clientY * k), hit);
+    mirrorContext(doc, e.clientX, e.clientY, e.target);
   }, cap);
 }
 document.getElementById('domBtn').onclick = () => { if (domOn) domStop(); else domStart(); };
@@ -1213,7 +1347,13 @@ document.getElementById('findNext').appendChild(svgIcon(ICO.chevDn));
 document.getElementById('findClose').appendChild(svgIcon(ICO.close));
 omniIcon.appendChild(svgIcon(ICO.globe));
 
-function chromeCmd(action, extra) { send({ type: 'chrome', action, ...(extra || {}) }); }
+function chromeCmd(action, extra) {
+  if (['back', 'forward', 'reload', 'navigate', 'new-tab', 'switch-tab', 'close-tab', 'open-internal'].includes(action)) {
+    resetInput();
+    closeCtx();
+  }
+  send({type:'chrome', action, ...(extra || {})});
+}
 let hdrState = null;
 window.__rigChrome = null;
 
@@ -1271,6 +1411,7 @@ function applyChromeState(m) {
     requestModeSummary();
   } else if (page !== modePage || (m.loading && !previous?.loading)) {
     modePage = page;
+    mirFocusId = 0; mirFocusSel = null; mirFocusSig = null;
     resetAutoMode();
     requestModeSummary();
   }
@@ -1296,15 +1437,16 @@ document.getElementById('newTabBtn').onclick = () => chromeCmd('new-tab');
 addrEl.addEventListener('focus', () => addrEl.select());
 addrEl.addEventListener('keydown', (e) => {
   e.stopPropagation();
+  if (e.isComposing || e.keyCode === 229) return;
   if (e.key === 'Enter') {
     chromeCmd('navigate', { url: addrEl.value });
     addrEl.blur();
-    ime.focus();
+    focusPage();
   } else if (e.key === 'Escape') {
     const at = hdrState && (hdrState.tabs || [])[hdrState.active || 0];
     addrEl.value = at ? at.url : '';
     addrEl.blur();
-    ime.focus();
+    focusPage();
   }
 });
 addrEl.addEventListener('mousedown', (e) => e.stopPropagation());
@@ -1357,6 +1499,13 @@ document.getElementById('menuBtn').onclick = (e) => {
 document.addEventListener('pointerdown', (e) => {
   if (menuOpen && !menuEl.contains(e.target)) closeMenu();
 }, true);
+function focusPage() {
+  if (!domOn) { ime.focus({preventScroll:true}); return; }
+  const doc = activeMirrorDocument();
+  doc?.defaultView?.focus();
+  doc?.activeElement?.focus({preventScroll:true});
+}
+
 /* ── 查找条 ── */
 function openFind() {
   findbar.classList.add('open');
@@ -1367,7 +1516,7 @@ function openFind() {
 function closeFind() {
   findbar.classList.remove('open');
   chromeCmd('find-close');
-  ime.focus();
+  focusPage();
 }
 let findTextTimer = 0;
 findInput.addEventListener('input', () => {
@@ -1376,6 +1525,7 @@ findInput.addEventListener('input', () => {
 });
 findInput.addEventListener('keydown', (e) => {
   e.stopPropagation();
+  if (e.isComposing || e.keyCode === 229) return;
   if (e.key === 'Enter') chromeCmd(e.shiftKey ? 'find-prev' : 'find-next');
   else if (e.key === 'Escape') closeFind();
 });
@@ -1383,15 +1533,52 @@ findInput.addEventListener('mousedown', (e) => e.stopPropagation());
 document.getElementById('findNext').onclick = () => chromeCmd('find-next');
 document.getElementById('findPrev').onclick = () => chromeCmd('find-prev');
 document.getElementById('findClose').onclick = closeFind;
-/* ── 全局快捷键（Chrome 口径）：Ctrl/Cmd+F 查找、Ctrl/Cmd+L
-   地址栏。捕获阶段先于 ime 的转发处理拦截；焦点已在工具栏
-   输入框里时不重复处理（它们各自 stopPropagation） ── */
-document.addEventListener('keydown', (e) => {
-  if (!(e.ctrlKey || e.metaKey) || e.altKey) return;
-  const k = e.key.toLowerCase();
-  if (k === 'f') { e.preventDefault(); e.stopPropagation(); openFind(); }
-  else if (k === 'l') { e.preventDefault(); e.stopPropagation(); addrEl.focus(); addrEl.select(); }
-}, true);
+/* 浏览器快捷键归观看端工具栏。镜像 iframe 也需要自己的监听器。 */
+function viewerShortcut(e, mirrorDoc) {
+  if (contextMenuKey(e)) return true;
+  if (e.isComposing || e.keyCode === 229 || e.getModifierState('AltGraph')) return false;
+  const primary = e.ctrlKey || e.metaKey;
+  const key = e.key.toLowerCase();
+  let action;
+  if (!primary && !e.altKey && (key === 'contextmenu' || (key === 'f10' && e.shiftKey)) &&
+      (mirrorDoc || e.target === ime || ctxEl)) {
+    action = () => {
+      if (mirrorDoc) {
+        const active = mirrorDoc.activeElement;
+        const rect = active.getBoundingClientRect();
+        mirrorContext(mirrorDoc, rect.left, rect.bottom, active, true);
+      } else {
+        const rect = frameRect();
+        openCtx(rect.left + rect.width / 2, rect.top + rect.height / 2, null, ime, true);
+      }
+    };
+  } else if (primary && !e.altKey && !e.shiftKey) {
+    if (key === 'f') action = openFind;
+    else if (key === 'l') action = () => { addrEl.focus(); addrEl.select(); };
+    else if (key === 'r') action = () => chromeCmd('reload');
+    else if (key === 't') action = () => chromeCmd('new-tab');
+    else if (key === 'w') action = () => {
+      if (hdrState) chromeCmd('close-tab', {index:hdrState.active});
+    };
+    else if (key === 'pageup' || key === 'pagedown') action = () => {
+      if (!hdrState?.tabs.length) return;
+      const count = hdrState.tabs.length;
+      const index = (hdrState.active + (key === 'pageup' ? -1 : 1) + count) % count;
+      chromeCmd('switch-tab', {index});
+    };
+  } else if (e.altKey && !primary && !e.shiftKey) {
+    if (key === 'arrowleft') action = () => chromeCmd('back');
+    if (key === 'arrowright') action = () => chromeCmd('forward');
+  } else if (!primary && !e.altKey && !e.shiftKey && key === 'f5') {
+    action = () => chromeCmd('reload');
+  }
+  if (!action) return false;
+  e.preventDefault();
+  e.stopPropagation();
+  if (!e.repeat) action();
+  return true;
+}
+document.addEventListener('keydown', e => viewerShortcut(e, null), true);
 if (new URLSearchParams(location.search).get('dom') === '1') {
   ws.addEventListener('open', () => domStart());
 }

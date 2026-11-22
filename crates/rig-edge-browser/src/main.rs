@@ -1110,6 +1110,8 @@ async fn ws_session(app: Arc<App>, socket: WebSocket, remote: std::net::SocketAd
     });
     let (send_done, mut stop_recv) = tokio::sync::oneshot::channel::<()>();
     let mut recv_task = tokio::spawn(async move {
+        let mut pointer = human::ViewerPointer::default();
+        let mut keys = human::ViewerKeys::default();
         let mut rtc_session: Option<rtc::SessionHandle> = None;
         // R-10：收包按帧型分发——Ping/Pong/Binary 不结束会话
         // （此前 while let 只认 Text，任意保活帧都会拆连接）
@@ -1130,6 +1132,12 @@ async fn ws_session(app: Arc<App>, socket: WebSocket, remote: std::net::SocketAd
             };
             // RTC 信令在本层截获，其余消息才是人通道输入
             match v.get("type").and_then(|t| t.as_str()) {
+                Some("mouse" | "wheel") => app2.human.handle_pointer(&mut pointer, &v).await,
+                Some("key") => app2.human.handle_key(&mut keys, &v).await,
+                Some("input-reset") => {
+                    app2.human.release_pointer(&mut pointer).await;
+                    app2.human.release_keys(&mut keys).await;
+                }
                 Some("jpeg-demand") => {
                     let on = v.get("on").and_then(|b| b.as_bool()).unwrap_or(true);
                     if on && jpeg_lease.is_none() {
@@ -1214,6 +1222,8 @@ async fn ws_session(app: Arc<App>, socket: WebSocket, remote: std::net::SocketAd
                 }
             }
         }
+        app2.human.release_pointer(&mut pointer).await;
+        app2.human.release_keys(&mut keys).await;
     });
     tokio::select! {
         _ = &mut send_task => {

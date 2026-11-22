@@ -298,10 +298,16 @@ libavutil/libswscale/libavdevice/libswresample。
 
 ## 9. 人通道輸入與剪貼板
 
-- **輸入法與組合鍵**：觀看頁以透明 `textarea` 覆蓋層承接全部輸入（noVNC 同款做法）：
-  IME 組字完成（compositionend）後整段經 `insert_text` 送入頁面；組字期間跳過
-  keydown 轉發。普通按鍵轉發時透傳修飾鍵位掩碼（Alt=1 Ctrl=2 Meta=4 Shift=8），
-  帶 Ctrl/Alt/Meta 時不附單字 text（避免頁面收到雙份輸入）。
+- **頁面鍵盤**使用原始 `key`、物理鍵位 `code`、左右及數字鍵盤位置、
+  重複狀態和修飾鍵。可輸入的字元由一次 CDP 鍵事件寫入。Ctrl、Alt、Meta
+  組合鍵保留其修飾鍵。AltGr 產生的字元直接插入，避免被 Chromium 當成 Ctrl+Alt 快捷鍵。
+  IME 在觀看端組字，
+  確認後只送一次完整文字。視窗失焦、呈現模式切換或斷線會釋放已送出的按鍵。
+- **觀看頁快捷鍵**在畫面及 DOM 模式共用。Ctrl/Cmd+F 開遠端查找，
+  Ctrl/Cmd+L 聚焦觀看頁地址欄，Alt+←／→ 控制遠端上一頁／下一頁。
+  F5 或 Ctrl/Cmd+R 重載，Ctrl/Cmd+T／W 開啟／關閉遠端分頁，
+  Ctrl/Cmd+PageUp／PageDown 切換遠端分頁。快捷鍵須由觀看者瀏覽器交給網頁，
+  瀏覽器或作業系統優先攔截的組合可用觀看頁工具欄操作。
 - **AI 通道按鍵**：`Action::Key` 的鍵名經 `key_spec` 映射為
   （key, 物理鍵位 code, text）：單字符鍵的 code 是 `KeyA`/`Digit1` 等物理鍵位，
   **不是字符本身**——曾誤用字符作 code，導致 Ctrl+A/C/V 等組合鍵全部失效
@@ -325,12 +331,11 @@ libavutil/libswscale/libavdevice/libswresample。
   有圖才回），回傳後寫本地剪貼板。
 - **文件粘貼未實現**（LIU 2026-11-18 定：文件單獨考慮）。正道是 rig-proto
   新增 Upload 動作走 `DOM.setFileInputFiles`——改協議須 LIU 批准。
-- **右鍵菜單（第五期改版）**：地址欄是觀看頁原生 `<input>`，
-  右鍵粘貼/全選等走觀看者瀏覽器自身的輸入框行為，無需邊緣
-  介入（取代舊合成條帶時代的「右鍵先進編輯態」例外，歷史
-  定因見 PITFALLS §26）。頁面區域的右鍵菜單由觀看端繪製：
-  複製/粘貼/全選/複製圖片/後退/重新載入/自動模式開關，兩種
-  顯示模式同一套。
+- **右鍵選單**。地址欄和查找欄使用觀看者瀏覽器的原生編輯行為。
+  頁面右鍵仍送到遠端 Chromium，並開啟觀看端選單，提供複製、貼上、
+  全選、複製圖片、後退、前進、重載和自動模式開關。也可用選單鍵或
+  Shift+F10 開啟。方向鍵和 Home／End 選擇項目，Enter 執行，
+  Esc 關閉並返回原焦點。
 
 ### 9.1 觀看端設計：原生 DOM header（Chrome/Edge 形態）＋純頁面幀（第五期，LIU 2026-11-20 定并下令）
 
@@ -395,14 +400,12 @@ WebSocket 透傳原始 JPEG（8 字節頭 + JPEG）。只有編碼或貼圖需�
 欄）。§7.1 的執行期遮蔽與接管提示不變：遮蔽是邊緣輸入路由
 狀態、提示是觀看端 DOM。
 
-**點擊計數（雙擊語義）**：觀看端 mousedown/up 帶 `count`
-（MouseEvent.detail），邊緣兩條輸入路徑都透傳進 CDP
-`clickCount`——遠端頁面收得到真 dblclick（如遠端視頻雙擊在
-遠端頁內全屏、雙擊選詞）。消息缺 count 時邊緣缺省按 1：
-CDP mousePressed 不帶 clickCount 在本機 Chromium 上連普通
-click 都不產生（PITFALLS §36），缺省絕不能留空。觀看頁自身
-不綁雙擊手勢（舊版輸入層 dblclick 切全屏已拆，LIU
-2026-11-20 定：雙擊歸遠端頁面）。
+**滑鼠事件**。按下、放開、拖動及滾輪使用同一條頁面輸入路徑。
+觀看端傳遞座標、修飾鍵與點擊次數，邊緣逐連線記錄按住的按鈕。
+DOM 模式會從同源 iframe 的局部坐標換算到主視口，並在重建後恢復頁面焦點。
+左右鍵同時按住時可獨立放開，拖出舞台放開也會送達。單擊、雙擊、
+中鍵 click（`auxclick`）和頁面右鍵事件由 Chromium 產生。
+未傳點擊次數的 WS 事件按一次處理。
 
 **WebRTC 主路**（Phase 1b，`rtc.rs`）：觀看端經同一條 WS 發
 `rtc-start`，邊緣作 offerer + ICE-lite（str0m）回 `rtc-offer`，

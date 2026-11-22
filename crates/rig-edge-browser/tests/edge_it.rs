@@ -4231,3 +4231,343 @@ setInterval(()=>{const p=document.createElement('p');const b=document.createElem
     }
     assert!(dup.is_empty(), "镜像里出现重复 id：{dup:?}");
 }
+
+/// 两种显示模式的 WS 鼠标事件都应保留按钮、点按和修饰键语义。
+#[tokio::test]
+async fn edge_ws_mouse_button_and_modifier_semantics() {
+    if std::env::var("RIG_EDGE_IT").is_err() {
+        eprintln!("跳过：未设置 RIG_EDGE_IT");
+        return;
+    }
+    let _serial = SERIAL.lock().await;
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let page_port = listener.local_addr().unwrap().port();
+    let origin = format!("http://127.0.0.1:{page_port}");
+    let html = r#"<!doctype html><meta charset="utf-8"><title>MouseReady</title><body style="margin:0">
+<div id="target" style="width:500px;height:400px">target</div><pre id="log"></pre>
+<script>
+const log=[]; for (const type of ['mousedown','mouseup','click','dblclick','contextmenu','auxclick','mousemove','wheel'])
+  document.addEventListener(type,e=>{log.push({type:e.type,button:e.button,buttons:e.buttons,alt:e.altKey,ctrl:e.ctrlKey,meta:e.metaKey,shift:e.shiftKey});document.title=JSON.stringify(log);document.querySelector('#log').textContent=JSON.stringify(log)});
+</script></body>"#;
+    serve(
+        listener,
+        vec![("/mouse.html".to_string(), html.to_string())],
+    );
+    let edge_port = free_port();
+    let _proc = spawn_edge(&[
+        "--listen".into(),
+        format!("127.0.0.1:{edge_port}"),
+        "--url".into(),
+        format!("{origin}/mouse.html"),
+        "--human".into(),
+        "--width".into(),
+        "700".into(),
+        "--height".into(),
+        "500".into(),
+    ]);
+    wait_health(edge_port).await;
+    use futures_util::SinkExt;
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{edge_port}/ws"))
+        .await
+        .unwrap();
+    macro_rules! send {
+        ($v:expr) => {
+            ws.send(tokio_tungstenite::tungstenite::Message::Text(
+                $v.to_string().into(),
+            ))
+            .await
+            .unwrap()
+        };
+    }
+    send!(json!({"type":"dom-start"}));
+    let ready = next_dom(&mut ws, "dom-snapshot", Duration::from_secs(20)).await;
+    assert_eq!(
+        ready["title"], "MouseReady",
+        "fixture must be loaded before input: {ready}"
+    );
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    let mut previous = 0;
+    for dom in [false, true] {
+        // Press/release left with all four modifier bits; click count 2 yields dblclick.
+        send!(
+            json!({"type":"mouse","dom":dom,"action":"down","x":100,"y":100,"button":0,"buttons":1,"count":2,"modifiers":15})
+        );
+        send!(
+            json!({"type":"mouse","dom":dom,"action":"up","x":100,"y":100,"button":0,"buttons":0,"count":2,"modifiers":15})
+        );
+        // Secondary and middle buttons exercise native contextmenu and auxclick events.
+        for (button, mask) in [(2, 2), (1, 4)] {
+            send!(
+                json!({"type":"mouse","dom":dom,"action":"down","x":100,"y":100,"button":button,"buttons":mask,"count":1})
+            );
+            send!(
+                json!({"type":"mouse","dom":dom,"action":"up","x":100,"y":100,"button":button,"buttons":0,"count":1})
+            );
+        }
+        // Hold left + right, release right, then move with left still held.
+        send!(
+            json!({"type":"mouse","dom":dom,"action":"down","x":100,"y":100,"button":0,"buttons":1,"count":1})
+        );
+        send!(
+            json!({"type":"mouse","dom":dom,"action":"down","x":100,"y":100,"button":2,"buttons":3,"count":1})
+        );
+        send!(
+            json!({"type":"mouse","dom":dom,"action":"up","x":100,"y":100,"button":2,"buttons":1,"count":1})
+        );
+        send!(
+            json!({"type":"mouse","dom":dom,"action":"move","x":110,"y":110,"button":0,"buttons":1})
+        );
+        send!(
+            json!({"type":"mouse","dom":dom,"action":"up","x":110,"y":110,"button":0,"buttons":0,"count":1})
+        );
+        // An unmatched release must not synthesize a mouseup.
+        send!(
+            json!({"type":"mouse","dom":dom,"action":"up","x":100,"y":100,"button":0,"buttons":0,"count":1})
+        );
+        send!(json!({"type":"wheel","dom":dom,"x":100,"y":100,"dx":0,"dy":40,"modifiers":8}));
+        let deadline = Instant::now() + Duration::from_secs(8);
+        let log = loop {
+            send!(json!({"type":"dom-resync"}));
+            let snap = next_dom(&mut ws, "dom-snapshot", Duration::from_secs(3)).await;
+            if let Some(log) = snap["title"]
+                .as_str()
+                .and_then(|title| serde_json::from_str::<Vec<Value>>(title).ok())
+            {
+                if log.iter().skip(previous).any(|e| e["type"] == "wheel") {
+                    break log;
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "dom={dom}: missing wheel and/or mouse events: {snap}"
+            );
+        };
+        let events = &log[previous..];
+        let pairs = |kind: &str| {
+            events
+                .iter()
+                .filter(|e| e["type"] == kind)
+                .map(|e| {
+                    (
+                        e["button"].as_i64().unwrap(),
+                        e["buttons"].as_u64().unwrap(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            pairs("mousedown"),
+            [(0, 1), (2, 2), (1, 4), (0, 1), (2, 3)],
+            "dom={dom}"
+        );
+        assert_eq!(
+            pairs("mouseup"),
+            [(0, 0), (2, 0), (1, 0), (2, 1), (0, 0)],
+            "dom={dom}"
+        );
+        assert_eq!(pairs("mousemove"), [(0, 1)], "dom={dom}");
+        assert_eq!(pairs("contextmenu"), [(2, 2), (2, 3)], "dom={dom}");
+        assert!(pairs("auxclick").contains(&(1, 0)), "dom={dom}");
+        assert!(pairs("click").contains(&(0, 0)), "dom={dom}");
+        let double = events
+            .iter()
+            .find(|e| e["type"] == "dblclick")
+            .expect("left dblclick");
+        for key in ["alt", "ctrl", "meta", "shift"] {
+            assert_eq!(double[key], true, "dom={dom}: {double}");
+        }
+        let wheel = events.iter().find(|e| e["type"] == "wheel").unwrap();
+        assert_eq!(wheel["shift"], true, "dom={dom}: {wheel}");
+        previous = log.len();
+    }
+}
+
+/// 两种显示模式的键盘元数据、组合键和文字输入应一致。
+#[tokio::test]
+async fn edge_ws_keyboard_metadata_and_text_safety() {
+    if std::env::var("RIG_EDGE_IT").is_err() {
+        eprintln!("跳过：未设置 RIG_EDGE_IT");
+        return;
+    }
+    let _serial = SERIAL.lock().await;
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let page_port = listener.local_addr().unwrap().port();
+    let origin = format!("http://127.0.0.1:{page_port}");
+    let html = r#"<!doctype html><meta charset="utf-8"><title>KeyboardReady</title><input id="field" autofocus><script>
+const log=[]; const field=document.querySelector('#field');
+field.addEventListener('keydown',e=>{if(['Numpad1','Semicolon','F6','F7','F8'].includes(e.code))e.preventDefault()},true);
+for(const type of ['keydown','keyup','keypress','beforeinput','input']) field.addEventListener(type,e=>{log.push({type:e.type,key:e.key,code:e.code,keyCode:e.keyCode,location:e.location,repeat:e.repeat,shift:e.shiftKey,alt:e.altKey,ctrl:e.ctrlKey,meta:e.metaKey,data:e.data??null,value:field.value});document.title=JSON.stringify(log)});
+field.addEventListener('keyup',e=>{if(e.code==='F7'||e.code==='F8')field.value=''});
+</script>"#;
+    serve(
+        listener,
+        vec![("/keyboard.html".to_string(), html.to_string())],
+    );
+    let edge_port = free_port();
+    let _proc = spawn_edge(&[
+        "--listen".into(),
+        format!("127.0.0.1:{edge_port}"),
+        "--url".into(),
+        format!("{origin}/keyboard.html"),
+        "--human".into(),
+        "--width".into(),
+        "700".into(),
+        "--height".into(),
+        "500".into(),
+    ]);
+    wait_health(edge_port).await;
+    use futures_util::SinkExt;
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{edge_port}/ws"))
+        .await
+        .unwrap();
+    macro_rules! send {
+        ($v:expr) => {
+            ws.send(tokio_tungstenite::tungstenite::Message::Text(
+                $v.to_string().into(),
+            ))
+            .await
+            .unwrap()
+        };
+    }
+    send!(json!({"type":"dom-start"}));
+    let ready = next_dom(&mut ws, "dom-snapshot", Duration::from_secs(20)).await;
+    assert_eq!(
+        ready["title"], "KeyboardReady",
+        "fixture not ready: {ready}"
+    );
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let mut failures = Vec::new();
+    let mut previous = 0;
+    for dom in [false, true] {
+        let send_key =
+            |action: &str, key: &str, code: &str, modifiers: u8, location: u8, repeat: bool| {
+                json!({"type":"key","dom":dom,"action":action,"key":key,"code":code,
+                "modifiers":modifiers,"location":location,"repeat":repeat})
+            };
+        // Shortcut modifiers stay on the event while Shift+A inserts exactly once.
+        for (key, code, mods) in [
+            ("A", "KeyA", 8),
+            ("a", "KeyA", 1),
+            ("b", "KeyB", 2),
+            ("c", "KeyC", 4),
+        ] {
+            send!(send_key("down", key, code, mods, 0, false));
+            send!(send_key("up", key, code, mods, 0, false));
+        }
+        send!(send_key("down", "q", "KeyQ", 3, 0, false));
+        send!(send_key("up", "q", "KeyQ", 3, 0, false));
+        let mut alt_graph = send_key("down", "@", "KeyQ", 3, 0, false);
+        alt_graph["altGraph"] = json!(true);
+        send!(alt_graph);
+        send!(send_key("up", "@", "KeyQ", 3, 0, false));
+        for (key, location, repeat) in [
+            ("Numpad1", 3, true),
+            ("Semicolon", 0, false),
+            ("F6", 0, false),
+        ] {
+            let value = match key {
+                "Numpad1" => "1",
+                "Semicolon" => ";",
+                _ => key,
+            };
+            send!(send_key("down", value, key, 0, location, repeat));
+            send!(send_key("up", value, key, 0, location, false));
+        }
+        send!(send_key("down", "Shift", "ShiftRight", 8, 2, false));
+        send!(json!({"type":"input-reset"}));
+        let end = if dom { "F8" } else { "F7" };
+        send!(send_key("down", end, end, 0, 0, false));
+        send!(send_key("up", end, end, 0, 0, false));
+
+        let deadline = Instant::now() + Duration::from_secs(8);
+        let log = loop {
+            send!(json!({"type":"dom-resync"}));
+            let snap = next_dom(&mut ws, "dom-snapshot", Duration::from_secs(3)).await;
+            if let Some(log) = snap["title"]
+                .as_str()
+                .and_then(|s| serde_json::from_str::<Vec<Value>>(s).ok())
+            {
+                if log
+                    .iter()
+                    .skip(previous)
+                    .any(|e| e["key"] == end && e["type"] == "keyup")
+                {
+                    break log;
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "dom={dom}: keyboard end marker not observed: {snap}"
+            );
+        };
+        let events = &log[previous..];
+        previous = log.len();
+        let downs = events
+            .iter()
+            .filter(|e| e["type"] == "keydown")
+            .collect::<Vec<_>>();
+        for (key, code, key_code, location, repeat) in [
+            ("1", "Numpad1", 97, 3, true),
+            (";", "Semicolon", 186, 0, false),
+            ("F6", "F6", 117, 0, false),
+        ] {
+            let event = downs
+                .iter()
+                .find(|e| e["key"] == key)
+                .expect("keydown record");
+            for (field, expected) in [
+                ("code", json!(code)),
+                ("keyCode", json!(key_code)),
+                ("location", json!(location)),
+                ("repeat", json!(repeat)),
+            ] {
+                if event[field] != expected {
+                    failures.push(format!(
+                        "dom={dom} {key} {field}: expected {expected}, got {}",
+                        event[field]
+                    ));
+                }
+            }
+        }
+        for (key, field) in [("a", "alt"), ("b", "ctrl"), ("c", "meta")] {
+            let event = downs.iter().find(|e| e["key"] == key).unwrap();
+            if event[field] != true {
+                failures.push(format!(
+                    "dom={dom}: {key} should carry {field} modifier: {event}"
+                ));
+            }
+        }
+        assert!(
+            events
+                .iter()
+                .any(|e| e["type"] == "keyup" && e["code"] == "ShiftRight" && e["location"] == 2),
+            "dom={dom}: reset releases ShiftRight"
+        );
+        let shift_text = events
+            .iter()
+            .filter(|e| e["type"] == "input" && e["data"] == "A")
+            .count();
+        if shift_text != 1 {
+            failures.push(format!(
+                "dom={dom}: Shift text should produce one input event, got {shift_text}; {log:?}"
+            ));
+        }
+        let final_value = events
+            .iter()
+            .rev()
+            .find(|e| e["type"] == "input")
+            .and_then(|e| e["value"].as_str())
+            .unwrap_or("");
+        if final_value != "A@" {
+            failures.push(format!(
+                "dom={dom}: only Shift+A and AltGr+Q should type; final value={final_value:?}; {log:?}"
+            ));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "keyboard regression failures:\n{}",
+        failures.join("\n")
+    );
+}

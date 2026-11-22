@@ -107,7 +107,10 @@ const SCRIPT: &str = r##"(() => {
           const d = node.contentDocument;
           if (d && d.documentElement) {
             S.fdepth++;
-            try { const inner = ser(d.documentElement); if (inner) out.f = inner; }
+            try {
+              const inner = ser(d.documentElement);
+              if (inner) { out.f = inner; out.fm = d.compatMode; }
+            }
             finally { S.fdepth--; }
             watchFrame(node, d);
           } else { cross = true; }
