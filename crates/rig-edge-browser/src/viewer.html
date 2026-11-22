@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="zh"><head><meta charset="utf-8"><title>rig-edge-browser</title>
+<html lang="en"><head><meta charset="utf-8"><title>rig-edge-browser</title>
 <style>
   /* ── 浏览器 chrome（第五期：观看页原生 DOM）────────────────
      造型语言参考 Chrome × Edge：标签条（圆角标签、活动标签与
@@ -169,26 +169,26 @@
 </style></head><body>
 <header id="hdr">
   <div id="tabstrip"><div id="tabs" style="display:contents"></div>
-    <button id="newTabBtn" class="hbtn" title="新建标签页"></button></div>
+    <button id="newTabBtn" class="hbtn" title="New tab"></button></div>
   <div id="navbar">
-    <button id="backBtn" class="hbtn" title="后退"></button>
-    <button id="fwdBtn" class="hbtn" title="前进"></button>
-    <button id="reloadBtn" class="hbtn" title="重新加载"></button>
-    <div id="omni"><span id="omniIcon"></span><input id="addr" type="text" spellcheck="false" autocomplete="off" placeholder="输入网址或搜索"></div>
-    <button id="domBtn" title="DOM 镜像模式（低带宽）">DOM</button>
-    <button id="menuBtn" class="hbtn" title="菜单"></button>
+    <button id="backBtn" class="hbtn" title="Back"></button>
+    <button id="fwdBtn" class="hbtn" title="Forward"></button>
+    <button id="reloadBtn" class="hbtn" title="Reload"></button>
+    <div id="omni"><span id="omniIcon"></span><input id="addr" type="text" spellcheck="false" autocomplete="off" placeholder="Enter a URL or search"></div>
+    <button id="domBtn" title="DOM mirror mode (low bandwidth)">DOM</button>
+    <button id="menuBtn" class="hbtn" title="Menu"></button>
   </div>
   <div id="loadbar"><i></i></div>
   <div id="findbar">
-    <input id="findInput" type="text" spellcheck="false" placeholder="在页面中查找">
+    <input id="findInput" type="text" spellcheck="false" placeholder="Find in page">
     <span id="findInfo"></span>
-    <button id="findPrev" class="hbtn" title="上一个（Shift+Enter）"></button>
-    <button id="findNext" class="hbtn" title="下一个（Enter）"></button>
-    <button id="findClose" class="hbtn" title="关闭（Esc）"></button>
+    <button id="findPrev" class="hbtn" title="Previous (Shift+Enter)"></button>
+    <button id="findNext" class="hbtn" title="Next (Enter)"></button>
+    <button id="findClose" class="hbtn" title="Close (Esc)"></button>
   </div>
   <div id="menu"></div>
 </header>
 <div id="stage"><canvas id="cv" width="1280" height="800"></canvas><video id="vid" style="display:none" autoplay playsinline></video><iframe id="mir" sandbox="allow-same-origin" style="display:none"></iframe><textarea id="ime" autocomplete="off"></textarea><div id="ghost"><div id="gdot"></div><div id="glabel"></div></div><div id="fbRing"></div><div id="fbRect"></div><div id="dpill"></div></div>
-<div id="prompt"><div>AI 正在执行操作，是否强制接管？</div>
-<button class="yes" id="pYes">强制接管</button><button id="pNo">继续等待</button></div>
+<div id="prompt"><div>The AI is performing an action. Take over control?</div>
+<button class="yes" id="pYes">Take over</button><button id="pNo">Keep waiting</button></div>
 <script src="/auth.js"></script></body></html>

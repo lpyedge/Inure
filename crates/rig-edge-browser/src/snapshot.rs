@@ -119,7 +119,7 @@ pub async fn screenshot_masks(
     let (scope, sessions) = {
         let map = browser.sessions.lock().await;
         if !map.contains_key(main) {
-            return Err("截图会话已分离".into());
+            return Err("screenshot session was detached".into());
         }
         let mut scope = frame_scope(&map, main);
         scope.retain(|session| {
@@ -136,7 +136,7 @@ pub async fn screenshot_masks(
                 let parent = map
                     .get(owner)
                     .and_then(|info| info.parent.as_deref())
-                    .ok_or("截图子帧无宿主会话")?;
+                    .ok_or("screenshot subframe has no host session")?;
                 if parent == main {
                     break;
                 }
@@ -181,7 +181,7 @@ pub async fn screenshot_masks(
             let (&host, _) = root
                 .iter()
                 .find(|(_, (_, _, id))| id.as_deref() == Some(frame.as_str()))
-                .ok_or("无法确认敏感子帧的遮罩位置")?;
+                .ok_or("cannot determine the mask position of the sensitive subframe")?;
             let bounds = to_visual(browser.border_bounds(main, host).await?);
             host_bounds.insert(owner, bounds);
             bounds
@@ -235,9 +235,11 @@ pub async fn build_observation(
             Ok(nodes) => nodes,
             Err(e) => {
                 if sid == main {
-                    return Err(format!("主 frame AX 采集失败: {e}"));
+                    return Err(format!("main frame AX collection failed: {e}"));
                 }
-                warnings.push(format!("frame {sid} 的 AX 采集失败（{e}），已跳过"));
+                warnings.push(format!(
+                    "AX collection failed for frame {sid} ({e}); skipped"
+                ));
                 continue;
             }
         };
@@ -252,9 +254,13 @@ pub async fn build_observation(
         // 密码等敏感状态来自 DOM，AX 节点未经这一步不能对外输出。
         let dom = match browser.dom_map(&sid).await {
             Ok(dom) => dom,
-            Err(_) if placed => return Err("主 frame DOM 映射失败，无法确认脱敏".into()),
+            Err(_) if placed => {
+                return Err("main frame DOM mapping failed; cannot confirm redaction".into())
+            }
             Err(_) => {
-                warnings.push(format!("frame {sid} 的 DOM 映射失败，无法确认脱敏，已跳过"));
+                warnings.push(format!(
+                    "DOM mapping failed for frame {sid}; cannot confirm redaction; skipped"
+                ));
                 continue;
             }
         };
@@ -262,7 +268,9 @@ pub async fn build_observation(
             String::new()
         } else {
             browser.root_frame_id(&sid).await.unwrap_or_else(|e| {
-                warnings.push(format!("frame {sid} 的根帧 id 获取失败（{e}）"));
+                warnings.push(format!(
+                    "failed to get the root frame id of frame {sid} ({e})"
+                ));
                 Default::default()
             })
         };

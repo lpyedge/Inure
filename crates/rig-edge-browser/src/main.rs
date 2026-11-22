@@ -36,6 +36,7 @@ mod exec;
 mod human;
 mod media;
 mod metrics;
+mod pulse;
 mod rtc;
 mod snapshot;
 
@@ -75,7 +76,7 @@ struct App {
     exec: Arc<ExecControl>,
     /// 监听地址里的具体 IP（通配绑定时为 None）：RTC 候选地址的来源
     listen_ip: Option<std::net::IpAddr>,
-    av_capable: bool,
+    audio_available: bool,
     gate_ai: AtomicBool,
     gate_human: watch::Sender<bool>,
     gate_transition: Mutex<()>,
@@ -143,7 +144,7 @@ async fn auth_guard(State(app): State<Arc<App>>, req: Request, next: Next) -> Re
     } else {
         (
             StatusCode::UNAUTHORIZED,
-            Json(json!({"error": "需要令牌（Authorization: Bearer）"})),
+            Json(json!({"error": "A token is required (Authorization: Bearer)"})),
         )
             .into_response()
     }
@@ -168,7 +169,11 @@ fn pair_response(app: &App, pair: Option<auth::TokenPair>) -> Response {
             "stream_key": app.auth.stream_key(),
         }))
         .into_response(),
-        None => (StatusCode::UNAUTHORIZED, Json(json!({"error": "令牌无效"}))).into_response(),
+        None => (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"error": "Invalid token"})),
+        )
+            .into_response(),
     }
 }
 
@@ -237,7 +242,7 @@ async fn build_tls(
             }
             let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
             eprintln!(
-                "rig-edge-browser: 非回环监听 {listen} 强制 TLS（未提供 --tls-cert/--tls-key，自动使用自签名证书）"
+                "rig-edge-browser: TLS is enforced for non-loopback listen address {listen} (no --tls-cert/--tls-key given; using a self-signed certificate)"
             );
             (
                 format!("{home}/.rig-edge/self-signed.crt"),
@@ -246,7 +251,7 @@ async fn build_tls(
         }
         (Some(c), Some(k)) => (c, k),
         _ => {
-            eprintln!("拒绝启动：--tls-cert 与 --tls-key 必须成对提供。");
+            eprintln!("Refusing to start: --tls-cert and --tls-key must be given together.");
             std::process::exit(2);
         }
     };
@@ -259,22 +264,23 @@ async fn build_tls(
         if !sans.contains(&host) && !host.is_empty() {
             sans.push(host);
         }
-        let ck = rcgen::generate_simple_self_signed(sans.clone()).expect("自签名证书生成失败");
+        let ck = rcgen::generate_simple_self_signed(sans.clone())
+            .expect("failed to generate self-signed certificate");
         if let Some(dir) = std::path::Path::new(&cert).parent() {
-            std::fs::create_dir_all(dir).expect("证书目录创建失败");
+            std::fs::create_dir_all(dir).expect("failed to create certificate directory");
         }
-        std::fs::write(&cert, ck.cert.pem()).expect("证书写入失败");
+        std::fs::write(&cert, ck.cert.pem()).expect("failed to write certificate");
         // 私钥以 0600 原子创建（R-22：不留先落盘后改权限的窗口），
         // 写入与权限结果都必须成功，失败即拒绝启动
         write_key_0600(&key, ck.key_pair.serialize_pem().as_bytes());
         eprintln!(
-            "rig-edge-browser: 已生成自签名证书 {cert}（SAN: {}）",
+            "rig-edge-browser: generated self-signed certificate {cert} (SAN: {})",
             sans.join(", ")
         );
     }
     let cfg = axum_server::tls_rustls::RustlsConfig::from_pem_file(&cert, &key)
         .await
-        .expect("TLS 证书加载失败");
+        .expect("failed to load TLS certificate");
     Some(cfg)
 }
 
@@ -291,12 +297,12 @@ fn write_key_0600(path: &str, bytes: &[u8]) {
             .truncate(true)
             .mode(0o600)
             .open(path)
-            .expect("私钥文件创建失败");
-        f.write_all(bytes).expect("私钥写入失败");
+            .expect("failed to create private key file");
+        f.write_all(bytes).expect("failed to write private key");
     }
     #[cfg(not(unix))]
     {
-        std::fs::write(path, bytes).expect("私钥写入失败");
+        std::fs::write(path, bytes).expect("failed to write private key");
     }
 }
 
@@ -318,8 +324,8 @@ struct ChannelState {
     human: bool,
     /// 音视频合流管线是否在跑
     av: bool,
-    /// 本机是否具备合流条件（ffmpeg + PulseAudio 虚拟声卡）
-    av_available: bool,
+    /// 自拉 Chromium 的音讯是否接入独立虚拟声卡。
+    audio_available: bool,
     /// 人通道启动失败原因（R-11）；正常时为 null
     human_error: Option<String>,
     /// 是否允许 HLS 播放。管线有有效播放请求时运行。
@@ -349,7 +355,7 @@ async fn channel_state(app: &Arc<App>, av: bool) -> ChannelState {
         ai: app.gate_ai.load(Ordering::SeqCst),
         human: app.human_enabled(),
         av,
-        av_available: app.av_capable,
+        audio_available: app.audio_available,
         human_error: app.human_error.lock().unwrap().clone(),
         av_wanted: wanted,
         media_state,
@@ -419,7 +425,7 @@ async fn main() {
     let serves_http = !has("--stdio") || human_default;
     if serves_http && token.is_none() {
         eprintln!(
-            "拒绝启动：对外提供 HTTP 必须设令牌。请由启动程序随机生成并传入 --token <令牌>（或环境变量 RIG_EDGE_TOKEN）。"
+            "Refusing to start: a token is required when serving HTTP. Have the launcher generate a random token and pass it via --token <token> (or the RIG_EDGE_TOKEN environment variable)."
         );
         std::process::exit(2);
     }
@@ -432,12 +438,20 @@ async fn main() {
         })
         .unwrap_or_default();
 
-    // 虚拟声卡先行：Chromium 出生时就把声音放进 null sink，
-    // 之后 ffmpeg 从它的 monitor 合流（LIU 2026-11-18 定的音频方案）。
-    let av_capable = media::ensure_virtual_sink().await;
-    if av_capable {
-        std::env::set_var("PULSE_SINK", media::SINK_NAME);
-    }
+    let attached = get_arg("--cdp-url");
+    // 自拉 Chromium 启动时接入自己的虚拟声卡；挂靠无法改变现有进程的输出。
+    let audio = if serves_http && attached.is_none() {
+        pulse::PulseAudio::start(get_arg("--pulseaudio-dir").as_deref())
+            .await
+            .unwrap_or_else(|error| {
+                eprintln!("PulseAudio unavailable: {error}");
+                None
+            })
+    } else {
+        None
+    };
+    let pulse_server = audio.as_ref().map(|instance| instance.server().to_owned());
+    let pulse = Arc::new(Mutex::new(audio));
 
     // Upload 只允许取自该目录（人要给 AI 传文件，把文件放进来）：给了
     // --cache-dir 用其下 uploads/；没给则用本进程的一次性临时目录
@@ -445,39 +459,41 @@ async fn main() {
         Some(d) => std::path::Path::new(d).join("uploads"),
         None => std::env::temp_dir().join(format!("rig-edge-{}-uploads", std::process::id())),
     };
-    std::fs::create_dir_all(&upload_root).expect("创建上传目录失败");
+    std::fs::create_dir_all(&upload_root).expect("failed to create upload directory");
     // 没有专门指定的目录都是本进程的一次性临时目录：退出时清理，
     // 不在磁盘上留登录态/下载的文件（SIGKILL 无法兜底）
     let mut temp_dirs: Vec<std::path::PathBuf> = vec![media::hls_dir()];
     if cache_dir.is_none() {
         temp_dirs.push(upload_root.clone());
     }
-    if profile_dir.is_none() && get_arg("--cdp-url").is_none() {
+    if profile_dir.is_none() && attached.is_none() {
         temp_dirs.push(browser::temp_profile_dir());
     }
 
     // 浏览器来源二选一：--cdp-url 挂靠现成 Chromium（client 与浏览器分开，
     // 边缘退出不杀它），或自拉一个无头 Chromium。
-    let attached = get_arg("--cdp-url");
     let browser = if let Some(u) = &attached {
-        Browser::attach(u).await.expect("挂靠 Chromium 失败")
+        Browser::attach(u)
+            .await
+            .expect("failed to attach to Chromium")
     } else {
         Browser::launch(
-            get_arg("--chromium").as_deref(),
+            get_arg("--chromium-dir").as_deref(),
             width,
             height,
             start_url.as_deref(),
             profile_dir.as_deref(),
             cache_dir.as_deref(),
+            pulse_server.as_deref(),
         )
         .await
-        .expect("启动 Chromium 失败")
+        .expect("failed to launch Chromium")
     };
     if attached.is_none() {
         eprintln!(
             "rig-edge-browser: profile={} cache={}",
-            profile_dir.as_deref().unwrap_or("(临时)"),
-            cache_dir.as_deref().unwrap_or("(profile 内)"),
+            profile_dir.as_deref().unwrap_or("(temporary)"),
+            cache_dir.as_deref().unwrap_or("(inside profile)"),
         );
     }
     eprintln!("rig-edge-browser: uploads={}", upload_root.display());
@@ -490,7 +506,7 @@ async fn main() {
             // 不再 navigate（避免历史里多一条 about:blank）；
             // 挂靠模式才需要把现成浏览器带到起始页。
             if attached.is_some() {
-                let main = browser.main().await.expect("主会话");
+                let main = browser.main().await.expect("main session");
                 let _ = browser.navigate(&main, url).await;
                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             }
@@ -521,11 +537,11 @@ async fn main() {
                 use std::net::ToSocketAddrs;
                 match v.to_socket_addrs().and_then(|mut it| {
                     it.next().ok_or_else(|| {
-                        std::io::Error::new(std::io::ErrorKind::NotFound, "无解析结果")
+                        std::io::Error::new(std::io::ErrorKind::NotFound, "no resolved address")
                     })
                 }) {
                     Ok(a) => stun.push(a),
-                    Err(e) => eprintln!("[rtc] --stun {v} 解析失败，跳过: {e}"),
+                    Err(e) => eprintln!("[rtc] --stun {v} could not be resolved, skipping: {e}"),
                 }
             }
         }
@@ -542,15 +558,18 @@ async fn main() {
     let app = Arc::new(App {
         ai: AiChannel::new(browser.clone(), origins, exec.clone())
             .with_upload_root(&upload_root)
-            .expect("上传目录不可用"),
+            .expect("upload directory unavailable"),
         exec,
-        media: Arc::new(media::MediaPipeline::new(human.clone())),
-        rtc: rtc::RtcHub::new(human.clone(), stun),
+        media: Arc::new(media::MediaPipeline::new(
+            human.clone(),
+            pulse_server.clone(),
+        )),
+        rtc: rtc::RtcHub::new(human.clone(), stun, pulse_server.clone()),
         dom: dom::DomChannel::new(browser.clone(), human.clone()),
         listen_ip,
         human,
         browser,
-        av_capable,
+        audio_available: pulse_server.is_some(),
         gate_ai: AtomicBool::new(ai_default),
         gate_human: watch::channel(human_default).0,
         gate_transition: Mutex::new(()),
@@ -563,12 +582,12 @@ async fn main() {
     if human_default {
         if let Err(e) = app.human.start().await {
             // R-11：启动失败如实降级——gate 不报已启用，错误可查
-            eprintln!("人通道启动失败: {e}");
+            eprintln!("failed to start the human channel: {e}");
             app.gate_human.send_replace(false);
             *app.human_error.lock().unwrap() = Some(e);
             app.human.set_gate_display(ai_default, false).await;
         }
-        if av_default && av_capable && app.human_enabled() {
+        if av_default && app.human_enabled() {
             app.media.apply_wanted(true).await;
         }
     }
@@ -605,7 +624,7 @@ async fn main() {
         // 人通道要开时 HTTP 并行跑（仅供观看页）。stdout 只写协议帧，
         // 本分支的提示一律走 stderr。stdin 关闭（智能体退出）即收尾。
         let http = if human_default {
-            let addr: std::net::SocketAddr = listen.parse().expect("监听地址无效");
+            let addr: std::net::SocketAddr = listen.parse().expect("invalid listen address");
             let svc = router.into_make_service_with_connect_info::<std::net::SocketAddr>();
             eprintln!(
                 "rig-edge-browser: stdio (MCP) + human viewer on {}://{listen}",
@@ -626,15 +645,17 @@ async fn main() {
             // Chromium 落盘关闭再退出，不等 stdin 关闭
             let app_sig = app.clone();
             let temp_sig = temp_dirs.clone();
+            let pulse_sig = pulse.clone();
             tokio::spawn(async move {
                 let mut term =
                     tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                        .expect("注册 SIGTERM 处理失败");
+                        .expect("failed to register SIGTERM handler");
                 tokio::select! {
                     _ = tokio::signal::ctrl_c() => {}
                     _ = term.recv() => {}
                 }
                 app_sig.browser.shutdown().await;
+                drop(pulse_sig.lock().await.take());
                 remove_temp_dirs(&temp_sig);
                 std::process::exit(0);
             });
@@ -644,7 +665,7 @@ async fn main() {
             h.abort();
         }
     } else {
-        let addr: std::net::SocketAddr = listen.parse().expect("监听地址无效");
+        let addr: std::net::SocketAddr = listen.parse().expect("invalid listen address");
         let svc = router.into_make_service_with_connect_info::<std::net::SocketAddr>();
         let handle = axum_server::Handle::new();
         {
@@ -657,7 +678,7 @@ async fn main() {
                 // 会把边缘连同未落盘的登录态一起带走。
                 let mut term =
                     tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                        .expect("注册 SIGTERM 处理失败");
+                        .expect("failed to register SIGTERM handler");
                 tokio::select! {
                     _ = tokio::signal::ctrl_c() => {}
                     _ = term.recv() => {}
@@ -678,9 +699,10 @@ async fn main() {
             }
             None => axum_server::bind(addr).handle(handle).serve(svc).await,
         };
-        r.expect("服务异常退出");
+        r.expect("server exited abnormally");
     }
     app.browser.shutdown().await;
+    drop(pulse.lock().await.take());
     remove_temp_dirs(&temp_dirs);
 }
 
@@ -856,7 +878,7 @@ async fn apply_gate_flags(app: &Arc<App>, ai: Option<bool>, human: Option<bool>,
                     app.gate_human.send_replace(true);
                 }
                 Err(e) => {
-                    eprintln!("人通道启动失败: {e}");
+                    eprintln!("failed to start the human channel: {e}");
                     *app.human_error.lock().unwrap() = Some(e);
                 }
             }
@@ -878,7 +900,7 @@ async fn apply_gate_flags(app: &Arc<App>, ai: Option<bool>, human: Option<bool>,
         }
     }
     if let Some(av) = av {
-        if !av || app.av_capable && app.human_enabled() {
+        if !av || app.human_enabled() {
             app.media.apply_wanted(av).await;
         }
     }
@@ -1079,7 +1101,7 @@ impl ConnSubs {
     }
 }
 
-fn rtc_tracks(v: &serde_json::Value) -> rtc::TrackDemand {
+fn rtc_tracks(app: &App, v: &serde_json::Value) -> rtc::TrackDemand {
     let wanted = |key| {
         v.get(key)
             .and_then(serde_json::Value::as_bool)
@@ -1087,7 +1109,7 @@ fn rtc_tracks(v: &serde_json::Value) -> rtc::TrackDemand {
     };
     rtc::TrackDemand {
         video: wanted("video"),
-        audio: wanted("audio"),
+        audio: app.audio_available && wanted("audio"),
     }
 }
 
@@ -1348,12 +1370,12 @@ async fn ws_session(
                             dom_wanted: subs2.dom_held.clone(),
                             gate: recv_gate.clone(),
                         },
-                        rtc_tracks(&v),
+                        rtc_tracks(&app2, &v),
                     ));
                 }
                 Some("rtc-demand") => {
                     if let Some(s) = &rtc_session {
-                        s.set_demand(rtc_tracks(&v)).await;
+                        s.set_demand(rtc_tracks(&app2, &v)).await;
                     }
                 }
                 Some("mode-summary") => {
@@ -1533,7 +1555,7 @@ async fn mcp_dispatch(
         "ping" => Ok((json!({}), false)),
         "tools/list" => Ok((json!({"tools": mcp_tools()}), false)),
         "tools/call" => Ok(mcp_call(app, params).await),
-        _ => Err((-32601, format!("未知方法: {method}"))),
+        _ => Err((-32601, format!("unknown method: {method}"))),
     }
 }
 
@@ -1541,18 +1563,18 @@ fn mcp_tools() -> serde_json::Value {
     json!([
         {
             "name": "observe",
-            "description": "观察当前页面：返回紧凑文本渲染与完整语义快照（Observation JSON）。动手前先观察，动作引用快照里的元素 id 与 frame_id。可选参数（ObserveRequest）：mode='text' 只回文本视图（最省）、'tree' 树+文本（默认）、'tree_image' 再附编号截图；budget_tokens 按预算裁剪响应视图（被裁元素仍可凭 id 操作）；subtree 只回某元素的子树；include_offscreen=true 才带视口外元素（默认不带）；since_frame 使用客户端最后收到并应用的观察帧号。页面、坐标空间与投影相容时回增量（摘要和 ObservationDelta JSON），否则回完整快照。",
+            "description": "Observe the current page: returns a compact text rendering and a full semantic snapshot (Observation JSON). Observe before acting; actions reference element ids and the frame_id from the snapshot. Optional parameters (ObserveRequest): mode='text' returns only the text view (cheapest), 'tree' returns tree + text (default), 'tree_image' additionally attaches a numbered screenshot; budget_tokens trims the response view to a budget (trimmed elements can still be operated on by id); subtree returns only the subtree of one element; include_offscreen=true also includes elements outside the viewport (default: not included); since_frame is the last observation frame number the client received and applied. When the page, coordinate space and projection are compatible, an incremental result (summary and ObservationDelta JSON) is returned, otherwise a full snapshot.",
             "inputSchema": {"type": "object", "properties": {"mode": {"type": "string", "enum": ["text", "tree", "tree_image"]}, "budget_tokens": {"type": "integer", "minimum": 0}, "subtree": {"type": "string"}, "since_frame": {"type": "integer", "minimum": 0}, "include_offscreen": {"type": "boolean"}}, "additionalProperties": false}
         },
         {
             "name": "act",
-            "description": "执行一个动作。参数为 ActionRequest：{frame_id, action}。action 示例：{kind:'click', target:{by:'element', id:'e3'}}、{kind:'type', target:{by:'element', id:'e3'}, text:'内容', submit:false}、{kind:'key', key:'Control+A'}、{kind:'navigate', url:'https://…'}、{kind:'scroll', dx:0, dy:600}、{kind:'upload', target:{by:'element', id:'e3'}, files:['a.pdf']}（给文件框喂文件；只能取自边缘的上传目录，相对名按该目录解析，目录外一律拒绝）。frame_id 用最近一次 observe 的帧号，页面变化后陈旧帧会被拒（重新 observe 即可）。",
+            "description": "Perform one action. Parameters are an ActionRequest: {frame_id, action}. Action examples: {kind:'click', target:{by:'element', id:'e3'}}, {kind:'type', target:{by:'element', id:'e3'}, text:'content', submit:false}, {kind:'key', key:'Control+A'}, {kind:'navigate', url:'https://…'}, {kind:'scroll', dx:0, dy:600}, {kind:'upload', target:{by:'element', id:'e3'}, files:['a.pdf']} (feeds files to a file input; files must come from the edge's upload directory, relative names are resolved against it, anything outside it is rejected). Use the frame_id of the most recent observe; a stale frame is rejected once the page has changed (just observe again).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "frame_id": {"type": "integer"},
                     "action": {"type": "object"},
-                    "request_id": {"type": "string", "description": "可选；用于幂等与追踪，缺省时边缘自动生成"}
+                    "request_id": {"type": "string", "description": "Optional; for idempotency and tracing. Generated by the edge when omitted"}
                 },
                 "required": ["frame_id", "action"],
                 "additionalProperties": false
@@ -1560,7 +1582,7 @@ fn mcp_tools() -> serde_json::Value {
         },
         {
             "name": "screenshot",
-            "description": "截取当前页面的编号 PNG 截图（敏感区域已涂黑）。无语义区域（canvas 等）兜底用。",
+            "description": "Capture a numbered PNG screenshot of the current page (sensitive areas are blacked out). Fallback for regions without semantics (canvas, etc.).",
             "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false}
         }
     ])
@@ -1578,7 +1600,7 @@ async fn mcp_call(app: &Arc<App>, params: &serde_json::Value) -> (serde_json::Va
         .unwrap_or(serde_json::Value::Null);
     let err = |m: String| json!({"content": [{"type": "text", "text": m}], "isError": true});
     if !app.gate_ai.load(Ordering::SeqCst) {
-        return (err("AI 通道已关闭".into()), false);
+        return (err("AI channel is disabled".into()), false);
     }
     let (result, taken) = match name {
         "observe" => {
@@ -1587,7 +1609,12 @@ async fn mcp_call(app: &Arc<App>, params: &serde_json::Value) -> (serde_json::Va
             } else {
                 match serde_json::from_value(args.clone()) {
                     Ok(r) => r,
-                    Err(e) => return (err(format!("observe 参数不合协议: {e}")), false),
+                    Err(e) => {
+                        return (
+                            err(format!("observe arguments do not match the protocol: {e}")),
+                            false,
+                        )
+                    }
                 }
             };
             match app.ai.observe_req(&oreq).await {
@@ -1647,7 +1674,7 @@ async fn mcp_call(app: &Arc<App>, params: &serde_json::Value) -> (serde_json::Va
                     ];
                     if taken {
                         // 契约里的 Aborted 不变；停止指示以附加文本块给到智能体
-                        content.push(json!({"type": "text", "text": "用户已强制接管浏览器：请停止原任务，不要重试已中断的动作，等待用户的新指示后再重新 observe。"}));
+                        content.push(json!({"type": "text", "text": "The user has forcibly taken over the browser: stop the current task, do not retry the interrupted action, and wait for the user's new instructions before observing again."}));
                     }
                     // 被拒时附最新帧文本视图（第二个文本块）
                     match fresh {
@@ -1668,7 +1695,7 @@ async fn mcp_call(app: &Arc<App>, params: &serde_json::Value) -> (serde_json::Va
                     }
                     (json!({"content": content, "isError": false}), taken)
                 }
-                Err(e) => (err(format!("ActionRequest 解析失败: {e}")), false),
+                Err(e) => (err(format!("failed to parse ActionRequest: {e}")), false),
             }
         }
         "screenshot" => match app.ai.marked_screenshot().await {
@@ -1685,7 +1712,7 @@ async fn mcp_call(app: &Arc<App>, params: &serde_json::Value) -> (serde_json::Va
             }
             Err(e) => (err(e), false),
         },
-        _ => (err(format!("未知工具: {name}")), false),
+        _ => (err(format!("unknown tool: {name}")), false),
     };
     (result, taken)
 }

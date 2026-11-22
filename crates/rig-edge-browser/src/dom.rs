@@ -77,7 +77,12 @@ const SCRIPT: &str = r##"(() => {
     if (tag === 'SCRIPT' || tag === 'NOSCRIPT') return null;
     if (tag === 'CANVAS') {
       const r = node.getBoundingClientRect();
-      return { i: id, g: 'CANVAS', a: {}, c: [], rect: [Math.round(r.width), Math.round(r.height)] };
+      const cv = { i: id, g: 'CANVAS', a: {}, c: [], rect: [Math.round(r.width), Math.round(r.height)] };
+      // 单边 >1024px 的画布（游戏画面）走区域子流，快照式 canvas 子流有尺寸上限
+      if (node.width > CANVAS_SNAP_MAX || node.height > CANVAS_SNAP_MAX) {
+        cv.big = 1; cv.disp = getComputedStyle(node).display;
+      }
+      return cv;
     }
     const attrs = {};
     for (const at of node.attributes) { if (!/^on/i.test(at.name)) attrs[at.name] = at.value; }
@@ -261,6 +266,7 @@ const SCRIPT: &str = r##"(() => {
   // canvas toDataURL 抛错，标记 dead 不再重试。尺寸上限 1024，
   // 且单帧 data URL 超过约 1.5MB（照片级内容）不发——子流是
   // 语义补充不是视频通道，大帧会挤占差分通道。
+  const CANVAS_SNAP_MAX = 1024;
   function blankRef(w, h) {
     const key = w + 'x' + h;
     if (!S.blanks.has(key)) {
@@ -276,7 +282,7 @@ const SCRIPT: &str = r##"(() => {
     for (const [id, node] of S.byId) {
       if (S.dead.has(id) || !node || node.tagName !== 'CANVAS' || !node.isConnected) continue;
       const w = node.width, h = node.height;
-      if (!w || !h || w > 1024 || h > 1024) continue;
+      if (!w || !h || w > CANVAS_SNAP_MAX || h > CANVAS_SNAP_MAX) continue;
       let d;
       try { d = node.toDataURL('image/png'); } catch (e) { S.dead.add(id); continue; }
       if (d.length > 1500000) continue;
@@ -392,8 +398,8 @@ const SCRIPT: &str = r##"(() => {
   // video 带 p（播放中）与 ct（当前时刻，停稳签名用）。
   function regions() {
     const out = [];
-    let frames, videos;
-    try { frames = document.querySelectorAll('iframe'); videos = document.querySelectorAll('video'); }
+    let frames, videos, canvases;
+    try { frames = document.querySelectorAll('iframe'); videos = document.querySelectorAll('video'); canvases = document.querySelectorAll('canvas'); }
     catch (e) { return out; }
     for (const f of frames) {
       let cross = false;
@@ -407,6 +413,14 @@ const SCRIPT: &str = r##"(() => {
       const r = v.getBoundingClientRect();
       if (r.width < 8 || r.height < 8) continue;
       out.push({ i: rid(v), k: 'v', x: Math.round(r.left), y: Math.round(r.top), w: Math.round(r.width), h: Math.round(r.height), p: (!v.paused && !v.ended) ? 1 : 0, ct: Math.round((v.currentTime || 0) * 10) });
+    }
+    // 大画布（游戏画面）：快照式 canvas 子流有尺寸上限、WebGL 读不出像素，
+    // 这里让边缘按 rect 对页面表面截图，能覆盖一切渲染方式
+    for (const c of canvases) {
+      if (!(c.width > CANVAS_SNAP_MAX || c.height > CANVAS_SNAP_MAX)) continue;
+      const r = c.getBoundingClientRect();
+      if (r.width < 8 || r.height < 8) continue;
+      out.push({ i: rid(c), k: 'c', x: Math.round(r.left), y: Math.round(r.top), w: Math.round(r.width), h: Math.round(r.height) });
     }
     return out;
   }
@@ -592,7 +606,7 @@ impl DomChannel {
             self.refresh(&s).await;
         } else if first {
             self.broadcast(
-                json!({"type": "dom-state", "state": "error", "reason": "人通道未启动"}),
+                json!({"type": "dom-state", "state": "error", "reason": "human channel is not running"}),
             );
         }
     }
@@ -767,6 +781,9 @@ impl DomChannel {
                 Some((ps, at)) => {
                     if k == "x" {
                         ps != &sig || at.elapsed() > Duration::from_millis(1200)
+                    } else if k == "c" {
+                        // 大画布内容随时可能在动（游戏），约 4fps 刷新
+                        at.elapsed() > Duration::from_millis(250)
                     } else if playing {
                         at.elapsed() > Duration::from_millis(150)
                     } else {
@@ -869,7 +886,7 @@ impl DomChannel {
         if let Ok(u) = self.browser.eval_json(session, "location.href").await {
             if let Some(u) = u.as_str() {
                 if is_internal_url(u) {
-                    self.broadcast(json!({"type": "dom-state", "state": "error", "reason": "浏览器内部页面不支持 DOM 镜像，已切视频模式"}));
+                    self.broadcast(json!({"type": "dom-state", "state": "error", "reason": "Browser internal pages do not support DOM mirroring; switched to video mode"}));
                     return;
                 }
             }
@@ -893,10 +910,10 @@ impl DomChannel {
                 self.broadcast(Value::Object(snap));
             }
             Ok(_) => {
-                self.broadcast(json!({"type": "dom-state", "state": "error", "reason": "页面无序列化器（特殊页面不支持 DOM 镜像）"}));
+                self.broadcast(json!({"type": "dom-state", "state": "error", "reason": "Page has no serializer (special pages do not support DOM mirroring)"}));
             }
             Err(e) => {
-                self.broadcast(json!({"type": "dom-state", "state": "error", "reason": format!("快照失败: {e}")}));
+                self.broadcast(json!({"type": "dom-state", "state": "error", "reason": format!("snapshot failed: {e}")}));
             }
         }
     }

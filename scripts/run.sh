@@ -8,11 +8,23 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 T="${CARGO_TARGET_DIR:-$PWD/target}"
 # 取 release / debug 里**更新**的那个，避免跑到过期的旧构建
-BIN="$(ls -t "$T/release/rig-edge-browser" "$T/debug/rig-edge-browser" 2>/dev/null | head -1 || true)"
-[ -n "$BIN" ] && [ -x "$BIN" ] || { echo "先编译：scripts/build.sh" >&2; exit 1; }
+BIN=
+for candidate in "$T"/{release,debug}/rig-edge-browser; do
+  if [[ -x "$candidate" && ( -z "$BIN" || "$candidate" -nt "$BIN" ) ]]; then
+    BIN="$candidate"
+  fi
+done
+[ -n "$BIN" ] || { echo "Build first: scripts/build.sh" >&2; exit 1; }
+scheme=http
+for arg in "$@"; do
+  case "$arg" in
+    --listen|--token) echo "Use PORT and RIG_EDGE_TOKEN to configure this launcher." >&2; exit 2 ;;
+    --tls-cert) scheme=https ;;
+  esac
+done
 PORT="${PORT:-39871}"
 TOKEN="${RIG_EDGE_TOKEN:-$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')}"
-echo "地址： http://127.0.0.1:$PORT/"
-echo "令牌： $TOKEN"
-echo "二进制：$BIN"
-exec "$BIN" --listen "127.0.0.1:$PORT" --token "$TOKEN" --human "$@"
+echo "URL:    $scheme://127.0.0.1:$PORT/" >&2
+if [ -z "${RIG_EDGE_TOKEN:-}" ]; then echo "Token:  $TOKEN" >&2; fi
+echo "Binary: $BIN" >&2
+RIG_EDGE_TOKEN="$TOKEN" exec "$BIN" --listen "127.0.0.1:$PORT" --human "$@"

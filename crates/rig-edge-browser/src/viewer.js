@@ -65,7 +65,7 @@ ws.onmessage = (ev) => {
   if (m.type === 'dom-snapshot' || m.type === 'dom-delta' || m.type === 'dom-state' || m.type === 'dom-canvas' || m.type === 'dom-region' || m.type === 'dom-chunk') {
     __domStats.ws++; domFeed(m);
   }
-  if (m.type === 'ghost') { showGhost(m); if (tookOver) { tookOver = false; toast('AI 已恢复控制'); } }
+  if (m.type === 'ghost') { showGhost(m); if (tookOver) { tookOver = false; toast('AI has resumed control'); } }
   if (m.type === 'ghost-off') hideGhost();
   /* T01：边缘 DC 待发队列丢弃旧代次后请求重同步，观看端回发 dom-resync */
   if (m.type === 'dom-resync-needed') send({type:'dom-resync'});
@@ -137,7 +137,7 @@ function handleDomMessage(m) {
   if (m.type === 'dom-delta' && domOn) applyDelta(m);
   if (m.type === 'dom-canvas' && domOn) applyCanvas(m);
   if (m.type === 'dom-region' && domOn) applyRegion(m);
-  if (m.type === 'dom-state' && m.state === 'error' && domOn) domFallback(m.reason || '边缘错误');
+  if (m.type === 'dom-state' && m.state === 'error' && domOn) domFallback(m.reason || 'edge error');
 }
 /* 区域子流帧：跨源 iframe / video 占位块贴图（带外子流，无 seq；
    占位块不在当前镜像里就只进缓存，等下次建节点时贴上） */
@@ -409,10 +409,10 @@ ime.addEventListener('paste', e => {
    时弹手动复制框（文本已填好选好）。粘贴靠真实 paste 事件
    （clipboardData 直送），与安全上下文无关。 */
 function deliverLocalText(text) {
-  if (!text) { flashHint('没有选中的文字'); return; }
+  if (!text) { flashHint('No text selected'); return; }
   if (navigator.clipboard && navigator.clipboard.writeText) {
     navigator.clipboard.writeText(text)
-      .then(() => flashHint('已复制 ' + text.length + ' 字'))
+      .then(() => flashHint('Copied ' + text.length + ' characters'))
       .catch(() => showCopyBox(text));
   } else showCopyBox(text);
 }
@@ -429,7 +429,7 @@ function deliverLocalImage(b64) {
     const bytes = new Uint8Array(bin.length);
     for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
     navigator.clipboard.write([new ClipboardItem({'image/png': new Blob([bytes], {type: 'image/png'})})])
-      .then(() => flashHint('已复制图片'))
+      .then(() => flashHint('Image copied'))
       .catch(() => {});
   } catch (e) {}
 }
@@ -439,12 +439,12 @@ function showCopyBox(text) {
     copyBoxEl = document.createElement('div');
     copyBoxEl.id = 'copyBox';
     const tip = document.createElement('div');
-    tip.textContent = '自动写入剪贴板不可用，请手动复制（已全选，Ctrl+C 后关闭）：';
+    tip.textContent = 'Automatic clipboard write is unavailable. Copy manually (text is selected; press Ctrl+C, then close):';
     tip.style.marginBottom = '6px';
     const ta = document.createElement('textarea');
     ta.rows = 4; ta.style.width = '100%'; ta.readOnly = true;
     const btn = document.createElement('button');
-    btn.type = 'button'; btn.textContent = '关闭';
+    btn.type = 'button'; btn.textContent = 'Close';
     btn.style.marginTop = '6px';
     btn.onclick = () => { copyBoxEl.style.display = 'none'; ime.focus(); };
     copyBoxEl.append(tip, ta, btn);
@@ -516,7 +516,7 @@ function openCtx(cx, cy, hit, source = document.activeElement, keyboard = false)
   const menu = document.createElement('div');
   menu.id = 'ctxMenu';
   menu.setAttribute('role', 'menu');
-  menu.setAttribute('aria-label', '页面操作');
+  menu.setAttribute('aria-label', 'Page actions');
   const add = (label, fn) => {
     const b = document.createElement('button');
     b.type = 'button'; b.textContent = label;
@@ -524,25 +524,25 @@ function openCtx(cx, cy, hit, source = document.activeElement, keyboard = false)
     b.onclick = () => { closeCtx(true); fn(); };
     menu.appendChild(b);
   };
-  add('复制', () => { if (domOn) copyMirrorSelection(); else requestCopy(); });
-  add('粘贴', async () => {
+  add('Copy', () => { if (domOn) copyMirrorSelection(); else requestCopy(); });
+  add('Paste', async () => {
     const t = await readLocalClipText();
     if (t) { send({type:'text', ...(domOn ? {dom:true} : {}), text: t}); return; }
-    flashHint('请按 Ctrl+V 粘贴');
+    flashHint('Press Ctrl+V to paste');
     ime.focus();
   });
-  add('全选', selectPage);
-  add('自动模式：' + (modeAuto ? '开' : '关'), () => {
+  add('Select all', selectPage);
+  add('Auto mode: ' + (modeAuto ? 'on' : 'off'), () => {
     modeAuto = !modeAuto;
     resetAutoMode();
-    if (modeAuto) { requestModeSummary(); flashHint('自动模式已开'); }
-    else flashHint('自动模式已关');
+    if (modeAuto) { requestModeSummary(); flashHint('Auto mode on'); }
+    else flashHint('Auto mode off');
   });
   /* 导航走 chrome 命令（双模式同一路；旧实现 DOM 模式走 nav
      消息、视频模式发 Alt+←/F5 和弦模拟，口径不一） */
-  add('后退', () => chromeCmd('back'));
-  add('前进', () => chromeCmd('forward'));
-  add('重新加载', () => chromeCmd('reload'));
+  add('Back', () => chromeCmd('back'));
+  add('Forward', () => chromeCmd('forward'));
+  add('Reload', () => chromeCmd('reload'));
   menu.style.left = cx + 'px'; menu.style.top = cy + 'px';
   document.body.appendChild(menu);
   const r = menu.getBoundingClientRect();
@@ -562,14 +562,14 @@ function onImageAt(data) {
   if (!ctxEl || !data) return;
   if (ctxEl.querySelector('[data-act="copyimg"]')) return;
   const b = document.createElement('button');
-  b.type = 'button'; b.textContent = '复制图片'; b.setAttribute('data-act', 'copyimg');
+  b.type = 'button'; b.textContent = 'Copy image'; b.setAttribute('data-act', 'copyimg');
   b.tabIndex = -1; b.setAttribute('role', 'menuitem');
   b.onclick = () => {
     closeCtx(true);
-    if (!(navigator.clipboard && navigator.clipboard.write)) { flashHint('此环境不支持复制图片'); return; }
+    if (!(navigator.clipboard && navigator.clipboard.write)) { flashHint('Copying images is not supported in this environment'); return; }
     fetch('data:image/png;base64,' + ctxImgData).then(r => r.blob()).then(blob =>
       navigator.clipboard.write([new ClipboardItem({'image/png': blob})])
-        .then(() => flashHint('图片已复制')).catch(() => flashHint('复制图片失败')));
+        .then(() => flashHint('Image copied')).catch(() => flashHint('Failed to copy the image')));
   };
   ctxEl.appendChild(b);
 }
@@ -811,7 +811,7 @@ let lastDomStat = '';
 function setPill(t) {
   lastDomStat = t;
   dpill.textContent = t;
-  dpill.style.display = (domOn && t && t !== 'DOM 镜像中') ? 'block' : 'none';
+  dpill.style.display = (domOn && t && t !== 'DOM mirroring') ? 'block' : 'none';
 }
 let domOn = false, domSeq = 0, domResyncBusy = false, domTimer = 0;
 /* 镜像焦点记忆（rig 节点 id + 输入选区）：快照换 documentElement、
@@ -911,9 +911,9 @@ function applyModeSummary(m) {
   autoFlips++;
   lastAutoSwitch = now;
   if (wantDom) {
-    domStart(true); flashHint('自动模式：已切换到 DOM');
+    domStart(true); flashHint('Auto mode: switched to DOM');
   } else {
-    domStop(true); flashHint('自动模式：已切换到视频');
+    domStop(true); flashHint('Auto mode: switched to video');
   }
 }
 setInterval(requestModeSummary, 1000);
@@ -927,9 +927,9 @@ function domStart(auto) {
   showDisplay();
   send({type:'dom-start'});
   rtcStart();
-  setPill('等待快照…');
+  setPill('Waiting for snapshot…');
   clearTimeout(domTimer);
-  domTimer = setTimeout(() => { if (domOn && !mirMap.size) domFallback('快照超时'); }, 8000);
+  domTimer = setTimeout(() => { if (domOn && !mirMap.size) domFallback('Snapshot timed out'); }, 8000);
 }
 function domStop(silent) {
   if (!domOn) return;
@@ -1001,7 +1001,7 @@ function placeGhost() {
 }
 function domFallback(why) {
   domStop(true);
-  setPill('DOM 镜像不可用：' + why);
+  setPill('DOM mirror unavailable: ' + why);
   rtcStart();
 }
 /* 区域子流占位块：跨源 iframe（序列化读不到内容）与 video 元素
@@ -1059,7 +1059,7 @@ function regionBox(n, doc) {
 function buildNode(n, doc) {
   if (n.t !== undefined) { const tn = doc.createTextNode(n.t); tn.__rigId = n.i; mirMap.set(n.i, tn); return tn; }
   let el;
-  if ((n.g === 'IFRAME' && n.x) || n.g === 'VIDEO') {
+  if ((n.g === 'IFRAME' && n.x) || n.g === 'VIDEO' || (n.g === 'CANVAS' && n.big)) {
     el = regionBox(n, doc);
     el.__rigId = n.i;
     mirMap.set(n.i, el);
@@ -1143,7 +1143,7 @@ function applySnapshot(m) {
   placeGhost();
   domSeq = m.seq; domResyncBusy = false;
   clearTimeout(domTimer);
-  setPill('DOM 镜像中');
+  setPill('DOM mirroring');
 }
 function applyDelta(m) {
   if (m.seq !== domSeq + 1) {
@@ -1386,10 +1386,10 @@ function renderTabs(st) {
     }
     const ttl = document.createElement('span');
     ttl.className = 'ttl';
-    ttl.textContent = t.title || t.url || '新标签页';
+    ttl.textContent = t.title || t.url || 'New tab';
     const cls = document.createElement('button');
     cls.className = 'cls';
-    cls.title = '关闭标签页';
+    cls.title = 'Close tab';
     cls.appendChild(svgIcon(ICO.close));
     cls.addEventListener('mousedown', (e) => e.stopPropagation());
     cls.addEventListener('click', (e) => { e.stopPropagation(); chromeCmd('close-tab', { index: i }); });
@@ -1409,7 +1409,7 @@ function applyChromeState(m) {
   backBtn.disabled = !m.canBack;
   fwdBtn.disabled = !m.canFwd;
   reloadBtn.replaceChildren(svgIcon(m.loading ? ICO.stop : ICO.reload));
-  reloadBtn.title = m.loading ? '停止加载' : '重新加载';
+  reloadBtn.title = m.loading ? 'Stop loading' : 'Reload';
   loadbar.classList.toggle('go', !!m.loading);
   const at = (m.tabs || [])[m.active || 0];
   const page = m.active + ':' + (at?.url || '');
@@ -1481,20 +1481,20 @@ function buildMenu() {
     menuEl.appendChild(b);
   };
   const sep = () => menuEl.appendChild(document.createElement('hr'));
-  item('在页面中查找', openFind, { sc: 'Ctrl+F' });
-  item('新建标签页', () => chromeCmd('new-tab'));
-  item('下载', () => chromeCmd('open-internal', { url: 'chrome://downloads' }));
-  item('扩展', () => chromeCmd('open-internal', { url: 'chrome://extensions' }));
-  item('历史记录', () => chromeCmd('open-internal', { url: 'chrome://history' }));
-  item('设置', () => chromeCmd('open-internal', { url: 'chrome://settings' }));
-  item('打印…', () => chromeCmd('print'));
+  item('Find in page', openFind, { sc: 'Ctrl+F' });
+  item('New tab', () => chromeCmd('new-tab'));
+  item('Downloads', () => chromeCmd('open-internal', { url: 'chrome://downloads' }));
+  item('Extensions', () => chromeCmd('open-internal', { url: 'chrome://extensions' }));
+  item('History', () => chromeCmd('open-internal', { url: 'chrome://history' }));
+  item('Settings', () => chromeCmd('open-internal', { url: 'chrome://settings' }));
+  item('Print…', () => chromeCmd('print'));
   sep();
-  item('分辨率：跟随窗口', () => chromeCmd('res-auto'), { checked: st.res === 'auto' });
-  item('分辨率：1280 × 800', () => chromeCmd('res-fixed', { w: 1280, h: 800 }), { checked: st.res === '1280x800' });
-  item('分辨率：1920 × 1080', () => chromeCmd('res-fixed', { w: 1920, h: 1080 }), { checked: st.res === '1920x1080' });
+  item('Resolution: follow window', () => chromeCmd('res-auto'), { checked: st.res === 'auto' });
+  item('Resolution: 1280 × 800', () => chromeCmd('res-fixed', { w: 1280, h: 800 }), { checked: st.res === '1280x800' });
+  item('Resolution: 1920 × 1080', () => chromeCmd('res-fixed', { w: 1920, h: 1080 }), { checked: st.res === '1920x1080' });
   sep();
-  item('AI 通道', () => chromeCmd('toggle-ai'), { checked: !!st.gateAi });
-  item('人通道', () => chromeCmd('toggle-human'), { checked: !!st.gateHuman });
+  item('AI channel', () => chromeCmd('toggle-ai'), { checked: !!st.gateAi });
+  item('Human channel', () => chromeCmd('toggle-human'), { checked: !!st.gateHuman });
 }
 document.getElementById('menuBtn').onclick = (e) => {
   e.stopPropagation();

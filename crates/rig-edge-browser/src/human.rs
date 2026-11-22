@@ -567,7 +567,7 @@ impl HumanChannel {
             .lock()
             .await
             .clone()
-            .ok_or_else(|| "人通道未启动".to_string())
+            .ok_or_else(|| "human channel is not running".to_string())
     }
 
     // ── 启停与帧泵 ──────────────────────────────────────────
@@ -603,7 +603,7 @@ impl HumanChannel {
                     if let Some(page) = wanted {
                         match human.start_frame_pump(page.clone()).await {
                             Ok(task) => pump = Some((page, task)),
-                            Err(e) => eprintln!("整页采集启动失败: {e}"),
+                            Err(e) => eprintln!("failed to start full-page capture: {e}"),
                         }
                     }
                 }
@@ -675,7 +675,7 @@ impl HumanChannel {
                     .map(|v| v != "0")
                     .unwrap_or(false);
                 if full_only {
-                    eprintln!("[pump] RIG_PUMP_FULL_ONLY=1：内容帧全部丢弃，只用整页帧");
+                    eprintln!("[pump] RIG_PUMP_FULL_ONLY=1: all content frames are dropped; using full-page frames only");
                 }
                 let mut seeded = false;
                 loop {
@@ -718,7 +718,7 @@ impl HumanChannel {
                                 last_summary = std::time::Instant::now();
                                 let m = crate::metrics::global();
                                 eprintln!(
-                                    "[pump] 汇总 full={} content={} pasted={} dropped={} refetch={} last_rect={}",
+                                    "[pump] summary full={} content={} pasted={} dropped={} refetch={} last_rect={}",
                                     m.pump_full.load(std::sync::atomic::Ordering::Relaxed),
                                     m.pump_content.load(std::sync::atomic::Ordering::Relaxed),
                                     m.pump_pasted.load(std::sync::atomic::Ordering::Relaxed),
@@ -998,7 +998,7 @@ impl HumanChannel {
                             }
                             if should_rebase(unmatched.1, (w, h), gate_full, !gate_has_media) {
                                 eprintln!(
-                                    "[pump] 连续 {} 帧 {w}x{h} 无法归属任何矩形：整页基准 {}x{} 重定为新尺寸",
+                                    "[pump] {} consecutive {w}x{h} frames match no rectangle: full-page baseline {}x{} reset to the new size",
                                     unmatched.1, gate_full.0, gate_full.1
                                 );
                                 gate_full = (w, h);
@@ -1252,7 +1252,7 @@ impl HumanChannel {
             }
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
-        let session = session.ok_or_else(|| format!("标签 {target_id} 无会话"))?;
+        let session = session.ok_or_else(|| format!("tab {target_id} has no session"))?;
         *self.view_session.lock().await = Some(session.clone());
         self.browser.set_main(&session).await;
         let _ = self.browser.activate_target(target_id).await;
@@ -1839,9 +1839,9 @@ impl HumanChannel {
             let mut st = self.chrome.lock().await;
             if let Some(fs) = &mut st.find {
                 fs.info = if count > 0 {
-                    format!("{count} 处")
+                    format!("{count} matches")
                 } else {
-                    "无结果".to_string()
+                    "No results".to_string()
                 };
             }
         }
@@ -1967,7 +1967,7 @@ impl HumanChannel {
     pub async fn paste_image(&self, png_base64: &str) -> Result<(), String> {
         // 该串会拼进页面 JS，先验字母表与大小，杜绝字符串逃逸注入
         if !is_safe_base64(png_base64) {
-            return Err("paste-image 数据不是合法 base64 或超限".into());
+            return Err("paste-image data is not valid base64 or exceeds the size limit".into());
         }
         let session = self.view().await?;
         let js = format!(

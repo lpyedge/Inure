@@ -15,22 +15,15 @@ RIG 的**瀏覽器邊緣程序**：一個 Rust 二進位，與目標 Chromium �
   執行帶陳舊校驗的動作。語義優先；無語義區域（canvas 等）以編號 PNG 截圖兜底。
 - **人通道**：把瀏覽器畫面（及聲音）流給人看，並把人的滑鼠/鍵盤/剪貼板輸入送回頁面。
 
-邊緣程序是**直連本體**：本機或局域網即可獨立使用。經 Gateway 中轉只是可選的轉運
-通道（反向接入尚未實現，見 §11），不是使用前提。轉發中心永不抓取、渲染或解析——
-所有感知與呈現都發生在邊緣。
+邊緣程序是**直連本體**：同機或局域網即可使用。本倉庫不含 Gateway 或傳輸層。
 
-**定位定版（LIU 2026-11-19）**：本子項目自身即是完整產品——一個可獨立交付、
-獨立驗收的瀏覽器控制端，人與 AI 智能體直連即可用（形態見 §1.1）。
-受控端反向接入 Gateway 轉發是**擴展能力**（解決跨網路可達性），排在邊緣
-功能打磨之後；本子項目的任何功能、測試與發布都不以 Gateway 存在為前提。
-
-### 1.1 不經 Gateway 的完整用法（快速開始）
+### 1.1 直連使用（快速開始）
 
 | 消費者 | 形態 | 做法 |
 |---|---|---|
-| 人（同機） | 觀看頁 | `rig-edge-browser --url https://example.com` 後開 `http://127.0.0.1:39871/`：視頻/DOM 雙模式觀看與操作、原生 header、音視頻（HLS/RTC）都在這一頁 |
+| 人（同機） | 觀看頁 | `rig-edge-browser --human --token <令牌> --url https://example.com` 後開 `http://127.0.0.1:39871/` |
 | AI（同機） | MCP stdio | 智能體以子進程拉起 `rig-edge-browser --stdio`，JSON-RPC 協議見 §7；observe/act/screenshot 三工具 |
-| AI（局域網/遠程直連） | HTTP | `rig-edge-browser --listen 0.0.0.0:39871 --token <令牌>`（非回環無令牌拒絕啟動，見 §6）；`POST /observe`、`/act`、`/screenshot.png`（Bearer 啟動令牌） |
+| AI（局域網/遠程直連） | HTTP | `rig-edge-browser --listen 0.0.0.0:39871 --token <令牌>`；HTTP 需令牌，局域網使用 HTTPS，見 §6 |
 | 人+AI 協作 | 同時在線 | AI 通道與人通道可並存：交互模型（待命/執行/強制接管）見 §7.1，人隨時可接管 |
 
 四種形態共用同一份感知與動作語義（§10），差別只在傳輸與前端外殼。
@@ -56,6 +49,7 @@ RIG 的**瀏覽器邊緣程序**：一個 Rust 二進位，與目標 Chromium �
 | `snapshot.rs` | AX 快照引擎：全量樹遍歷、OOPIF 子幀掛接與坐標合成、ignored 透傳、generic 殼剪枝、穩定 id 分配、密碼子樹脫敏 |
 | `ai.rs` | AI 通道：observe（生成快照幀）/ act（陳舊校驗後執行 Action）/ 編號截圖 |
 | `human.rs` | 人通道：按需求啟停 CDP screencast、輸入事件注入、文本/圖片剪貼板橋 |
+| `pulse.rs` | 啟動和管理自有 PulseAudio daemon、私有 socket/運行目錄與 `rigsink`；失敗只影響音頻 |
 | `media.rs` | 音視頻合流：PulseAudio 虛擬聲卡 + 進程內 libav 雙版本 HLS（見 §8） |
 | `encode.rs` | 進程內編碼層：libavcodec + hw_frames_ctx 運行時协商（硬編優先、軟編回落） |
 | `chrome.rs` | 瀏覽器 chrome 狀態：標籤/導航/尋找/解析度/通道閘門的狀態保存、`chrome-state` 推送 JSON 與地址輸入歸一化（觀看端原生 header 的數據源，見 §9.1） |
@@ -68,11 +62,13 @@ RIG 的**瀏覽器邊緣程序**：一個 Rust 二進位，與目標 Chromium �
 
 | 模式 | 觸發 | 行為 | 生命週期歸屬 |
 |---|---|---|---|
-| 自拉起 launch | 預設 | 在系統/Playwright 安裝中自動發現 Chromium，以獨立 profile 拉起（沙箱預設保留；僅 root 環境——Chromium 在 root 下無法啟用沙箱——或顯式設 `RIG_CHROMIUM_NO_SANDBOX=1` 時才加 `--no-sandbox`） | 邊緣擁有：退出時關閉瀏覽器 |
+| 自拉起 launch | 預設 | 依序從 PATH 發現 `chromium`、`chromium-browser`、`google-chrome`、`google-chrome-stable`；`--chromium-dir` 指定直接含 `chrome` 或 `chromium` 的目錄。显式目录无效时报错，不回退到 PATH；无 Playwright/HOME 自动探测 | 邊緣擁有：退出時關閉瀏覽器 |
 | 掛靠 attach | `--cdp-url http://127.0.0.1:9222` | 輪詢 `{base}/json/version` 取 `webSocketDebuggerUrl` 後連接現成 Chromium | 瀏覽器自有：邊緣退出**只斷開連接，絕不關閉被掛靠的瀏覽器**（集成測試驗證） |
 
 兩種模式連接後的頁面會話建立、AX 啟用、剪貼板授權流程完全一致（內部共用
 `finish_connect`）。
+
+AI 通道預設開啟，`--no-ai` 可關閉。人通道預設關閉，`--human` 可開啟。HTTP 服務須提供非空 `--token` 或 `RIG_EDGE_TOKEN`，包括 `--stdio --human`。純 stdio 可省略令牌。
 
 **UA 規範化（2026-11-20 補）**：`finish_connect` 在掛載任何頁面會話前，
 以 `Browser.getVersion` 取本體 UA，把 `HeadlessChrome` 替換為 `Chrome`
@@ -110,11 +106,12 @@ platform/arch——版本取 product 的真實完整版本，UA 串裡的是約�
 | `--listen <addr:port>` | `127.0.0.1:39871` | HTTP 服務綁定位址（stdio 模式下僅 `--human` 時用於觀看頁） |
 | `--url <url>` | `about:blank` | 啟動後導航到的頁面；其 origin 自動進入導航白名單 |
 | `--cdp-url <base>` | — | 掛靠模式：現成 Chromium 的 DevTools HTTP 基位址（見 §3） |
-| `--chromium <path>` | 自動發現 | 自拉起模式的 Chromium 可執行檔路徑；也可用環境變數 `RIG_CHROMIUM` |
+| `--chromium-dir <path>` | 自動發現 | 自拉起模式的 Chromium 目錄；目錄中須直接有可執行檔 `chrome` 或 `chromium`。未指定時按順序查找 PATH：`chromium`、`chromium-browser`、`google-chrome`、`google-chrome-stable`；無 Playwright/HOME 自動探測，指定目錄無效會報錯且不回退 |
+| `--pulseaudio-dir <path>` | 啟動器提供 | 指定 PulseAudio 解包目錄；發布入口使用包內目錄，源碼運行可從 PATH 啟動系統 PulseAudio |
 | `--width` / `--height` | 1280 / 800 | 瀏覽器視口尺寸 |
 | `--allow-origin <origin>` | — | 追加允許 Navigate 的 origin（可重複給多次） |
-| `--no-ai` | — | AI 通道預設關閉（運行時仍可經 `/channels` 開啟） |
-| `--human` | — | 人通道預設開啟（不給則預設關閉，觀看頁無畫面） |
+| `--no-ai` | — | 顯式給出時關閉 AI；缺省 AI 通道開啟 |
+| `--human` | — | 顯式給出時人通道預設開啟，不給則關閉 |
 | `--av` | — | 預設允許 HLS 播放，首個有效播放列表請求啟動合流 |
 | `--token <secret>` | 環境變數 `RIG_EDGE_TOKEN` | **對外提供 HTTP 時必設**（空值視同未設），由啟動程序隨機生成並傳入；見 §6 |
 | `--embed-origin <origin[,…]>` | — | 允許內嵌觀看頁的宿主來源；未給則禁止任何內嵌（見 §6.1） |
@@ -123,7 +120,7 @@ platform/arch——版本取 product 的真實完整版本，UA 串裡的是約�
 | `--profile-dir <path>` | 環境變數 `RIG_EDGE_PROFILE_DIR`；未給 = 一次性臨時目錄 | **持久化目錄**（LIU 2026-11-20 定）：Chromium 用戶數據目錄。登入態、Cookie、LocalStorage / IndexedDB / Session Storage、Service Worker 與 Cache Storage、保存的密碼、擴展、已安裝應用、站點權限全在其中——邊緣重啟原樣續用，**整目錄搬到新環境重部署即可無損打開之前的網站**。密碼存儲固定 `--password-store=basic`：OSCrypt 密鑰隨 profile 的 Local State 走，新機器可解密；用宿主 keyring 則密鑰不跟目錄走、遷移即全滅。同一目錄同一時間只能被一個邊緣使用（Chromium 單例鎖）。PWAs 的系統層快捷方式不在目錄內、需在新環境重建，應用數據本身隨目錄走 |
 | `--cache-dir <path>` | 環境變數 `RIG_EDGE_CACHE_DIR`；未給 = profile 內 | 可棄緩存目錄：Chromium 磁盤緩存（HTTP / 媒體）經 `--disk-cache-dir` 放到這裡，與 profile 分開存、遷移時可不帶。GPU / 著色器等小緩存無官方分離參數、仍留在 profile 內（體積小、可自愈重建） |
 
-**臨時目錄清理**（LIU 2026-11-22）：未專門指定的目錄（沒給 `--profile-dir` 的一次性 profile `<tmp>/rig-edge-<pid>`、沒給 `--cache-dir` 的上傳目錄 `<tmp>/rig-edge-<pid>-uploads`）在 Chromium 關閉**之後**於退出時刪除（HTTP / stdio 兩模式、SIGINT / SIGTERM / stdin 關閉同）；專門指定的目錄一律不動。SIGKILL 與崩潰無法兜底，會留下殘餘。
+**臨時目錄清理**（LIU 2026-11-22）：未專門指定的目錄（一次性 profile `<tmp>/rig-edge-<pid>`、上傳目錄 `<tmp>/rig-edge-<pid>-uploads`、PulseAudio 私有運行目錄 `<tmp>/rig-edge-<pid>-pulse`、HLS 分片 `<tmp>/rig-edge-hls-<pid>`）於退出時清理；指定的 profile/cache 目錄不動。SIGKILL 與崩潰可能留下殘餘，使用 `scripts/clean-tmp.sh` 按 PID 檢查，避免通配符刪除仍運行實例的資料。
 
 持久化與停機口徑：邊緣收到 SIGINT / SIGTERM 時先請 Chromium 以 `Browser.close` **落盤關閉**再退出（HTTP 與 stdio 兩模式同）——強殺（SIGKILL）會丟掉最近未提交的 Cookie / Local Storage 寫入（IT 實測：數秒前的寫入被整組強殺即丟失，IndexedDB 因事務即時提交幸免）。部署側停機請用 TERM 而非 KILL。集成測試 `edge_profile_persistence` 驗證：寫入 Cookie / LocalStorage / IndexedDB → SIGTERM 優雅停機（附落盤實據斷言）→ 同雙目錄重啟 → 三值全數恢復。
 
@@ -136,8 +133,8 @@ platform/arch——版本取 product 的真實完整版本，UA 串裡的是約�
 | `/session` | POST | 啟動令牌（body）換 `access` + `refresh` + `stream_key`（見 §6） |
 | `/session/refresh` | POST | `refresh`（body）換新一對，舊 refresh 立即作廢 |
 | `/health` | GET | 存活探針（免鑑權）；回 `{"ok":true,...}`，整改第四期起附可觀測字段：`ready`、`cdp_connected`、`last_frame_age_ms`、`exec_in_flight`、`frames{sent,skipped}`、`latency{compose,encode,act,observe,dom_snapshot,quads}`（各分段 p50/p95/p99/max + 累計）、`last_snapshot`（最近一次 observe 的總時/CDP 調用數/quads 次數與耗時/AX 段耗時/節點數） |
-| `/ready` | GET | 就緒探針（免鑑權、無敏感信息）：CDP 存活且至少一個會話 → 200，否則 503。與 /health（liveness）分離（R-19） |
-| `/channels` | GET | 查三通道狀態：`{"ai":bool,"human":bool,"av":bool,"av_available":bool}` |
+| `/ready` | GET | CDP/session 健康探針（免鑑權、無敏感信息）：CDP 存活且至少一個會話 → 200，否則 503；不代表媒體或觀看頁就緒 |
+| `/channels` | GET | 查通道狀態：`ai`、`human`、`av`、`audio_available`、`av_wanted` 等 |
 | `/channels` | POST | 設通道開關，請求體同上形狀（部分欄位可省略） |
 | `/observe` | POST | AI 觀察：請求體為 rig-proto 的 `ObserveRequest`（可空 `{}`）。回應組成由 `mode` 定：`text` 只回 `{"text"}`；`tree`（默認）回 `{"text", "observation"}`；`tree_image` 再加 `"image_png_base64"`。`budget_tokens` 按預算裁剪**響應視圖**（存儲幀不動、被裁元素憑 id 仍可操作，裁剪說明附在 text 末尾）；`subtree` 只回某元素子樹（id 不存在回 400）。`include_offscreen` 默認 false：視口外元素不進響應視圖（存儲幀保留、帶 Offscreen 狀態），true 才帶。`since_frame` 使用客戶端最後套用的觀察幀。當 `mode=tree` 且分頁、文件、座標空間與輸出投影相容時，可回 `{"delta": ObservationDelta, "text"}`。基幀須在最近 8 個已輸出的結構化觀察內。無法重建目前視圖時回整幀 |
 | `/act` | POST | AI 動作：接受 `ActionRequest`，回 `{"result": ActionResult}`。頁面狀態類拒絕另附最新觀察及文字，或附無法取得最新狀態的說明 |
@@ -147,7 +144,7 @@ platform/arch——版本取 product 的真實完整版本，UA 串裡的是約�
 
 **通道閘門語義**：AI 關閉時 `/observe`、`/act`、`/screenshot.png` 回 409；
 人通道關閉時會斷開既有觀看連線，停止輸入並釋放 DOM、RTC 與 JPEG 需求。
-從 `/channels` 重開後，觀看端需重新連線。AV 關閉時合流管線停機。三通道全關時僅控制介面可用。
+從 `/channels` 重開後，觀看端需重新連線。`audio_available` 是啟動時私有 PulseAudio 的就緒狀態，`av_wanted` 表示是否允許 HLS，`av` 表示 HLS 管線是否正在運行。內建觀看頁也依 `av_wanted` 決定是否請求 RTC 音軌。視頻可以在無聲卡時運行。
 閘門在 HTTP 與 MCP 兩個前端一致生效。
 **關閉 AI 通道同時撤銷當前執行代次**（與強制接管同一機制）：在途 act 在下一個檢查點以 `Aborted` 中止，重新開啟後須先 `observe` 重新同步才能 `act`。
 
@@ -300,11 +297,11 @@ AI 前端；下文的「AI 客戶端」指 MCP 客戶端或 HTTP 調用方。
 （候选序 NVENC→QSV→VAAPI→Vulkan），無則軟編回落，一份代碼不以開發機
 （無 GPU 的 LXC）為設計基準。协商必須一路試到編碼器 open 成功為止：實測
 Vulkan 軟渲染能建設備上下文但無 encode queue 擴展、編碼器打不開。
-RTC 與 HLS 兩路共用此編碼層。運行時依賴系統 libavcodec/libavformat/
-libavutil/libswscale/libavdevice/libswresample。
+RTC 與 HLS 兩路共用此編碼層。發布包附帶 libavcodec/libavformat/
+libavutil/libswscale/libavdevice/libswresample 及其傳遞依賴。
 
-- 音頻：PulseAudio null sink `rigsink` 設為預設輸出，Chromium 啟動前以
-  `PULSE_SINK=rigsink` 注入——聲音進虛擬聲卡，合流管線以 avdevice pulse
+- 音頻：自拉的 PulseAudio 建立獨立 null sink `rigsink`，Chromium 以
+  私有 socket 與 `PULSE_SINK=rigsink` 將聲音送到聲卡，合流管線以 avdevice pulse
   輸入從 `rigsink.monitor` 進程內採集。pulse 流參數與解碼幀的聲道布局
   為空（mask=0）時須按聲道數歸一化為默認布局，否則 libswresample 逐幀
   以 Input changed 拒收；平面聲道數據須走 `plane::<f32>()` 讀寫（
@@ -320,11 +317,7 @@ libavutil/libswscale/libavdevice/libswresample。
   H.264 = libx264（veryfast、2.5Mbps）；關鍵幀間隔 20 幀（2 秒）；
   均 AAC 48kHz 128k。HLS fMP4：`hls_time 1`、列表 6 段、自動刪舊段；
   輸出於臨時目錄 `rig-edge-hls-<pid>/{hevc,h264}/`，布局與舊管線一致。
-- **虛擬聲卡自愈**（`ensure_virtual_sink`）：所有 pactl/pulseaudio 呼叫帶
-  10 秒超時（防僵死守護進程掛死啟動）；探活失敗時先 `--start`，仍不可達
-  則 `--kill` 後重啟一次；最終以「sink 出現在列表中」為就緒判據。
-  實測背景：殘留的 pulseaudio 守護進程會僵死（進程在、pactl 連接被終止），
-  舊實現因此誤判 AV 不可用。
+- **虛擬聲卡**：只有提供 HTTP 且自拉 Chromium 時，程序才啟動私有 PulseAudio daemon、socket 與 `rigsink`；發布包從相鄰 `pulseaudio/` 提供執行檔和模組，源码運行可顯式指定 `--pulseaudio-dir` 或從 PATH 使用系統 PulseAudio。純 stdio 與掛靠模式不啟動。啟動缺失或失敗只禁用音頻，視頻不受影響；消費者不需安裝 PulseAudio、pactl 或 ffmpeg 命令行。
 
 ## 9. 人通道輸入與剪貼板
 
@@ -481,12 +474,7 @@ FLTP 不同；②打包格式的交錯數據不能走 ffmpeg-next 的
 copy_from_slice 長度不符直接 panic 殺死 feeder 線程），必須
 走 `data(0)` 字節級讀寫並嚴格取 samples×聲道數；③feeder
 線程以 catch_unwind 兜底，panic 按出錯重試、不帶走整個音頻
-功能。採集前提：被採音的瀏覽器音頻須落在 rigsink 上——邊緣
-自啟的瀏覽器由邊緣設 `PULSE_SINK=rigsink`；**掛靠模式下
-外部瀏覽器須由啟動方自行設 `PULSE_SINK=rigsink`**（或系統
-默認 sink 恰為 rigsink），否則 monitor 只有靜音。真觀看頁
-探針驗證：offer 含 m=audio/opus、440Hz 音調穿 RTC 到觀看端
-RMS 0.78（非靜音）。
+功能。採集前提：自啟 Chromium 已接入專用的 `rigsink`。掛靠模式保留畫面與控制。
 
 **P2P 直連檔**：`--stun <host:port>`（可重複）配置後，會話
 改走全 ICE（非 lite），且開始前以自寫的最小 STUN 客戶端
@@ -495,9 +483,7 @@ UDP 套接字采集 srflx 候選——str0m/is 按其設計不做 STUN
 發現（「caller's responsibility」），故自寫（約百行，含單
 元測試）。實測：經 NAT 向公網 STUN 采集到真實映射地址，
 offer 同時攜帶 host 與 srflx 候選；全 ICE 與真瀏覽器連通
-及 transport 門控均由探針驗證。經 Gateway 的涓流信令與
-「雙端各連 Gateway」中繼檔屬軌道 T（Gateway 本體未建），
-本模塊的信令消息形態與之兼容，待軌道 T 立項後接入。
+及 transport 門控均由探針驗證。信令由觀看端與邊緣直接交換。
 
 觀看頁以 WebRTC 優先呈現視訊。ICE 斷開時立即回到 WS JPEG，
 並留 3 秒給 ICE 恢復。8 秒內未建立 RTC 連線便關閉該會話。
@@ -788,8 +774,7 @@ rig-proto 單元測試鎖定 upload/新拒絕碼/Done.note 的線格式。
 
 ## 11. 已知限制與未做事項
 
-- **遠端接入不在本倉庫演進**：網關/傳輸層（Gateway/Connector/CLI/中轉）已整倉移除
-  （另有備份）；邊緣不依賴轉發中心即可獨立作控制端使用（見 §1）。
+- **遠端轉發不在本倉庫**：網關/傳輸層已移除；邊緣由同機或局域網直連使用（見 §1）。
 - **人通道呈現是 CDP screencast（JPEG 幀流）+ WebRTC + HLS**，不是 RDP；
   RDP 呈現（IronRDP）與 RDP 音頻是後續里程碑。
 - **人通道文件粘貼不做**：觀看端讀不到使用者本機文件；AI 通道的文件
@@ -798,7 +783,7 @@ rig-proto 單元測試鎖定 upload/新拒絕碼/Done.note 的線格式。
   回完整視圖（協議即如此設計，客戶端重新定基即可）。
 - **DOM 模式邊界**：頭部已與視頻模式一致（邊緣 chrome 條帶流，
   含標籤條與下拉菜單，見 §9.2）；同源 iframe 內容整棵鏡像；
-  跨源 iframe 與 video 走**區域子流**（邊緣按 rect 截圖貼回
+  大畫布（單邊 >1024px，如遊戲畫面）同樣走區域子流（2026-11-22；`regions()` 的 `k:'c'`，約 4fps，快照標 `big:1`）。跨源 iframe 與 video 走**區域子流**（邊緣按 rect 截圖貼回
   佔位，見 §9.2）——驗證碼部件可看可點（坐標型 CDP 輸入由
   瀏覽器合成層路由、可穿透跨源 iframe，探針實測），但 iframe
   內部滾動不同步、內部 DOM 不鏡像；canvas 子流限制見 §9.2
@@ -861,8 +846,7 @@ rig-proto 單元測試鎖定 upload/新拒絕碼/Done.note 的線格式。
 
 ## 12. 集成測試
 
-`crates/rig-edge-browser/tests/edge_it.rs`，以環境變數 `RIG_EDGE_IT=1` 啟用
-（需真 Chromium；`RIG_CHROMIUM` 可指定路徑，否則掃 Playwright 安裝目錄）：
+`crates/rig-edge-browser/tests/edge_it.rs`：`scripts/test.sh unit` 始終跳過真 Chromium；`it`、`av`、`all` 才執行集成測試。默認從 PATH 查找 Chromium；`RIG_EDGE_TEST_CHROMIUM_DIR` 可顯式指定直接含 `chrome` 或 `chromium` 的目錄，不探測 HOME 或 Playwright。`scripts/test.sh` 在 `.temp/pulseaudio/` 存在時自動設置 PulseAudio fixture，也可用 `RIG_EDGE_TEST_PULSEAUDIO_DIR` 指定。
 
 | 測試 | 覆蓋 |
 |---|---|
@@ -898,8 +882,7 @@ rig-proto 單元測試鎖定 upload/新拒絕碼/Done.note 的線格式。
 - 測試頁元素的 AX 名稱來自 `<label>` 文本（如「用戶名」），勿憑假設寫
   期望名。
 
-全倉提交門禁 `scripts/local-gate.sh` 包含 fmt、clippy、單元測試、真 Chromium 集成測試和 Python 報表測試。
-執行前備妥完整 Chromium、PulseAudio 虛擬聲卡與 `ffprobe`，提交前須全綠。
+全倉提交門禁 `scripts/local-gate.sh` 依序運行 fmt、clippy 與 `scripts/test.sh all`。真 Chromium 集成測試需要完整 Chromium；音視頻測試另需 PulseAudio fixture 與 `ffprobe`。
 
 ## 13. 本批次提交索引
 

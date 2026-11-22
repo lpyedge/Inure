@@ -50,7 +50,7 @@ impl Cdp {
     pub async fn connect(ws_url: &str) -> CdpResult<Arc<Cdp>> {
         let (ws, _) = tokio_tungstenite::connect_async(ws_url)
             .await
-            .map_err(|e| format!("CDP 连接失败: {e}"))?;
+            .map_err(|e| format!("CDP connection failed: {e}"))?;
         let (mut sink, mut stream) = ws.split();
         // 有界队列（GPT review R-08）：CDP 对端僵死时发送侧不能无限积压
         let (cmd_tx, mut cmd_rx) = mpsc::channel::<String>(128);
@@ -81,7 +81,7 @@ impl Cdp {
                 };
                 if let Some(id) = v.get("id").and_then(Value::as_u64) {
                     let res = if let Some(err) = v.get("error") {
-                        Err(format!("CDP 错误: {err}"))
+                        Err(format!("CDP error: {err}"))
                     } else {
                         Ok(v.get_mut("result").map(Value::take).unwrap_or(Value::Null))
                     };
@@ -111,7 +111,7 @@ impl Cdp {
             alive2.store(false, std::sync::atomic::Ordering::SeqCst);
             let mut map = pending2.lock().await;
             for (_, p) in map.drain() {
-                let _ = p.tx.send(Err("CDP 连接断开".to_string()));
+                let _ = p.tx.send(Err("CDP connection closed".to_string()));
             }
         });
 
@@ -183,7 +183,7 @@ impl Cdp {
                 // 上层请求总截止可能取消等待，此时接收端已经关闭。
                 map.retain(|_, pending| !pending.tx.is_closed());
                 if map.len() >= 512 {
-                    return Err(format!("CDP 在途命令过多（{method}）"));
+                    return Err(format!("too many CDP commands in flight ({method})"));
                 }
             }
             map.insert(id, Pending { tx });
@@ -200,13 +200,13 @@ impl Cdp {
             if self.cmd_tx.send(msg.to_string()).await.is_err() {
                 // 发送失败也要清 pending，否则条目永久滞留（R-08）
                 self.pending.lock().await.remove(&id);
-                return Err("CDP 写通道已关闭".to_string());
+                return Err("CDP write channel is closed".to_string());
             }
             match rx.await {
                 Ok(res) => res,
                 Err(_) => {
                     self.pending.lock().await.remove(&id);
-                    Err(format!("CDP 通道关闭（{method}）"))
+                    Err(format!("CDP channel closed ({method})"))
                 }
             }
         };
@@ -216,7 +216,7 @@ impl Cdp {
                 // 超时后应答若再到，读泵 remove 时已无条目、无副作用；
                 // 这里先清，避免在途条目无限累积（R-08）
                 self.pending.lock().await.remove(&id);
-                Err(format!("CDP 调用超时（{method}）"))
+                Err(format!("CDP call timed out ({method})"))
             }
         }
     }

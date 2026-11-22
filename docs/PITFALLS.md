@@ -336,10 +336,10 @@
 - **DOM 模式点进 YouTube：地址栏/标题瞬间变了，内容却要等数秒（镜像每 ~300ms 整页重建一次）**：三个都会触发整页 `resync`（快照）的页内来源，在 YouTube 上全部「误报」：(1) 序列化器不序列化 script，但 `head` 里任何变动都重同步，而 YouTube 的脚本加载器持续增删 `<script>`、改 nonce/class——现在只对 SCRIPT/NOSCRIPT 的 head 变动忽略；其余 head 变动（link/style/title）合并成 500ms 尾随一次；(2) `window.resize` 事件被当作视口变化，YouTube 自己会周期性派发——现在只在 `innerWidth/Height` 与上次快照不同才重发；(3) 注入脚本（`addScriptToEvaluateOnNewDocument`）会进入每个同进程子 frame，about:blank/同源 iframe 各自上报 `installed` 触发整页快照——现在只在顶层 frame 工作。实测导航到 YouTube 后快照由「永不停的每 ~300ms 一张」变为加载期 3 张后停止。排查法：给每处 `send({kind:'resync'})` 打 `why`/`d`（记录类型、目标、节点名）后统计分布，别靠猜。
 - **视频模式播放中「铺满整个窗口、过会儿又缩回」（编码器被切到视频区尺寸）**：`连续 8 帧同尺寸无法归属任何矩形 → 重定整页基准`（为弹窗新标签冻结加的）在 YouTube 上误触发——播放器布局切换/滚动时视频区帧（873x491、800x544、1168x657）暂时匹配不上矩形，连续 8 帧就把整页基准改成视频区尺寸，此后视频区帧被当整页帧送进编码器（日志：`[pump] 连续 8 帧 873x491 无法归属任何矩形：整页基准 1280x800 重定为新尺寸` 紧跟 `[rtc] 编码器就绪 872x490`），观看端于是看到视频放大铺满、而页面只剩左上角；真整页帧（面积更大）到来才恢复。内容帧只可能来自 video/canvas，所以现在页面上还有 video/canvas 矩形时一律不重定基准（`should_rebase`，单测 `rebase_never_with_media_rects`）；没有任何 video/canvas 的页面（弹窗回归网场景）仍可重定。排查线索：LAN 日志里搜 `无法归属` 与 `编码器就绪` 的先后与尺寸。本机无头环境未能复现，依据是生产日志；修复后请在你的环境再验证。
 - **上一条修复仍不彻底（生产日志 `连续 8 帧 853x480 无法归属` 仍出现）——两个互相放大的原因**：(1) Chrome screencast 的元数据 `deviceWidth/Height` 与 JPEG 实际尺寸经常对不上（本机实测约 1/3 内容帧：`meta=663x373 jpeg=663x253`、`meta=873x491 jpeg=1280x800`、`meta=1280x489 jpeg=782x489`），按元数据分类本来就不可靠；上一轮加的「尺寸不符就跳过」既没记丢弃，又让这些帧不触发矩形抓取、还照旧计入「无法归属」连续计数；(2) 我把部分滚出视口（x/y 为负）的矩形从候选里滤掉后，`gate_rects.is_empty()` 就不再等于「页面没有媒体元素」。现在：尺寸不符的内容帧记入 `dropped` 并直接丢弃、不计入连续计数；`should_rebase` 的前提改为 `gate_has_media`（取几何时 video/canvas 的**原始**数量，不受候选过滤影响）。本机 1280x800 + 反复滚动 + 视口缩放，`无法归属` 0 次、编码器只在启动时重建一次。教训：为一处启发式加的「过滤」要同步检查所有读取同一状态的其它启发式。
-- **本机测试边缘默认用 Playwright 的 Chromium，播不了 YouTube**（无专有编解码器，报「Something went wrong」）：测视频页要设 `RIG_CHROMIUM=/opt/google/chrome/chrome`。
+- **本机测试边缘默认从 PATH 找 Chromium；Playwright Chromium 播不了 YouTube**（无专有编解码器，报「Something went wrong」）：测视频页可设 `RIG_EDGE_TEST_CHROMIUM_DIR=/opt/google/chrome`，目录中需直接有 `chrome`。
 - **排查教训**：`pkill -f`/`pgrep -f` 的模式会匹配到执行它的 shell 自己的命令行（退出码 144），按 `ps | grep "[x]yz"` 取 PID 再 kill。
 - **标签栏顺序不稳**：标签栏直接用 `Target.getTargets` 的返回顺序，Chrome 在新建/切换后会把最近活动的排前面——新建标签落在第一位、切换后标签栏重排（`edge_chrome_ui_and_takeover` 在基线 HEAD 就因此失败，期望新标签 `active:1`）。巡检循环现在用 `stable_tab_order` 保持已有标签相对顺序、新标签追加末尾（单测 `tab_order_is_stable_and_appends_new`）。
-- **本机跑 `edge_av_and_image_clipboard` 的前置**：便携 PulseAudio 的 PATH/LD_LIBRARY_PATH/PULSE_SERVER（同 `scripts/edge-lan.sh`），以及 `ffprobe`/`ffmpeg` 命令行（`apt-get install -y ffmpeg`；边缘自身是进程内链接 libav，不需要 ffmpeg 命令，命令行只给测试后半段断言用）。**坑**：照 `edge-lan.sh` 导出环境会把 `HOME` 改成 `.temp/pulse-home`，导致 `edge_stdio_mcp_and_attach` 找不到 `~/.cache/ms-playwright`、`git` 报 dubious ownership；跑测试前在 source 之后再 `export HOME=/root`。
+- **本机跑 `edge_av_and_image_clipboard` 的前置**：PulseAudio 和 `ffprobe`。便携音频可通过 `RIG_EDGE_TEST_PULSEAUDIO_DIR` 指定，测试浏览器可通过 `RIG_EDGE_TEST_CHROMIUM_DIR` 指定。
 - **集成测试里的“排空”循环要按时限**：页面在动时 DOM 差分文本持续到达，`while let Ok(Some(Ok(_))) = timeout(..)` 永不退出、测试挂死；改成固定时长内排空。
 - **后台 DOM 感知不能决定 WS 帧流**：Viewer 为自动模式判断会常驻 `dom-start`，若边缘据此停发 JPEG，RTC 回退到 canvas 后画面停在旧帧。帧流需求只看观看端的 `jpeg-demand`（`jpeg_want`）。
 - **AI 截图遮罩取自完整快照**：响应视图可能被子树/预算裁剪，敏感区域必须取自未裁剪的同一份采集；采集期间换页则不交付截图。
@@ -379,6 +379,22 @@
 - 定因：`.temp/with-pulse.sh` 作为包装脚本把目标命令当子进程运行，`$!` 记到的是包装脚本的 PID，`kill $!` 杀掉的不是边缘本体。
 - 解法：包装脚本最后一行改为 `exec "$@"`，`$!` 就是目标进程；同时不再用 `pgrep -f` 找进程（模式串会匹配到自己的 shell，退出码 144，本项目已踩多次）。
 - 教训：**包装脚本要 `exec` 目标命令**；收尾时核对「还有哪些进程在跑」。
+
+### 52. 启动脚本跑了旧二进制，端口上还有旧实例：打开页面看到的是旧版报错（2026-11-22，LIU 实测）
+
+- 症状：用 `scripts/edge-lan.sh` 启动后，打开地址看到旧版的 `{"error":"需要令牌（Authorization: Bearer 或 ?token=）"}`，而不是令牌输入页。
+- 定因：两处叠加。① 脚本把 `.temp/target/release/` 写死为优先二进制，那是 11 月 21 日的旧构建（新构建在 `target/release/`），旧版没有登录页壳，`/` 要令牌；② 端口上还留着更早启动的旧实例，新实例因 `AddrInUse` 启动即退出，而脚本的健康检查被**旧实例**应答，仍打印 OK——旧实例冒充了新实例。
+- 解法：脚本从 `$CARGO_TARGET_DIR`、`target/`、`.temp/target/` 的 release 与 debug 里取**最新**的二进制，源码比二进制新时提醒重新编译；启动前检测端口占用并报出占用者；启动后确认**自己的进程**还活着。
+- 教训：**健康检查必须能区分「我起的实例」和「别的实例」**；启动脚本不要硬编码二进制路径，要取最新；换了版本后先确认端口上跑的是不是新进程（`ss -ltnp` 看 PID 与启动时间）。
+
+### 53. 网页游戏在 DOM 模式下完全不显示：大画布没有子流（2026-11-22，LIU 实测 entanglement.gopherwoodstudios.com）
+
+- 症状：游戏页在 DOM 模式下什么都看不到，镜像里只有「CANVAS 1280×489」的占位文字。
+- 定因：DOM 镜像的 canvas 子流是「页内 `toDataURL` 快照」，设了单边 ≤1024px 的上限（大帧会挤占差分通道）；游戏画布是 1280 宽，被直接跳过。整个游戏都画在这一个 canvas 上，所以「完全无法呈现」。
+- 解法：单边 >1024px 的画布改走**区域子流**（跨源 iframe、`<video>` 用的那条路）：序列化器给节点标 `big`，`regions()` 把它列入清单（`k:'c'`），边缘按 rect 对页面表面截图，约 250ms 一帧，观看端用区域占位块贴图。截图读的是浏览器实际渲染结果，所以 WebGL 画布同样能显示。
+- 验证：集成测试 `edge_dom_large_canvas_streams_as_region`；真浏览器里用 1280×400 的本地画布页端到端验证——DOM 模式下画面正常显示，点击画布中心，远端收到的坐标是 `(640,244)`。
+- **未验证**：该站点本身。它在本机沙箱里（连同一个独立的 Chrome）都停在 “Loading…”（疑为其外部资源在沙箱网络里取不到），没法在这里看到游戏加载完后的棋盘。上面的验证是用等价的本地画布页做的。
+- 教训：**「语义补充通道」的尺寸上限对游戏类页面等于「整个页面都没有」**；有上限的快照式通道必须有兜底路径（这里是区域截图），不能只是跳过。
 
 ## 六、探针与测试方法论（栽过的跟头）
 

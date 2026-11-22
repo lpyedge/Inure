@@ -1,68 +1,60 @@
 #!/usr/bin/env bash
-# 局域网测试启动：便携 PulseAudio（.temp/pulseaudio）+ rigsink 虚拟声卡 + edge。
-# 用法：bash scripts/edge-lan.sh [TOKEN] [PORT]
-#   TOKEN 缺省随机生成；PORT 缺省 39871。
-# 停止：kill <edge-pid> <pa-pid>（脚本退出时打印）。
+# 局域网测试启动。用法：PORT=39871 scripts/edge-lan.sh [边缘参数…]
+# RIG_EDGE_TOKEN 缺省随机生成。停止：kill <edge-pid>。
 set -euo pipefail
 cd "$(dirname "$0")/.."
 ROOT="$PWD"
 
-TOKEN="${1:-$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')}"
-PORT="${2:-39871}"
-IP="$(ip -4 addr show scope global | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | grep -v '^172\.' | head -1)"
-[ -n "$IP" ] || { echo "找不到局域网 IP"; exit 1; }
+for arg in "$@"; do
+  case "$arg" in
+    --listen|--token) echo "Use PORT and RIG_EDGE_TOKEN to configure this launcher." >&2; exit 2 ;;
+    --stdio) echo "Run rig-edge-browser --stdio directly for MCP." >&2; exit 2 ;;
+  esac
+done
+TOKEN="${RIG_EDGE_TOKEN:-$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')}"
+PORT="${PORT:-39871}"
+IP="$(ip -4 -o addr show up scope global | awk 'NR == 1 { split($4, address, "/"); print address[1] }')"
+[ -n "$IP" ] || { echo "Could not find a LAN IPv4 address" >&2; exit 1; }
 
-PA="$ROOT/.temp/pulseaudio"
-RUN="$ROOT/.temp/pulse-run"
-HOME_DIR="$ROOT/.temp/pulse-home"
-[ -x "$PA/usr/bin/pulseaudio" ] || { echo "$PA 缺 pulseaudio，先解包 deb"; exit 1; }
-mkdir -p "$RUN" "$HOME_DIR"
-chmod 700 "$RUN" "$HOME_DIR"
-
-export PATH="$PA/usr/bin:$PATH"
-export LD_LIBRARY_PATH="$PA/usr/lib/x86_64-linux-gnu:$PA/usr/lib/x86_64-linux-gnu/pulseaudio:$PA/usr/lib/pulse-17.0+dfsg1/modules${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-export XDG_RUNTIME_DIR="$RUN"
-export PULSE_RUNTIME_PATH="$RUN"
-export HOME="$HOME_DIR"
-export DBUS_SESSION_BUS_ADDRESS="unix:path=/nonexistent"
-export DBUS_SYSTEM_BUS_ADDRESS="unix:path=/nonexistent"
-SOCK="$RUN/native"
-export PULSE_SERVER="unix:$SOCK"
-export PULSE_SINK="rigsink"
-
-if [ ! -S "$SOCK" ]; then
-  "$PA/usr/bin/pulseaudio" \
-    --daemonize=no --exit-idle-time=-1 --disallow-exit -n \
-    "--dl-search-path=$PA/usr/lib/pulse-17.0+dfsg1/modules" \
-    --load=module-native-protocol-unix \
-    --load="module-null-sink sink_name=rigsink" \
-    >"$RUN/daemon.log" 2>&1 &
-  echo $! >"$RUN/daemon.pid"
-  for i in $(seq 1 100); do
-    [ -S "$SOCK" ] && break
-    sleep 0.1
-  done
-  [ -S "$SOCK" ] || { echo "pulseaudio 未起来，看 $RUN/daemon.log"; exit 1; }
+# 与 build.sh 使用相同的构建目录，并从中选择最新的可执行文件。
+T="${CARGO_TARGET_DIR:-$ROOT/target}"
+BIN=
+for candidate in "$T"/{release,debug}/rig-edge-browser; do
+  if [[ -x "$candidate" && ( -z "$BIN" || "$candidate" -nt "$BIN" ) ]]; then
+    BIN="$candidate"
+  fi
+done
+[ -n "$BIN" ] || { echo "Build first: scripts/build.sh" >&2; exit 1; }
+# 源码比二进制新 → 提醒重新编译
+if [ -n "$(find crates -type f \( -name '*.rs' -o -name '*.js' -o -name '*.html' \) -newer "$BIN" -print -quit 2>/dev/null)" ]; then
+  echo "The binary is older than the sources: $BIN. Run scripts/build.sh first." >&2
 fi
-"$PA/usr/bin/pactl" set-default-sink rigsink >/dev/null 2>&1 || true
-
-# 优先 release：debug 构建下 DOM 序列化/JPEG/合成慢一个量级（实测 DOM 模式明显卡顿）
-BIN="$ROOT/.temp/target/release/rig-edge-browser"
-[ -x "$BIN" ] || BIN="$ROOT/.temp/target/debug/rig-edge-browser"
-[ -x "$BIN" ] || { echo "先 cargo build --release"; exit 1; }
-RIG_EDGE_TOKEN="$TOKEN" PULSE_SERVER="$PULSE_SERVER" PULSE_SINK=rigsink \
-  "$BIN" --listen "$IP:$PORT" --human --av \
-  >"$ROOT/.temp/edge-lan.log" 2>&1 &
-echo $! >"$ROOT/.temp/edge-lan.pid"
-
-sleep 2
-if curl -sk "https://$IP:$PORT/health" | grep -q '"ok":true'; then
-  echo "OK  pid=$(cat "$ROOT/.temp/edge-lan.pid") pa_pid=$(cat "$RUN/daemon.pid" 2>/dev/null)"
-  echo "URL: https://$IP:$PORT/   （打开后在输入页填令牌，令牌不进 URL）"
-  echo "TOKEN: $TOKEN"
-  echo "停：kill $(cat "$ROOT/.temp/edge-lan.pid") $(cat "$RUN/daemon.pid" 2>/dev/null)"
-else
-  echo "edge 未就绪，看 $ROOT/.temp/edge-lan.log"
-  tail -20 "$ROOT/.temp/edge-lan.log"
+echo "Using binary: $BIN" >&2
+# 端口已被占用（例如上一次启动的旧实例还在跑）→ 直接报错，别让旧实例冒充新实例应答健康检查
+OWNER="$(ss -ltnp 2>/dev/null | awk -v p=":$PORT" '$4 ~ p"$" {print $NF}' | head -1 || true)"
+if [ -n "$OWNER" ]; then
+  echo "Port $PORT is already in use ($OWNER). Stop that instance first or set PORT to another port." >&2
   exit 1
 fi
+mkdir -p "$ROOT/.temp"
+RIG_EDGE_TOKEN="$TOKEN" "$BIN" --listen "$IP:$PORT" --human --av "$@" \
+  >"$ROOT/.temp/edge-lan.log" 2>&1 &
+EDGE_PID=$!
+echo "$EDGE_PID" >"$ROOT/.temp/edge-lan.pid"
+
+deadline=$((SECONDS + 20))
+while (( SECONDS < deadline )) && kill -0 "$EDGE_PID" 2>/dev/null; do
+  if curl -kf --max-time 1 --silent "https://$IP:$PORT/ready" >/dev/null &&
+     kill -0 "$EDGE_PID" 2>/dev/null; then
+    echo "OK  pid=$EDGE_PID" >&2
+    echo "URL: https://$IP:$PORT/" >&2
+    if [ -z "${RIG_EDGE_TOKEN:-}" ]; then echo "Token: $TOKEN" >&2; fi
+    echo "Stop: kill $EDGE_PID" >&2
+    exit 0
+  fi
+  sleep 0.25
+done
+kill "$EDGE_PID" 2>/dev/null || true
+echo "The edge did not become ready; see $ROOT/.temp/edge-lan.log" >&2
+tail -20 "$ROOT/.temp/edge-lan.log" >&2
+exit 1

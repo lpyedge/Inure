@@ -1,7 +1,7 @@
 # Edge Browser 开发约束（每次开始工作前必读）
 
 本仓库只做一件事：**Chromium 控制与 AI/人双通道**。边缘程序 `rig-edge-browser`
-直连 Chromium（CDP），同机（stdio/回环 HTTP）或局域网（HTTP+令牌）直连即完整形态。
+直连 Chromium（CDP），同机（stdio/回环 HTTP）或局域网（HTTPS+令牌）直连即完整形态。
 
 文档入口：`docs/README.md`（10 篇文档集）；专题：`docs/EDGE_BROWSER.md`（边缘程序设计）、`docs/PERCEPTION.md`（感知层设计）、
 `docs/EVAL.md`（评估方法）、`docs/SECURITY_DESIGN_2026-11-19.md`（快照会话隔离等安全整改）、
@@ -18,7 +18,7 @@
 
 ## 边缘硬约束
 
-- **RIG 不启动、不管理浏览器以外的一切**：只支持 Chromium（自拉无头或 `--cdp-url` 挂靠）；不做 iOS、不做桌面 RDP/VNC。
+- **RIG 只管理自己启动的 Chromium 与音频虚拟声卡**：支持自拉无头 Chromium 或 `--cdp-url` 挂靠；不做 iOS、不做桌面 RDP/VNC。
 - **语义来源优先**：能从 CDP 无障碍树/DOM 拿到的结构，不去看像素；像素解析只是兜底。
 - **坐标统一为逻辑像素**，边缘转换；AI 与 Viewer 不接触物理像素。
 - **动作引用元素 + 帧**，执行前必须校验；被拒绝的动作**不执行、不静默重试**。
@@ -33,7 +33,7 @@
 - 新增依赖前确认许可证为 MIT / Apache-2.0 / BSD 等宽松许可，并在 PR 中说明理由。
   AGPL、BSL 项目只读设计，不复制代码。
 - 错误处理：库代码 `thiserror`，二进制入口 `anyhow`。
-- 注释和文档用中文，标识符用英文。
+- 注释和文档用中文，标识符用英文；**用户可见的界面与运行时提示（观看页、HTTP/MCP 报错、MCP 工具描述、启动与诊断输出、脚本输出）一律用英文**。
 
 ## 历史注记
 

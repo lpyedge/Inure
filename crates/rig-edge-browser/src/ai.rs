@@ -85,7 +85,7 @@ fn spawn_change_listener(browser: &Browser, log: Arc<crate::changes::ChangeLog>)
 
 fn delta_out(delta: ObservationDelta, note: Option<&str>) -> ObserveOut {
     let mut text = format!(
-        "[增量观察：帧 {} → {}，更新 {} 个子树、移除 {} 个元素。]\n",
+        "[Incremental observation: frame {} → {}, {} subtrees updated, {} elements removed.]\n",
         delta.base_frame,
         delta.frame_id,
         delta.upserts.len(),
@@ -109,7 +109,7 @@ fn project(
     if let Some(id) = &projection.subtree {
         let element = full
             .find(id)
-            .ok_or_else(|| format!("subtree 元素不存在: {id}"))?;
+            .ok_or_else(|| format!("subtree element does not exist: {id}"))?;
         view.elements = vec![element.clone()];
     }
     if !projection.include_offscreen {
@@ -121,7 +121,7 @@ fn project(
             let before_n = count_elements(&view);
             view = trim_to_budget(&view, budget);
             let note = format!(
-                "已按 budget_tokens={budget} 裁剪响应视图：元素 {before_n} → {}，估算 {before_est} → {} token（被裁元素凭 id 仍可操作，存储帧未动）",
+                "Response view trimmed to budget_tokens={budget}: elements {before_n} → {}, estimated {before_est} → {} tokens (trimmed elements can still be operated on by id; the stored frame is untouched)",
                 count_elements(&view),
                 estimate_tokens(&view)
             );
@@ -267,7 +267,10 @@ impl AiChannel {
             }
         })
         .await
-        .map_err(|_| "观察超时：未能确认当前页面的完整快照".to_string())?
+        .map_err(|_| {
+            "Observation timed out: could not confirm a complete snapshot of the current page"
+                .to_string()
+        })?
     }
 
     #[cfg(test)]
@@ -415,14 +418,16 @@ impl AiChannel {
     ) -> Result<Vec<u8>, String> {
         tokio::time::timeout_at(deadline, async {
             if !frame.warnings.is_empty() || !self.context_is_current(frame).await {
-                return Err("无法确认截图与快照对齐".into());
+                return Err(
+                    "Cannot confirm that the screenshot is aligned with the snapshot".into(),
+                );
             }
             let context = &frame.context;
             let session = &context.page.session;
             let mark = self.changes.mark();
             let masks = screenshot_masks(&self.browser, session, context.view.visual_offset)
                 .await
-                .map_err(|_| "无法确认截图的敏感区域")?;
+                .map_err(|_| "Cannot confirm the sensitive regions of the screenshot")?;
             let mut missing_mask = false;
             frame.obs.each_element(&mut |el| {
                 if el.has(ElementState::Password) || el.has(ElementState::Sensitive) {
@@ -433,25 +438,27 @@ impl AiChannel {
                 }
             });
             if missing_mask {
-                return Err("无法确认截图的敏感区域".into());
+                return Err("Cannot confirm the sensitive regions of the screenshot".into());
             }
             let png = self.browser.screenshot_png(session, context.view).await?;
             let after = screenshot_masks(&self.browser, session, context.view.visual_offset)
                 .await
-                .map_err(|_| "无法确认截图的敏感区域")?;
+                .map_err(|_| "Cannot confirm the sensitive regions of the screenshot")?;
             if masks != after
                 || !self.context_is_current(frame).await
                 || self
                     .changes
                     .changed_in_sessions_since(mark, &masks.sessions)
             {
-                return Err("截图期间页面、视口或敏感区域发生变化".into());
+                return Err(
+                    "The page, viewport or sensitive regions changed during the screenshot".into(),
+                );
             }
             let scale = context.view.space.scale * context.view.visual_scale;
             draw_marks(&png, view, scale, masks.regions.into_values())
         })
         .await
-        .map_err(|_| "截图超时".to_string())?
+        .map_err(|_| "Screenshot timed out".to_string())?
     }
 
     /// 编号截图：当前帧的合成图，交互元素描边+编号，敏感区域黑块打码。
@@ -530,7 +537,9 @@ impl AiChannel {
         .await;
         (
             result,
-            fresh.map(Some).map_err(|_| "无法取得最新页面状态".into()),
+            fresh
+                .map(Some)
+                .map_err(|_| "Could not obtain the latest page state".into()),
         )
     }
 
@@ -640,7 +649,7 @@ impl AiChannel {
             if !self.origin_allowed(url) {
                 return ActionResult::Rejected {
                     reason: RejectReason::PolicyDenied {
-                        detail: format!("origin 不在白名单: {url}"),
+                        detail: format!("origin is not in the allowlist: {url}"),
                     },
                 };
             }
@@ -1132,7 +1141,7 @@ impl AiChannel {
             }
             Action::Select { target, values } => {
                 let Target::Element { id } = target else {
-                    return Err(denied("Select 只支持元素目标".into()));
+                    return Err(denied("Select only supports element targets".into()));
                 };
                 let (session, backend) = self.locate_session_backend(locate, id).await?;
                 let values = values.clone();
@@ -1149,7 +1158,7 @@ impl AiChannel {
                 let object_id = resolved
                     .pointer("/object/objectId")
                     .and_then(serde_json::Value::as_str)
-                    .ok_or_else(|| denied("resolveNode 无 objectId".into()))?
+                    .ok_or_else(|| denied("resolveNode returned no objectId".into()))?
                     .to_string();
                 self.live(h).await?;
                 let out = self
@@ -1188,7 +1197,7 @@ impl AiChannel {
                     .await
                     .map_err(denied)?;
                 if out.get("exceptionDetails").is_some() {
-                    return Err(denied("Select 評估發生例外".into()));
+                    return Err(denied("Select evaluation raised an exception".into()));
                 }
                 let result = out
                     .pointer("/result/value")
@@ -1196,35 +1205,44 @@ impl AiChannel {
                 match result {
                     Some("OK") => {}
                     Some("ERR_MULTI_ON_SINGLE") => {
-                        return Err(denied("单选 Select 收到多个 values".into()))
+                        return Err(denied(
+                            "Single-select Select received multiple values".into(),
+                        ))
                     }
                     Some("ERR_NOT_SELECT") => {
-                        return Err(denied("Select 目标不是原生 select 元素".into()))
+                        return Err(denied(
+                            "Select target is not a native select element".into(),
+                        ))
                     }
                     Some("ERR_UNKNOWN_OPTION") => {
-                        return Err(denied("Select 包含未知选项值".into()))
+                        return Err(denied("Select contains an unknown option value".into()))
                     }
                     Some("ERR_DISABLED_OPTION") => {
-                        return Err(denied("Select 包含禁用选项".into()))
+                        return Err(denied("Select contains a disabled option".into()))
                     }
-                    _ => return Err(denied("Select 评估未成功".into())),
+                    _ => return Err(denied("Select evaluation did not succeed".into())),
                 }
                 Ok(None)
             }
             Action::Upload { target, files } => {
                 let Target::Element { id } = target else {
-                    return Err(denied("Upload 只支持元素目标".into()));
+                    return Err(denied("Upload only supports element targets".into()));
                 };
                 // 先验文件（边缘主机侧，便宜且不碰页面）：限定在上传根目录内，
                 // 存在且为普通文件、单文件 ≤200MiB、总数 ≤20
                 let Some(root) = &self.upload_root else {
-                    return Err(denied("未配置上传目录，Upload 不可用".into()));
+                    return Err(denied(
+                        "No upload directory is configured; Upload is unavailable".into(),
+                    ));
                 };
                 if files.is_empty() {
-                    return Err(denied("Upload files 为空".into()));
+                    return Err(denied("Upload files is empty".into()));
                 }
                 if files.len() > 20 {
-                    return Err(denied(format!("Upload 文件数超限: {} > 20", files.len())));
+                    return Err(denied(format!(
+                        "Upload file count exceeds the limit: {} > 20",
+                        files.len()
+                    )));
                 }
                 let files: Vec<String> = files
                     .iter()
@@ -1244,7 +1262,7 @@ impl AiChannel {
                 let object_id = resolved
                     .pointer("/object/objectId")
                     .and_then(serde_json::Value::as_str)
-                    .ok_or_else(|| denied("resolveNode 无 objectId".into()))?
+                    .ok_or_else(|| denied("resolveNode returned no objectId".into()))?
                     .to_string();
                 let out = self
                     .browser
@@ -1272,7 +1290,7 @@ impl AiChannel {
                     (
                         &files[..1],
                         Some(format!(
-                            "单选文件框只取第一个文件，其余 {} 个已忽略",
+                            "Single-file input accepts only the first file; the remaining {} were ignored",
                             files.len() - 1
                         )),
                     )
@@ -1318,7 +1336,7 @@ impl AiChannel {
         let object_id = resolved
             .pointer("/object/objectId")
             .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| denied("resolveNode 无 objectId".into()))?
+            .ok_or_else(|| denied("resolveNode returned no objectId".into()))?
             .to_string();
         let out = self
             .browser
@@ -1341,7 +1359,9 @@ impl AiChannel {
         {
             Ok(session)
         } else {
-            Err(denied("Type 目标点击后未获得焦点，已拒绝输入".into()))
+            Err(denied(
+                "The Type target did not receive focus after the click; input was rejected".into(),
+            ))
         }
     }
 
@@ -1443,19 +1463,23 @@ fn action_label(action: &Action, current: &Observation) -> String {
         }
     }
     match action {
-        Action::Click { target, .. } => format!("点击 {}", desc(target, current)),
-        Action::Hover { target } => format!("悬停 {}", desc(target, current)),
+        Action::Click { target, .. } => format!("Click {}", desc(target, current)),
+        Action::Hover { target } => format!("Hover {}", desc(target, current)),
         Action::Type { target, .. } => match target {
-            Some(t) => format!("输入到 {}", desc(t, current)),
-            None => "输入".to_string(),
+            Some(t) => format!("Type into {}", desc(t, current)),
+            None => "Type".to_string(),
         },
-        Action::Key { key } => format!("按键 {key}"),
-        Action::Scroll { .. } => "滚动".to_string(),
-        Action::Select { target, .. } => format!("选择 {}", desc(target, current)),
+        Action::Key { key } => format!("Press {key}"),
+        Action::Scroll { .. } => "Scroll".to_string(),
+        Action::Select { target, .. } => format!("Select {}", desc(target, current)),
         Action::Upload { target, files } => {
-            format!("上传 {} 个文件到 {}", files.len(), desc(target, current))
+            format!(
+                "Upload {} file(s) to {}",
+                files.len(),
+                desc(target, current)
+            )
         }
-        Action::Navigate { url } => format!("打开 {url}"),
+        Action::Navigate { url } => format!("Open {url}"),
     }
 }
 
@@ -1519,7 +1543,7 @@ fn draw_marks(
     masks: impl IntoIterator<Item = BBox>,
 ) -> Result<Vec<u8>, String> {
     use image::{Rgba, RgbaImage};
-    let img = image::load_from_memory(png).map_err(|e| format!("截圖解码失败: {e}"))?;
+    let img = image::load_from_memory(png).map_err(|e| format!("screenshot decode failed: {e}"))?;
     let mut img = img.to_rgba8();
     let (iw, ih) = (img.width() as f32, img.height() as f32);
     // 显式裁到视觉视口后，允许边缘像素取整造成的 1 px 误差。
@@ -1527,7 +1551,7 @@ fn draw_marks(
         || (iw - obs.space.width * scale).abs() > 1.0
         || (ih - obs.space.height * scale).abs() > 1.0
     {
-        return Err("截图像素尺寸与视口不一致".into());
+        return Err("screenshot pixel size does not match the viewport".into());
     }
     let accent = Rgba([255, 64, 64, 255]);
     let black = Rgba([0, 0, 0, 255]);
@@ -1629,7 +1653,7 @@ fn draw_marks(
     let mut out = Vec::new();
     let mut cur = std::io::Cursor::new(&mut out);
     img.write_to(&mut cur, image::ImageFormat::Png)
-        .map_err(|e| format!("截圖编码失败: {e}"))?;
+        .map_err(|e| format!("screenshot encode failed: {e}"))?;
     Ok(out)
 }
 
@@ -1649,7 +1673,7 @@ fn resolve_upload_path(root: &std::path::Path, f: &str) -> Result<String, Reject
     let real = joined.canonicalize().map_err(|_| not_found())?;
     if !real.starts_with(root) {
         return Err(RejectReason::PolicyDenied {
-            detail: "Upload 文件必须位于上传目录内".into(),
+            detail: "Upload files must be inside the upload directory".into(),
         });
     }
     let md = std::fs::metadata(&real).map_err(|_| not_found())?;
@@ -2077,7 +2101,7 @@ mod tests {
             }
         });
         assert_eq!(buttons, 1, "仅主帧的 AX 节点可以输出");
-        assert!(text.contains("S2") && text.contains("已跳过"));
+        assert!(text.contains("S2") && text.contains("skipped"));
     }
 
     #[tokio::test]
@@ -2104,7 +2128,10 @@ mod tests {
                     };
                     assert!(text.contains("# frame"), "失败时应保留文本: {case:?}");
                     if png.is_none() {
-                        assert!(text.contains("截图"), "失败应有诊断: {case:?} {text}");
+                        assert!(
+                            text.to_lowercase().contains("screenshot"),
+                            "失败应有诊断: {case:?} {text}"
+                        );
                     }
                     png.ok_or(text)
                 } else {
@@ -2382,7 +2409,10 @@ mod tests {
                 }
             }
         );
-        assert_eq!(fresh.err().as_deref(), Some("无法取得最新页面状态"));
+        assert_eq!(
+            fresh.err().as_deref(),
+            Some("Could not obtain the latest page state")
+        );
     }
 
     #[tokio::test]

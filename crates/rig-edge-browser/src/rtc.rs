@@ -64,6 +64,7 @@ pub struct AudPkt {
 
 pub struct RtcHub {
     human: Arc<HumanChannel>,
+    pulse_server: Option<String>,
     au_tx: broadcast::Sender<Arc<Au>>,
     aud_tx: broadcast::Sender<Arc<AudPkt>>,
     video_want: Arc<AtomicUsize>,
@@ -104,11 +105,16 @@ impl Drop for WantGuard {
 }
 
 impl RtcHub {
-    pub fn new(human: Arc<HumanChannel>, stun: Vec<SocketAddr>) -> Arc<RtcHub> {
+    pub fn new(
+        human: Arc<HumanChannel>,
+        stun: Vec<SocketAddr>,
+        pulse_server: Option<String>,
+    ) -> Arc<RtcHub> {
         let (au_tx, _) = broadcast::channel(64);
         let (aud_tx, _) = broadcast::channel(128);
         Arc::new(RtcHub {
             human,
+            pulse_server,
             au_tx,
             aud_tx,
             video_want: Arc::new(AtomicUsize::new(0)),
@@ -140,7 +146,7 @@ impl RtcHub {
                     .ok();
             }
         }
-        if tracks.audio {
+        if let Some(server) = self.pulse_server.as_ref().filter(|_| tracks.audio) {
             let mut slot = self
                 .audio_feeder
                 .lock()
@@ -149,9 +155,10 @@ impl RtcHub {
                 let aud_tx = self.aud_tx.clone();
                 let want = self.audio_want.clone();
                 let epoch = self.epoch;
+                let server = server.clone();
                 *slot = std::thread::Builder::new()
                     .name("rig-rtc-audio".into())
-                    .spawn(move || audio_feeder_loop(want, aud_tx, epoch))
+                    .spawn(move || audio_feeder_loop(&server, want, aud_tx, epoch))
                     .ok();
             }
         }
@@ -188,7 +195,7 @@ impl RtcHub {
         tokio::spawn(async move {
             if let Err(e) = run_session(hub, out, local_ip, cmd_rx, dom_rx, transport, tracks).await
             {
-                eprintln!("[rtc] 会话异常退出: {e}");
+                eprintln!("[rtc] session exited abnormally: {e}");
             }
         });
         SessionHandle { cmd: cmd_tx }
@@ -306,14 +313,19 @@ fn feeder_loop(
                             },
                         ) {
                             Ok(e) => {
-                                eprintln!("[rtc] 编码器就绪: {} {}x{}（协商结果）", e.name(), w, h);
+                                eprintln!(
+                                    "[rtc] encoder ready: {} {}x{} (negotiated)",
+                                    e.name(),
+                                    w,
+                                    h
+                                );
                                 enc = Some(e);
                                 enc_size = (w, h);
                                 applied_bitrate = bitrate.load(Ordering::SeqCst);
                                 in_times.clear(); // 旧编码器的帧时刻作废
                             }
                             Err(e) => {
-                                eprintln!("[rtc] 建编码器失败: {e}");
+                                eprintln!("[rtc] failed to create the encoder: {e}");
                                 std::thread::sleep(Duration::from_millis(500));
                             }
                         }
@@ -354,7 +366,7 @@ fn feeder_loop(
                                     }
                                 }
                             }
-                            Err(e) => eprintln!("[rtc] 编码失败: {e}"),
+                            Err(e) => eprintln!("[rtc] encode failed: {e}"),
                         }
                     }
                 }
@@ -374,6 +386,7 @@ fn feeder_loop(
 /// plane::<f32> 两条实测教训）；编码器不同（Opus vs AAC）故各走一路，
 /// 两个采集客户端可同时挂在同一个 monitor 上。
 fn audio_feeder_loop(
+    server: &str,
     want: Arc<AtomicUsize>,
     aud_tx: broadcast::Sender<Arc<AudPkt>>,
     epoch: Instant,
@@ -386,16 +399,16 @@ fn audio_feeder_loop(
         // catch_unwind：采集线程 panic 不能带走整个音频功能，
         // 按出错处理、歇一下重试（feeder 是进程级后台线程）
         let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            audio_capture_run(&want, &aud_tx, epoch)
+            audio_capture_run(server, &want, &aud_tx, epoch)
         }));
         match run {
             Ok(Ok(())) => {}
             Ok(Err(e)) => {
-                eprintln!("[rtc] 音频采集退出: {e}");
+                eprintln!("[rtc] audio capture exited: {e}");
                 std::thread::sleep(Duration::from_millis(800));
             }
             Err(_) => {
-                eprintln!("[rtc] 音频采集 panic，800ms 后重试");
+                eprintln!("[rtc] audio capture panicked; retrying in 800ms");
                 std::thread::sleep(Duration::from_millis(800));
             }
         }
@@ -403,21 +416,22 @@ fn audio_feeder_loop(
 }
 
 fn audio_capture_run(
+    server: &str,
     want: &Arc<AtomicUsize>,
     aud_tx: &broadcast::Sender<Arc<AudPkt>>,
     epoch: Instant,
 ) -> Result<(), String> {
     crate::encode::ensure_init();
-    let (mut input, a_idx, dec_ctx) = crate::media::open_pulse()?;
+    let (mut input, a_idx, dec_ctx) = crate::media::open_pulse(server)?;
     let mut decoder = dec_ctx
         .decoder()
         .audio()
-        .map_err(|e| format!("打开音频解码器失败: {e}"))?;
-    let codec = ff::encoder::find_by_name("libopus").ok_or("无 libopus 编码器")?;
+        .map_err(|e| format!("failed to open the audio decoder: {e}"))?;
+    let codec = ff::encoder::find_by_name("libopus").ok_or("no libopus encoder")?;
     let mut enc_builder = ff::codec::context::Context::new_with_codec(codec)
         .encoder()
         .audio()
-        .map_err(|e| format!("建 Opus 编码器失败: {e}"))?;
+        .map_err(|e| format!("failed to create the Opus encoder: {e}"))?;
     enc_builder.set_rate(48_000);
     enc_builder.set_channel_layout(ff::channel_layout::ChannelLayout::STEREO);
     // libopus 只收打包格式（flt/s16），平面格式开编码器直接 EINVAL
@@ -427,7 +441,7 @@ fn audio_capture_run(
     enc_builder.set_time_base((1, 48_000));
     let mut opus = enc_builder
         .open()
-        .map_err(|e| format!("打开 Opus 编码器失败: {e}"))?;
+        .map_err(|e| format!("failed to open the Opus encoder: {e}"))?;
     // pulse 帧声道布局可能为空（mask=0）：配置侧与帧侧都按声道数
     // 归一化，否则重采样器逐帧报 Input changed（media.rs 实测教训）
     let src_layout = {
@@ -446,7 +460,7 @@ fn audio_capture_run(
         ff::channel_layout::ChannelLayout::STEREO,
         48_000,
     )
-    .map_err(|e| format!("建重采样器失败: {e}"))?;
+    .map_err(|e| format!("failed to create the resampler: {e}"))?;
 
     // Opus 20ms 一帧 = 960 采样@48k（立体声打包 = 1920 个 f32 交错）；
     // 重采样输出先攒够一帧再送编码器
@@ -631,7 +645,7 @@ fn request_resync(out: &mpsc::Sender<String>, last: &mut Option<Instant>, now: I
     }
     *last = Some(now);
     let _ = out.try_send(json!({"type": "dom-resync-needed"}).to_string());
-    eprintln!("[rtc] DC 待发队列超限：丢弃旧代次，已请求全量重同步");
+    eprintln!("[rtc] DC send queue exceeded its limit: dropped the old generation and requested a full resync");
 }
 
 /// 把一条 DOM 消息编码为 DC 发送帧序列：不超限原样单帧；超限切成
@@ -683,17 +697,17 @@ async fn run_session(
     // 不上，STUN 绑定请求会被静默丢弃、ICE 永远连不通（实测教训）
     let socket = UdpSocket::bind(SocketAddr::new(local_ip, 0))
         .await
-        .map_err(|e| format!("绑定 UDP 失败: {e}"))?;
+        .map_err(|e| format!("failed to bind UDP: {e}"))?;
     let local_addr = socket
         .local_addr()
-        .map_err(|e| format!("取 UDP 本地地址失败: {e}"))?;
+        .map_err(|e| format!("failed to get the UDP local address: {e}"))?;
 
     // P2P 直连档：配了 STUN 时会话走全 ICE，开始前先从本套接字采集
     // srflx（采集必须用会话自己的套接字，端口与 host 候选一致）
     let mut srflx = None;
     for server in &hub.stun {
         if let Some(a) = stun_discover(&socket, *server).await {
-            eprintln!("[rtc] STUN {server} 采集到 srflx {a}");
+            eprintln!("[rtc] STUN {server} gathered srflx {a}");
             srflx = Some(a);
             break;
         }
@@ -740,7 +754,7 @@ async fn run_session(
     let mut dc_pending = DcPending::new();
     let mut last_resync: Option<Instant> = None;
     let Some((offer, pending)) = change.apply() else {
-        return Err("生成 offer 失败".into());
+        return Err("failed to create the offer".into());
     };
     let mut pending = Some(pending);
     let pt = rtc
@@ -782,7 +796,7 @@ async fn run_session(
                     if let Some(p) = pending.take() {
                         match SdpAnswer::from_sdp_string(&sdp) {
                             Ok(ans) => { let _ = rtc.sdp_api().accept_answer(p, ans); }
-                            Err(e) => eprintln!("[rtc] answer 解析失败: {e}"),
+                            Err(e) => eprintln!("[rtc] failed to parse the answer: {e}"),
                         }
                     }
                 }
@@ -791,7 +805,7 @@ async fn run_session(
                     // 正是 Candidate 的 Deserialize 期望的形状
                     match serde_json::from_str::<Candidate>(&s) {
                         Ok(c) => rtc.add_remote_candidate(c),
-                        Err(e) => eprintln!("[rtc] candidate 解析失败: {e}"),
+                        Err(e) => eprintln!("[rtc] failed to parse the candidate: {e}"),
                     }
                 }
                 Some(Cmd::Demand(tracks)) => {
@@ -883,12 +897,12 @@ async fn run_session(
                         if let Some(mut ch) = rtc.channel(id) {
                             ch.set_buffered_amount_low_threshold(DC_CHUNK_MAX * 4);
                         }
-                        eprintln!("[rtc] rig-dom 数据通道已打开，DOM 改走 DC");
+                        eprintln!("[rtc] rig-dom data channel opened; DOM now goes over the DC");
                     }
                     Event::ChannelClose(id) if id == dom_cid => {
                         dc_open = false;
                         dom_open.store(false, Ordering::SeqCst);
-                        eprintln!("[rtc] rig-dom 数据通道关闭，DOM 回落 WS");
+                        eprintln!("[rtc] rig-dom data channel closed; DOM falls back to WS");
                     }
                     Event::KeyframeRequest(_) => {
                         hub.force_key.store(true, Ordering::SeqCst);

@@ -218,6 +218,7 @@ impl Drop for EdgeProc {
         let tmp = std::env::temp_dir();
         let _ = std::fs::remove_dir_all(tmp.join(format!("rig-edge-{}", self.0.id())));
         let _ = std::fs::remove_dir_all(tmp.join(format!("rig-edge-{}-uploads", self.0.id())));
+        let _ = std::fs::remove_dir_all(tmp.join(format!("rig-edge-{}-pulse", self.0.id())));
         let _ = std::fs::remove_dir_all(tmp.join(format!("rig-edge-hls-{}", self.0.id())));
     }
 }
@@ -248,7 +249,7 @@ async fn edge_browser_end_to_end() {
     drop(listener);
 
     let mut proc = EdgeProc(
-        Command::new(env!("CARGO_BIN_EXE_rig-edge-browser"))
+        edge_command()
             .args([
                 "--listen",
                 &format!("127.0.0.1:{edge_port}"),
@@ -743,7 +744,7 @@ fn spawn_edge(args: &[String]) -> EdgeProc {
         args.push(TEST_TOKEN.into());
     }
     EdgeProc(
-        Command::new(env!("CARGO_BIN_EXE_rig-edge-browser"))
+        edge_command()
             .args(&args)
             .process_group(0)
             .stdout(Stdio::null())
@@ -751,6 +752,17 @@ fn spawn_edge(args: &[String]) -> EdgeProc {
             .spawn()
             .expect("启动 rig-edge-browser"),
     )
+}
+
+fn edge_command() -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_rig-edge-browser"));
+    if let Ok(dir) = std::env::var("RIG_EDGE_TEST_CHROMIUM_DIR") {
+        command.args(["--chromium-dir", &dir]);
+    }
+    if let Ok(dir) = std::env::var("RIG_EDGE_TEST_PULSEAUDIO_DIR") {
+        command.args(["--pulseaudio-dir", &dir]);
+    }
+    command
 }
 
 async fn wait_health(edge_port: u16) {
@@ -811,7 +823,7 @@ async fn edge_av_and_image_clipboard() {
     wait_health(av_port).await;
     let _ = &mut proc;
     let (_, ch) = http_json(av_port, "GET", "/channels", None);
-    assert_eq!(ch["av_available"], true, "ffmpeg/PulseAudio 应就位: {ch}");
+    assert_eq!(ch["audio_available"], true, "PulseAudio 应就位: {ch}");
     assert_eq!(ch["av_wanted"], true, "--av 應保留 AV 意圖: {ch}");
     assert_eq!(ch["av"], false, "沒有播放請求時不應啟動合流管線: {ch}");
     // 媒体流用登录后下发的路径钥匙（原生 <video> 带不了请求头）
@@ -1168,6 +1180,74 @@ async fn edge_dom_mirror_does_not_carry_password_values() {
     }
 }
 
+const DOM_BIG_CANVAS_HTML: &str = r#"<!DOCTYPE html><html><head><meta charset="utf-8"><title>Big canvas</title></head>
+<body style="margin:0;background:#000">
+<canvas id="game" width="1280" height="400"></canvas>
+<script>
+const c = document.getElementById('game').getContext('2d');
+c.fillStyle = '#d02020'; c.fillRect(0, 0, 1280, 400);
+c.fillStyle = '#fff'; c.font = '48px sans-serif'; c.fillText('GAME BOARD', 100, 200);
+</script></body></html>"#;
+
+/// 游戏类大画布（单边 >1024px，如 1280 宽）走区域子流：快照里标 big，
+/// 边缘按 rect 截图以 dom-region 发来，而不是只留一个「CANVAS w×h」占位
+/// （快照式 canvas 子流有 1024px 上限，整个游戏画面会完全不显示）。
+#[tokio::test]
+async fn edge_dom_large_canvas_streams_as_region() {
+    if std::env::var("RIG_EDGE_IT").is_err() {
+        eprintln!("跳过：未设置 RIG_EDGE_IT");
+        return;
+    }
+    let _serial = SERIAL.lock().await;
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    serve(
+        listener,
+        vec![("/big.html".into(), DOM_BIG_CANVAS_HTML.into())],
+    );
+    let edge_port = free_port();
+    let _edge = spawn_edge(&[
+        "--listen".into(),
+        format!("127.0.0.1:{edge_port}"),
+        "--url".into(),
+        format!("http://127.0.0.1:{port}/big.html"),
+        "--human".into(),
+        "--width".into(),
+        "1300".into(),
+        "--height".into(),
+        "700".into(),
+    ]);
+    wait_health(edge_port).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    use futures_util::SinkExt;
+    let (mut ws, _) = ws_connect(format!("ws://127.0.0.1:{edge_port}/ws"))
+        .await
+        .expect("人通道 WS 应可连接");
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        json!({"type": "dom-start"}).to_string().into(),
+    ))
+    .await
+    .unwrap();
+    let snap = next_dom(&mut ws, "dom-snapshot", Duration::from_secs(20)).await;
+    let cv_id = tree_find_canvas(&snap["tree"]).expect("快照应含 CANVAS 节点");
+    let cv = tree_find_node(&snap["tree"], cv_id).expect("应能取回 canvas 节点");
+    assert_eq!(
+        cv["big"], 1,
+        "单边 >1024 的画布应标 big（走区域子流）: {cv}"
+    );
+    let region = next_dom(&mut ws, "dom-region", Duration::from_secs(12)).await;
+    assert_eq!(
+        region["i"].as_u64(),
+        Some(cv_id),
+        "区域帧应对应画布节点 id: {region}"
+    );
+    assert!(
+        region["d"].as_str().unwrap_or("").len() > 1000,
+        "区域帧应有画面内容: {region}"
+    );
+}
+
 /// 人工关闭 AI 通道 = 撤销当前执行代次：重新开启后，必须先 observe
 /// 重新同步，旧任务的 act 不得直接继续（外部审查 P1）。
 #[tokio::test]
@@ -1328,22 +1408,36 @@ async fn edge_token_auth() {
 }
 
 fn find_chromium_for_test() -> std::path::PathBuf {
-    if let Ok(p) = std::env::var("RIG_CHROMIUM") {
-        if !p.is_empty() {
-            return std::path::PathBuf::from(p);
+    if let Ok(dir) = std::env::var("RIG_EDGE_TEST_CHROMIUM_DIR") {
+        for name in ["chrome", "chromium"] {
+            let candidate = std::path::PathBuf::from(&dir).join(name);
+            if is_executable(&candidate) {
+                return candidate;
+            }
+        }
+        panic!("no chrome or chromium found directly in RIG_EDGE_TEST_CHROMIUM_DIR={dir}");
+    }
+    for name in [
+        "chromium",
+        "chromium-browser",
+        "google-chrome",
+        "google-chrome-stable",
+    ] {
+        if let Some(path) = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+            .map(|dir| dir.join(name))
+            .find(|path| is_executable(path))
+        {
+            return path;
         }
     }
-    let home = std::env::var("HOME").unwrap();
-    let base = std::path::PathBuf::from(home).join(".cache/ms-playwright");
-    let mut candidates: Vec<std::path::PathBuf> = vec![];
-    for e in std::fs::read_dir(&base).unwrap().flatten() {
-        let p = e.path().join("chrome-linux64/chrome");
-        if p.exists() {
-            candidates.push(p);
-        }
-    }
-    candidates.sort();
-    candidates.pop().expect("找不到 Playwright Chromium")
+    panic!("no Chromium executable found via RIG_EDGE_TEST_CHROMIUM_DIR or PATH");
+}
+
+fn is_executable(path: &std::path::Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path)
+        .map(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
 }
 
 /// stdio MCP 全流程 + --cdp-url 挂靠（边缘退出不杀浏览器）。
@@ -1362,7 +1456,7 @@ async fn edge_stdio_mcp_and_attach() {
 
     // ── A. stdio MCP：initialize → tools/list → observe → act → screenshot ──
     let mut child = EdgeProc(
-        Command::new(env!("CARGO_BIN_EXE_rig-edge-browser"))
+        edge_command()
             .args(["--stdio", "--url", &format!("{origin}/login.html")])
             .process_group(0)
             .stdin(Stdio::piped())
@@ -1566,7 +1660,7 @@ async fn edge_text_keys_clipboard() {
     let edge_port = listener.local_addr().unwrap().port();
     drop(listener);
     let mut proc = EdgeProc(
-        Command::new(env!("CARGO_BIN_EXE_rig-edge-browser"))
+        edge_command()
             .args([
                 "--listen",
                 &format!("127.0.0.1:{edge_port}"),
@@ -1947,7 +2041,7 @@ async fn edge_chrome_ui_and_takeover() {
     ws_send!(json!({"type": "chrome", "action": "find-open"}));
     wait_state!(|t: &str| t.contains("\"find\":{"), "寻找开启后 find 应非空");
     ws_send!(json!({"type": "chrome", "action": "find-text", "text": "A页内容"}));
-    wait_state!(|t: &str| t.contains("处"), "寻找计数应出现在状态里");
+    wait_state!(|t: &str| t.contains("matches"), "寻找计数应出现在状态里");
     ws_send!(json!({"type": "chrome", "action": "find-close"}));
     wait_state!(
         |t: &str| t.contains("\"find\":null"),
@@ -2156,6 +2250,19 @@ fn tree_has_attr_id(node: &Value, id: &str) -> bool {
 }
 
 /// 在序列化树里找第一个 CANVAS 节点的 id
+/// 按节点 id 取序列化树里的节点
+fn tree_find_node(node: &Value, id: u64) -> Option<Value> {
+    if node["i"].as_u64() == Some(id) {
+        return Some(node.clone());
+    }
+    for c in node["c"].as_array().into_iter().flatten() {
+        if let Some(n) = tree_find_node(c, id) {
+            return Some(n);
+        }
+    }
+    None
+}
+
 fn tree_find_canvas(node: &Value) -> Option<u64> {
     if node["g"] == "CANVAS" {
         return node["i"].as_u64();
@@ -2648,7 +2755,7 @@ async fn edge_observe_unchanged_vs_changed() {
         "页面变了，应重新采集: {d}"
     );
     assert!(
-        d["text"].as_str().unwrap_or("").contains("增量")
+        d["text"].as_str().unwrap_or("").contains("Incremental")
             && d["delta"]["upserts"].to_string().contains("已点击"),
         "增量应带出新文字: {d}"
     );
@@ -3681,7 +3788,10 @@ async fn edge_upload_action() {
     );
     assert_eq!(r["result"], "done", "多文件上传应成功（截断）: {r}");
     assert!(
-        r["note"].as_str().unwrap_or("").contains("只取第一个"),
+        r["note"]
+            .as_str()
+            .unwrap_or("")
+            .contains("only the first file"),
         "Done.note 应注明截断: {r}"
     );
     let obs = observe(edge_port);
@@ -3822,7 +3932,10 @@ async fn edge_observe_modes_budget() {
         "budget 应裁掉元素：{trimmed_n} < {full_n}"
     );
     assert!(
-        v["text"].as_str().unwrap_or("").contains("裁剪响应视图"),
+        v["text"]
+            .as_str()
+            .unwrap_or("")
+            .contains("trimmed to budget_tokens"),
         "文本应带裁剪说明: {}",
         v["text"]
     );
@@ -3934,7 +4047,7 @@ async fn edge_tree_image_masks_projected_out_secret_and_matches_mcp() {
 
     let edge_port = free_port();
     let mut child = EdgeProc(
-        Command::new(env!("CARGO_BIN_EXE_rig-edge-browser"))
+        edge_command()
             .args([
                 "--stdio",
                 "--human",
@@ -4387,7 +4500,9 @@ async fn edge_internal_gate_and_dblclick() {
             Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Text(t)))) => {
                 if let Ok(v) = serde_json::from_str::<Value>(&t) {
                     if v["type"] == "dom-state"
-                        && v["reason"].as_str().is_some_and(|r| r.contains("内部页面"))
+                        && v["reason"]
+                            .as_str()
+                            .is_some_and(|r| r.contains("internal pages"))
                     {
                         saw_internal_state = true;
                     }

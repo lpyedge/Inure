@@ -64,15 +64,15 @@
   box.id = 'rigLogin';
   box.style.cssText = 'position:fixed;inset:0;z-index:99999;display:flex;align-items:center;justify-content:center;background:#111;color:#eee;font:14px system-ui,sans-serif';
   box.innerHTML = '<form style="display:flex;flex-direction:column;gap:10px;width:min(320px,90vw)">' +
-    '<div>请输入访问令牌</div>' +
+    '<div>Enter the access token</div>' +
     '<input type="password" autocomplete="off" style="padding:8px;font-size:14px">' +
-    '<button type="submit" style="padding:8px">进入</button>' +
+    '<button type="submit" style="padding:8px">Enter</button>' +
     '<div class="msg" style="color:#f88;min-height:1.2em"></div></form>';
   document.body.appendChild(box);
   const form = box.querySelector('form'), input = box.querySelector('input'), msg = box.querySelector('.msg');
   const attempt = async (token) => {
     try { await start(token); }
-    catch (e) { msg.textContent = e.status === 401 ? '令牌无效' : '连接失败'; }
+    catch (e) { msg.textContent = e.status === 401 ? 'Invalid token' : 'Connection failed'; }
   };
   form.addEventListener('submit', (ev) => { ev.preventDefault(); attempt(input.value); });
   input.focus();

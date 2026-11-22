@@ -105,43 +105,13 @@ fn url_for_log(url: &str) -> String {
 }
 
 fn find_chromium(explicit: Option<&str>) -> CdpResult<PathBuf> {
-    if let Some(p) = explicit {
-        return Ok(PathBuf::from(p));
-    }
-    if let Ok(p) = std::env::var("RIG_CHROMIUM") {
-        if !p.is_empty() {
-            return Ok(PathBuf::from(p));
-        }
-    }
-    // Playwright 的浏览器目录（本机与 ovhca 的既有安装）
-    if let Some(home) = std::env::var_os("HOME") {
-        let base = PathBuf::from(home).join(".cache/ms-playwright");
-        if let Ok(rd) = std::fs::read_dir(&base) {
-            let mut candidates: Vec<PathBuf> = Vec::new();
-            for e in rd.flatten() {
-                for sub in [
-                    "chrome-linux64/chrome",
-                    "chrome-linux/chrome",
-                    "chrome-linux64/headless_shell",
-                    "chrome-linux/headless_shell",
-                    "chrome-mac/Chromium.app/Contents/MacOS/Chromium",
-                ] {
-                    let p = e.path().join(sub);
-                    if p.exists() {
-                        candidates.push(p);
-                    }
-                }
-            }
-            // 优先完整 Chromium（投屏/音频路径需要），其次 headless shell；同类取版本最新
-            candidates.sort_by_key(|p| {
-                let s = p.to_string_lossy().to_string();
-                let shell_rank = if s.contains("headless_shell") { 0 } else { 1 };
-                (shell_rank, s)
-            });
-            if let Some(p) = candidates.into_iter().next_back() {
-                return Ok(p);
-            }
-        }
+    if let Some(dir) = explicit {
+        return chromium_in_dir(std::path::Path::new(dir)).ok_or_else(|| {
+            format!(
+                "No executable chrome or chromium found directly in --chromium-dir {}",
+                dir
+            )
+        });
     }
     for name in [
         "chromium",
@@ -149,16 +119,42 @@ fn find_chromium(explicit: Option<&str>) -> CdpResult<PathBuf> {
         "google-chrome",
         "google-chrome-stable",
     ] {
-        if let Ok(out) = std::process::Command::new("which").arg(name).output() {
-            if out.status.success() {
-                let p = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                if !p.is_empty() {
-                    return Ok(PathBuf::from(p));
-                }
-            }
+        if let Some(path) = find_on_path(name, std::env::var_os("PATH").as_deref()) {
+            return Ok(path);
         }
     }
-    Err("找不到 Chromium（用 --chromium 或 RIG_CHROMIUM 指定）".into())
+    Err("Chromium not found on PATH (specify its directory with --chromium-dir)".into())
+}
+
+fn chromium_in_dir(dir: &std::path::Path) -> Option<PathBuf> {
+    ["chrome", "chromium"]
+        .iter()
+        .map(|name| dir.join(name))
+        .find(|path| is_executable(path))
+}
+
+fn find_on_path(name: &str, path: Option<&std::ffi::OsStr>) -> Option<PathBuf> {
+    std::env::split_paths(path?)
+        .map(|dir| dir.join(name))
+        .find(|candidate| is_executable(candidate))
+}
+
+fn is_executable(path: &std::path::Path) -> bool {
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
 }
 
 async fn http_get_json(url: &str) -> CdpResult<Value> {
@@ -167,14 +163,14 @@ async fn http_get_json(url: &str) -> CdpResult<Value> {
     // 且默认 keep-alive，必须按 Content-Length 读满正文。
     let hostport = url
         .strip_prefix("http://")
-        .ok_or("DevTools 地址不是 http")?;
+        .ok_or("DevTools address is not http")?;
     let (hostport, path) = match hostport.find('/') {
         Some(i) => (&hostport[..i], &hostport[i..]),
         None => (hostport, "/"),
     };
     let mut stream = tokio::net::TcpStream::connect(hostport)
         .await
-        .map_err(|e| format!("连接 DevTools 失败: {e}"))?;
+        .map_err(|e| format!("failed to connect to DevTools: {e}"))?;
     let req = format!(
         "GET {path} HTTP/1.1\r\nHost: {hostport}\r\nAccept: */*\r\nConnection: close\r\n\r\n"
     );
@@ -211,10 +207,13 @@ async fn http_get_json(url: &str) -> CdpResult<Value> {
     };
     let buf = tokio::time::timeout(std::time::Duration::from_secs(5), read_all)
         .await
-        .map_err(|_| "DevTools 读取超时".to_string())??;
+        .map_err(|_| "DevTools read timed out".to_string())??;
     let text = String::from_utf8_lossy(&buf);
-    let body = text.split("\r\n\r\n").nth(1).ok_or("DevTools 响应无正文")?;
-    serde_json::from_str(body).map_err(|e| format!("DevTools JSON 解析失败: {e}"))
+    let body = text
+        .split("\r\n\r\n")
+        .nth(1)
+        .ok_or("DevTools response has no body")?;
+    serde_json::from_str(body).map_err(|e| format!("failed to parse DevTools JSON: {e}"))
 }
 
 /// 未给 --profile-dir 时的一次性 profile 目录（本进程专属；退出时由
@@ -231,6 +230,7 @@ impl Browser {
         start_url: Option<&str>,
         profile_dir: Option<&str>,
         cache_dir: Option<&str>,
+        pulse_server: Option<&str>,
     ) -> CdpResult<Arc<Browser>> {
         let exe = find_chromium(chromium)?;
         let port = {
@@ -280,7 +280,13 @@ impl Browser {
         if let Some(c) = &cache_arg {
             argv.push(c.clone());
         }
-        let child = tokio::process::Command::new(&exe)
+        let mut command = tokio::process::Command::new(&exe);
+        if let Some(server) = pulse_server {
+            command
+                .env("PULSE_SERVER", server)
+                .env("PULSE_SINK", crate::pulse::SINK_NAME);
+        }
+        let child = command
             .args(&argv)
             .args([
                 // 不再 --disable-gpu：它会让 WebGL 整体不可用——真
@@ -292,9 +298,7 @@ impl Browser {
                 "--disable-dev-shm-usage",
                 "--no-first-run",
                 "--no-default-browser-check",
-                // 音频不静音：声音进 PulseAudio 虚拟声卡（PULSE_SINK 由
-                // main 在启动前按 media::ensure_virtual_sink 的结果设置），
-                // 由 ffmpeg 合流输出。无声卡时 Chromium 自行走静音设备。
+                // 自拉的 PulseAudio 可用时，Chromium 声音进入独立的虚拟声卡。
                 "--autoplay-policy=no-user-gesture-required",
                 &format!("--remote-debugging-port={port}"),
                 &format!("--user-data-dir={}", profile.display()),
@@ -308,7 +312,7 @@ impl Browser {
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn()
-            .map_err(|e| format!("启动 Chromium 失败: {e}"))?;
+            .map_err(|e| format!("failed to launch Chromium: {e}"))?;
 
         // 等 DevTools 端点就绪
         let version_url = format!("http://127.0.0.1:{port}/json/version");
@@ -323,7 +327,7 @@ impl Browser {
             tokio::time::sleep(std::time::Duration::from_millis(250)).await;
         }
         if ws_url.is_empty() {
-            return Err("Chromium DevTools 端点未就绪".into());
+            return Err("Chromium DevTools endpoint is not ready".into());
         }
         let cdp = Cdp::connect(&ws_url).await?;
         let browser = Self::finish_connect(cdp, Some(child)).await?;
@@ -354,7 +358,7 @@ impl Browser {
         }
         if ws_url.is_empty() {
             return Err(format!(
-                "挂靠失败：{version_url} 未给出 webSocketDebuggerUrl"
+                "Attach failed: {version_url} did not provide a webSocketDebuggerUrl"
             ));
         }
         let cdp = Cdp::connect(&ws_url).await?;
@@ -631,7 +635,7 @@ impl Browser {
             }
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         }
-        Err("主页面会话未出现".into())
+        Err("main page session did not appear".into())
     }
 
     pub async fn main(&self) -> CdpResult<String> {
@@ -640,7 +644,7 @@ impl Browser {
 
     pub async fn active_page(&self) -> CdpResult<ActivePage> {
         let main = self.main_session.lock().await;
-        let session = main.0.clone().ok_or("无主页面会话".to_string())?;
+        let session = main.0.clone().ok_or("no main page session".to_string())?;
         Ok(ActivePage {
             session,
             generation: main.1,
@@ -657,7 +661,7 @@ impl Browser {
         v.pointer("/frameTree/frame/loaderId")
             .and_then(Value::as_str)
             .map(str::to_string)
-            .ok_or_else(|| "getFrameTree 无 loaderId".to_string())
+            .ok_or_else(|| "getFrameTree returned no loaderId".to_string())
     }
 
     /// 把主会话切到指定页面会话。人通道切换活动标签时调用：
@@ -762,7 +766,7 @@ impl Browser {
         let root = r
             .get("root")
             .filter(|node| node.is_object())
-            .ok_or("DOM.getDocument 无根节点")?;
+            .ok_or("DOM.getDocument returned no root node")?;
         let mut map = HashMap::new();
         collect_dom(root, &mut map);
         Ok(map)
@@ -782,7 +786,7 @@ impl Browser {
             .pointer("/model/border")
             .and_then(Value::as_array)
             .filter(|p| p.len() == 8)
-            .ok_or("DOM.getBoxModel 无完整边框")?;
+            .ok_or("DOM.getBoxModel returned no complete border")?;
         let mut bounds = [
             f32::INFINITY,
             f32::INFINITY,
@@ -794,13 +798,13 @@ impl Browser {
                 .as_f64()
                 .map(|v| v as f32)
                 .filter(|v| v.is_finite())
-                .ok_or("DOM.getBoxModel 无有效边框坐标")?;
+                .ok_or("DOM.getBoxModel returned no valid border coordinates")?;
             let axis = i % 2;
             bounds[axis] = bounds[axis].min(v);
             bounds[axis + 2] = bounds[axis + 2].max(v);
         }
         if bounds[0] >= bounds[2] || bounds[1] >= bounds[3] {
-            return Err("DOM.getBoxModel 边框退化".into());
+            return Err("DOM.getBoxModel border is degenerate".into());
         }
         Ok(bounds)
     }
@@ -813,7 +817,7 @@ impl Browser {
         r.pointer("/frameTree/frame/id")
             .and_then(Value::as_str)
             .map(str::to_string)
-            .ok_or_else(|| "getFrameTree 无 frame id".to_string())
+            .ok_or_else(|| "getFrameTree returned no frame id".to_string())
     }
 
     /// 取页面已加载的图片资源字节（base64）：跨源图片在页内
@@ -845,7 +849,7 @@ impl Browser {
         let fid = tree
             .get("frameTree")
             .and_then(|t| find(t, url))
-            .ok_or("资源树里没有该图片")?;
+            .ok_or("the image is not in the resource tree")?;
         let r = self
             .cdp
             .call(
@@ -857,11 +861,11 @@ impl Browser {
         let content = r
             .get("content")
             .and_then(Value::as_str)
-            .ok_or("getResourceContent 无内容")?;
+            .ok_or("getResourceContent returned no content")?;
         if r.get("base64Encoded").and_then(Value::as_bool) == Some(true) {
             Ok(content.to_string())
         } else {
-            Err("图片资源不是二进制".to_string())
+            Err("the image resource is not binary".to_string())
         }
     }
 
@@ -1008,13 +1012,13 @@ impl Browser {
             .await?;
         let vv = r
             .get("cssVisualViewport")
-            .ok_or("getLayoutMetrics 无 cssVisualViewport")?;
+            .ok_or("getLayoutMetrics returned no cssVisualViewport")?;
         let f = |key: &str| {
             vv.get(key)
                 .and_then(Value::as_f64)
                 .map(|v| v as f32)
                 .filter(|v| v.is_finite())
-                .ok_or_else(|| format!("cssVisualViewport 无有效 {key}"))
+                .ok_or_else(|| format!("cssVisualViewport has no valid {key}"))
         };
         let d = self
             .cdp
@@ -1030,11 +1034,11 @@ impl Browser {
             scale: d
                 .pointer("/result/value")
                 .and_then(Value::as_f64)
-                .ok_or("无法取得 devicePixelRatio")? as f32,
+                .ok_or("cannot obtain devicePixelRatio")? as f32,
         };
         let visual_scale = f("scale")?;
         if !space.is_valid() || visual_scale <= 0.0 {
-            return Err("视口坐标空间无效".into());
+            return Err("viewport coordinate space is invalid".into());
         }
         Ok(ViewState {
             space,
@@ -1061,7 +1065,7 @@ impl Browser {
             )
             .await?;
         if let Some(exc) = r.get("exceptionDetails") {
-            return Err(format!("页面 JS 异常: {exc}"));
+            return Err(format!("page JS exception: {exc}"));
         }
         Ok(r.pointer("/result/value").cloned().unwrap_or(Value::Null))
     }
@@ -1090,7 +1094,7 @@ impl Browser {
             .await?;
         hit.get("backendNodeId")
             .and_then(Value::as_i64)
-            .ok_or_else(|| "命中未返回节点".to_string())
+            .ok_or_else(|| "hit test returned no node".to_string())
     }
 
     pub async fn element_receives_pointer(
@@ -1136,7 +1140,7 @@ impl Browser {
                 .await
                 .get(&session)
                 .and_then(|info| info.parent.clone())
-                .ok_or("子帧会话无父会话")?;
+                .ok_or("subframe session has no parent session")?;
             let view = self.view_state(&session).await?.space;
             if !view.contains(x, y) {
                 return Ok(false);
@@ -1153,7 +1157,7 @@ impl Browser {
             let backend = owner
                 .get("backendNodeId")
                 .and_then(Value::as_i64)
-                .ok_or("无法定位子帧宿主")?;
+                .ok_or("cannot locate the subframe host")?;
             let model = self
                 .cdp
                 .call(
@@ -1166,14 +1170,14 @@ impl Browser {
                 .pointer("/model/content")
                 .and_then(Value::as_array)
                 .filter(|quad| quad.len() == 8)
-                .ok_or("子帧宿主无有效内容边框")?;
+                .ok_or("subframe host has no valid content border")?;
             let mut quad = [0.0; 8];
             for (point, value) in quad.iter_mut().zip(content) {
                 *point = value
                     .as_f64()
                     .map(|value| value as f32)
                     .filter(|value| value.is_finite())
-                    .ok_or("子帧宿主坐标无效")?;
+                    .ok_or("subframe host coordinates are invalid")?;
             }
             let (u, v) = (x / view.width, y / view.height);
             let project = |axis: usize| {
@@ -1445,11 +1449,11 @@ impl Browser {
         let b64 = r
             .get("data")
             .and_then(Value::as_str)
-            .ok_or("captureScreenshot 无 data")?;
+            .ok_or("captureScreenshot returned no data")?;
         use base64::Engine;
         base64::engine::general_purpose::STANDARD
             .decode(b64)
-            .map_err(|e| format!("截图 base64 解码失败: {e}"))
+            .map_err(|e| format!("screenshot base64 decode failed: {e}"))
     }
 
     /// 区域截图（DOM 区域子流用）：对页面表面按视口相对 CSS px
@@ -1540,7 +1544,7 @@ impl Browser {
         v.get("targetId")
             .and_then(Value::as_str)
             .map(str::to_string)
-            .ok_or_else(|| "createTarget 无 targetId".to_string())
+            .ok_or_else(|| "createTarget returned no targetId".to_string())
     }
 
     pub async fn close_target(&self, target_id: &str) -> CdpResult<()> {
@@ -1649,7 +1653,7 @@ impl Browser {
         let data = v
             .get("data")
             .and_then(Value::as_str)
-            .ok_or_else(|| "printToPDF 无 data".to_string())?;
+            .ok_or_else(|| "printToPDF returned no data".to_string())?;
         use base64::Engine;
         base64::engine::general_purpose::STANDARD
             .decode(data)
@@ -1743,5 +1747,79 @@ fn collect_dom(node: &Value, map: &mut DomMap) {
     }
     if let Some(t) = node.get("templateContent") {
         collect_dom(t, map);
+    }
+}
+
+#[cfg(test)]
+mod chromium_lookup_tests {
+    use super::{chromium_in_dir, find_chromium, find_on_path, is_executable};
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static NEXT_DIR: AtomicUsize = AtomicUsize::new(0);
+
+    struct TestDir(PathBuf);
+
+    impl TestDir {
+        fn new() -> Self {
+            let id = NEXT_DIR.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir()
+                .join(format!("rig-chromium-lookup-{}-{id}", std::process::id()));
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+
+        fn add_executable(&self, name: &str) -> PathBuf {
+            let path = self.0.join(name);
+            std::fs::write(&path, b"test").unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            path
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn explicit_directory_finds_direct_chrome_or_chromium() {
+        let dir = TestDir::new();
+        let expected = dir.add_executable("chromium");
+        assert_eq!(chromium_in_dir(Path::new(&dir.0)), Some(expected));
+    }
+
+    #[test]
+    fn explicit_directory_rejects_nested_or_non_executable_candidates() {
+        let dir = TestDir::new();
+        std::fs::create_dir(dir.0.join("nested")).unwrap();
+        std::fs::write(dir.0.join("nested/chrome"), b"test").unwrap();
+        let non_executable = dir.0.join("chrome");
+        std::fs::write(&non_executable, b"test").unwrap();
+        assert_eq!(chromium_in_dir(Path::new(&dir.0)), None);
+    }
+
+    #[test]
+    fn invalid_explicit_directory_error_names_option() {
+        let dir = TestDir::new();
+        let error = find_chromium(dir.0.to_str()).unwrap_err();
+        assert!(error.to_string().contains("--chromium-dir"));
+    }
+
+    #[test]
+    fn path_lookup_finds_only_executable_named_candidates() {
+        let dir = TestDir::new();
+        let expected = dir.add_executable("google-chrome");
+        assert_eq!(
+            find_on_path("google-chrome", Some(dir.0.as_os_str())),
+            Some(expected)
+        );
+        assert_eq!(find_on_path("chromium", Some(dir.0.as_os_str())), None);
+        assert!(!is_executable(&dir.0.join("missing")));
     }
 }

@@ -9,13 +9,17 @@
 
 ## 快速开始
 
+将发布包完整解压，执行其中的 `./rig-edge-browser --stdio`。包内已带 FFmpeg 共享库和 PulseAudio。系统 Chromium 从 `PATH` 查找，便携浏览器用 `--chromium-dir /path/to/chrome-linux64` 指定。观看页、局域网和持久化配置见 [运行配方](docs/05-编译部署与运行.md#3-运行配方)。当前验证环境为 Ubuntu 26.04、Linux x86_64、glibc 2.43。
+
+从源码开发（构建依赖与源码运行要求见 [docs/04](docs/04-依赖与环境.md)）：
+
 ```bash
 # 编译（依赖见 docs/04-依赖与环境.md）
 cargo build --release
 
 # 人在本机看：打开 http://127.0.0.1:39871/ 并输入令牌
 TOKEN=$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')
-target/release/rig-edge-browser --listen 127.0.0.1:39871 --token "$TOKEN" --human --url https://example.com
+RIG_EDGE_TOKEN="$TOKEN" target/release/rig-edge-browser --listen 127.0.0.1:39871 --human --url https://example.com
 
 # AI 本机子进程（MCP stdio）：由智能体宿主拉起
 target/release/rig-edge-browser --stdio --url https://example.com
@@ -47,7 +51,7 @@ target/release/rig-edge-browser --stdio --url https://example.com
 | `scripts/build.sh [debug\|release]` | 编译并检查动态库依赖 |
 | `scripts/test.sh [unit\|it\|av\|py\|all]` | 测试入口（`it` 为真 Chromium 集成测试） |
 | `scripts/local-gate.sh` | 提交前完整门禁 |
-| `scripts/release.sh` | 发布打包到 `dist/`（tar.gz + sha256） |
+| `scripts/release.sh` | 打包程序、FFmpeg 共享库和 PulseAudio 到 `dist/`（tar.gz + sha256）；发布/升级需使用完整归档 |
 | `scripts/run.sh` | 本地快速运行（随机令牌 + 观看页） |
 | `scripts/clean-tmp.sh` | 清理 `/tmp` 残余临时目录 |
 
@@ -59,8 +63,8 @@ target/release/rig-edge-browser --stdio --url https://example.com
 source scripts/local-env.sh          # 构建缓存重定向到 .temp/（可选）
 cargo fmt --all --check
 cargo clippy --all-targets -- -D warnings
-cargo test --all
-RIG_EDGE_IT=1 cargo test --all       # 真 Chromium 集成测试（见 docs/09）
+scripts/test.sh unit
+scripts/test.sh it                   # 真 Chromium 集成测试（见 docs/09）
 python3 -m unittest discover -s tests/eval_report -p 'test_*.py' -v
 ```
 
@@ -73,8 +77,8 @@ python3 -m unittest discover -s tests/eval_report -p 'test_*.py' -v
 | `crates/rig-eval` | 感知层评估框架 |
 | `eval/` | 评估任务、测试页面、历史运行证据（`results/` 只读） |
 | `docs/` | 文档集（入口 `docs/README.md`） |
-| `scripts/` | 构建/测试/发布/运行/清理脚本（见上表）、`edge-lan.sh`、`with-pulse.sh`、`local-env.sh`、`eval_report.py` |
-| `.temp/` | 本地可再生产物：构建缓存、日志、便携 PulseAudio（git 忽略，可随时删除） |
+| `scripts/` | 构建/测试/发布/运行/清理脚本（见上表）、`edge-lan.sh`、`local-env.sh`、`eval_report.py` |
+| `.temp/` | 本地可再生产物：构建缓存、日志、便携 PulseAudio；运行临时目录在系统临时目录下（git 忽略） |
 
 > 并发说明：按**单人受信工具**设计——多观看端并发时全局状态不保证相互独立。
 > 网关/传输层已整仓移除（另有备份），本仓库只保留 Chromium 控制与 AI/人双通道。

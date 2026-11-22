@@ -126,16 +126,19 @@ impl VideoEncoder {
         for cand in hw_candidates(kind) {
             match Self::open_hw(&cand, cfg) {
                 Ok(enc) => {
-                    eprintln!("[encode] {:?} 使用硬编 {}", kind, enc.name);
+                    eprintln!("[encode] {:?} using hardware encoder {}", kind, enc.name);
                     return Ok(enc);
                 }
                 Err(e) => {
-                    eprintln!("[encode] 硬编候选 {} 不可用（{e}），试下一个", cand.encoder);
+                    eprintln!("[encode] hardware encoder candidate {} unavailable ({e}); trying the next one", cand.encoder);
                 }
             }
         }
         let enc = Self::open_sw(kind, cfg)?;
-        eprintln!("[encode] {:?} 回落软编 {}", kind, enc.name);
+        eprintln!(
+            "[encode] {:?} falling back to software encoder {}",
+            kind, enc.name
+        );
         Ok(enc)
     }
 

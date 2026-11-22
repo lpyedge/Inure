@@ -37,7 +37,7 @@ struct State {
 fn random_token() -> String {
     let mut b = [0u8; 32];
     // 系统随机源不可用时无法安全运行，直接终止比发弱令牌好
-    getrandom::fill(&mut b).expect("系统随机源不可用");
+    getrandom::fill(&mut b).expect("system random source unavailable");
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
