@@ -49,7 +49,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{Request, State};
+use axum::extract::{Query, Request, State};
 use axum::http::{header, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Response};
@@ -63,7 +63,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::sync::{watch, Mutex};
 
-use ai::{AiChannel, ObserveOut};
+use ai::{AiChannel, ObserveOut, ShotOpts};
 use browser::Browser;
 use exec::ExecControl;
 use human::HumanChannel;
@@ -1069,12 +1069,68 @@ async fn act(State(app): State<Arc<App>>, Json(body): Json<serde_json::Value>) -
     }
 }
 
-async fn screenshot(State(app): State<Arc<App>>) -> Response {
+#[derive(Deserialize, Default)]
+struct ShotQuery {
+    annotate: Option<String>,
+    /// `x,y,w,h`，当前视口的逻辑像素。
+    clip: Option<String>,
+}
+
+/// 截图请求参数：`annotate` 缺省为 none（不画编号标注），`clip` 缺省为整屏。
+fn parse_shot_opts(annotate: Option<&str>, clip: Option<[f32; 4]>) -> Result<ShotOpts, String> {
+    let marks = match annotate {
+        None | Some("none") => false,
+        Some("marks") => true,
+        Some(_) => return Err("annotate must be 'none' or 'marks'".into()),
+    };
+    Ok(ShotOpts { marks, clip })
+}
+
+fn parse_clip_query(raw: &str) -> Result<[f32; 4], String> {
+    let parts: Vec<f32> = raw
+        .split(',')
+        .map(|v| v.trim().parse::<f32>())
+        .collect::<Result<_, _>>()
+        .map_err(|_| "clip must be 'x,y,w,h' (numbers)".to_string())?;
+    <[f32; 4]>::try_from(parts).map_err(|_| "clip must be 'x,y,w,h' (4 numbers)".to_string())
+}
+
+fn clip_json(clip: [f32; 4], scale: f32) -> serde_json::Value {
+    json!({"clip": {"x": clip[0], "y": clip[1], "width": clip[2], "height": clip[3]}, "scale": scale})
+}
+
+async fn screenshot(State(app): State<Arc<App>>, Query(q): Query<ShotQuery>) -> Response {
     if !app.gate_ai.load(Ordering::SeqCst) {
         return channel_off();
     }
-    match app.ai.marked_screenshot().await {
-        Ok(png) => ([(header::CONTENT_TYPE, "image/png")], png).into_response(),
+    let clip = match q.clip.as_deref().map(parse_clip_query).transpose() {
+        Ok(c) => c,
+        Err(e) => return (StatusCode::BAD_REQUEST, Json(json!({"error": e}))).into_response(),
+    };
+    let opts = match parse_shot_opts(q.annotate.as_deref(), clip) {
+        Ok(o) => o,
+        Err(e) => return (StatusCode::BAD_REQUEST, Json(json!({"error": e}))).into_response(),
+    };
+    match app.ai.screenshot(opts).await {
+        Ok(shot) if opts.clip.is_some() => (
+            [
+                (header::CONTENT_TYPE, "image/png".to_string()),
+                (
+                    header::HeaderName::from_static("x-rig-clip"),
+                    format!(
+                        "{},{},{},{}",
+                        shot.clip[0], shot.clip[1], shot.clip[2], shot.clip[3]
+                    ),
+                ),
+                (
+                    header::HeaderName::from_static("x-rig-image-scale"),
+                    shot.scale.to_string(),
+                ),
+            ],
+            shot.png,
+        )
+            .into_response(),
+        Ok(shot) => ([(header::CONTENT_TYPE, "image/png")], shot.png).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response(),
     }
 }
@@ -1628,8 +1684,25 @@ fn mcp_tools() -> serde_json::Value {
         },
         {
             "name": "screenshot",
-            "description": "Capture a numbered PNG screenshot of the current page (sensitive areas are blacked out). Fallback for regions without semantics (canvas, etc.).",
-            "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false}
+            "description": "Capture a PNG screenshot of the current page (sensitive areas are blacked out). Fallback for regions without semantics (canvas, etc.). Optional parameters: annotate='none' (default) returns the plain page; 'marks' draws element outlines and id numbers, which can cover text and labels. clip={x,y,width,height} (viewport logical pixels) returns only that region at native resolution, together with the clip actually delivered and the image scale; a point (px,py) in the clipped image is at logical (x+px/scale, y+py/scale), and actions use full-viewport logical coordinates.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "annotate": {"type": "string", "enum": ["none", "marks"]},
+                    "clip": {
+                        "type": "object",
+                        "properties": {
+                            "x": {"type": "number"},
+                            "y": {"type": "number"},
+                            "width": {"type": "number"},
+                            "height": {"type": "number"}
+                        },
+                        "required": ["x", "y", "width", "height"],
+                        "additionalProperties": false
+                    }
+                },
+                "additionalProperties": false
+            }
         }
     ])
 }
@@ -1773,20 +1846,40 @@ async fn mcp_call(app: &Arc<App>, params: &serde_json::Value) -> (serde_json::Va
                 Err(e) => (err(format!("failed to parse ActionRequest: {e}")), false),
             }
         }
-        "screenshot" => match app.ai.marked_screenshot().await {
-            Ok(png) => {
-                use base64::Engine;
-                let b64 = base64::engine::general_purpose::STANDARD.encode(&png);
-                (
-                    json!({
-                        "content": [{"type": "image", "data": b64, "mimeType": "image/png"}],
-                        "isError": false
-                    }),
-                    false,
-                )
+        "screenshot" => {
+            let clip = match args.get("clip") {
+                None | Some(serde_json::Value::Null) => None,
+                Some(c) => {
+                    let n = |k: &str| {
+                        c.get(k)
+                            .and_then(serde_json::Value::as_f64)
+                            .map(|v| v as f32)
+                    };
+                    match (n("x"), n("y"), n("width"), n("height")) {
+                        (Some(x), Some(y), Some(w), Some(h)) => Some([x, y, w, h]),
+                        _ => return (err("clip needs numeric x, y, width, height".into()), false),
+                    }
+                }
+            };
+            let annotate = args.get("annotate").and_then(serde_json::Value::as_str);
+            let opts = match parse_shot_opts(annotate, clip) {
+                Ok(o) => o,
+                Err(e) => return (err(e), false),
+            };
+            match app.ai.screenshot(opts).await {
+                Ok(shot) => {
+                    use base64::Engine;
+                    let b64 = base64::engine::general_purpose::STANDARD.encode(&shot.png);
+                    let mut content =
+                        vec![json!({"type": "image", "data": b64, "mimeType": "image/png"})];
+                    if opts.clip.is_some() {
+                        content.push(json!({"type": "text", "text": clip_json(shot.clip, shot.scale).to_string()}));
+                    }
+                    (json!({"content": content, "isError": false}), false)
+                }
+                Err(e) => (err(e), false),
             }
-            Err(e) => (err(e), false),
-        },
+        }
         _ => (err(format!("unknown tool: {name}")), false),
     };
     (result, taken)
@@ -1794,6 +1887,27 @@ async fn mcp_call(app: &Arc<App>, params: &serde_json::Value) -> (serde_json::Va
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn shot_params_default_to_plain_full_page() {
+        assert_eq!(
+            super::parse_shot_opts(None, None).unwrap(),
+            super::ShotOpts::default()
+        );
+        assert!(super::parse_shot_opts(Some("marks"), None).unwrap().marks);
+        assert!(super::parse_shot_opts(Some("all"), None).is_err());
+    }
+
+    #[test]
+    fn shot_clip_query_needs_four_numbers() {
+        assert_eq!(
+            super::parse_clip_query("10, 20,30.5,40").unwrap(),
+            [10.0, 20.0, 30.5, 40.0]
+        );
+        for bad in ["", "1,2,3", "1,2,3,4,5", "a,b,c,d"] {
+            assert!(super::parse_clip_query(bad).is_err(), "{bad}");
+        }
+    }
+
     #[test]
     fn remove_temp_dirs_deletes_contents_and_tolerates_missing() {
         let d = std::env::temp_dir().join(format!("rig-cleanup-ut-{}", std::process::id()));

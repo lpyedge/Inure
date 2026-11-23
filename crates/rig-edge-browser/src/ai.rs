@@ -377,10 +377,13 @@ impl AiChannel {
 
     /// 固定主会话及坐标空间采集。采集跨过切页、根导航或视口变化时，
     /// 丢弃候选帧并在同一请求截止时间内重采。
+    /// `store=false`：只给本次调用用（截图），不替换存储帧——调用方手里的
+    /// 观察帧不能被一次呈现作废。
     async fn observe_full(
         &self,
         deadline: tokio::time::Instant,
         validation: bool,
+        store: bool,
     ) -> Result<Arc<FrameState>, String> {
         tokio::time::timeout_at(deadline, async {
             let mut ids = self.ids.lock().await;
@@ -415,7 +418,9 @@ impl AiChannel {
                     warnings,
                     validation,
                 });
-                *state = Some(frame.clone());
+                if store {
+                    *state = Some(frame.clone());
+                }
                 return Ok(frame);
             }
         })
@@ -461,7 +466,7 @@ impl AiChannel {
         req: &ObserveRequest,
         deadline: tokio::time::Instant,
     ) -> Result<ObserveOut, String> {
-        let frame = self.observe_full(deadline, false).await?;
+        let frame = self.observe_full(deadline, false, true).await?;
         self.present(&frame, req, deadline).await
     }
 
@@ -481,8 +486,11 @@ impl AiChannel {
         let (view, note) = project(&frame.obs, &projection)?;
         let mut warnings = frame.warnings.clone();
         let image = if req.mode == ObserveMode::TreeImage {
-            match self.capture_marked(frame, &view, deadline).await {
-                Ok(png) => Some(png),
+            match self
+                .capture_shot(frame, &view, ShotOpts::marked(), deadline)
+                .await
+            {
+                Ok(shot) => Some(shot.png),
                 Err(warning) => {
                     warnings.push(warning);
                     None
@@ -649,12 +657,13 @@ impl AiChannel {
         });
     }
 
-    async fn capture_marked(
+    async fn capture_shot(
         &self,
         frame: &FrameState,
         view: &Observation,
+        opts: ShotOpts,
         deadline: tokio::time::Instant,
-    ) -> Result<Vec<u8>, String> {
+    ) -> Result<Shot, String> {
         tokio::time::timeout_at(deadline, async {
             if !frame.warnings.is_empty() || !self.context_is_current(frame).await {
                 return Err(
@@ -700,18 +709,18 @@ impl AiChannel {
                 );
             }
             let scale = context.view.space.scale * context.view.visual_scale;
-            draw_marks(&png, view, scale, masks.regions.into_values())
+            render_shot(&png, view, scale, masks.regions.into_values(), opts)
         })
         .await
         .map_err(|_| "Screenshot timed out".to_string())?
     }
 
-    /// 编号截图：当前帧的合成图，交互元素描边+编号，敏感区域黑块打码。
-    pub async fn marked_screenshot(&self) -> Result<Vec<u8>, String> {
+    /// 截图：当前帧的合成图，敏感区域黑块打码；`opts` 决定是否画编号标注、是否裁剪。
+    pub async fn screenshot(&self, opts: ShotOpts) -> Result<Shot, String> {
         let deadline = observation_deadline();
         let h = self.exec.begin_observe().await;
         let result = async {
-            let frame = self.observe_full(deadline, false).await?;
+            let frame = self.observe_full(deadline, false, false).await?;
             let projection = Projection {
                 include_offscreen: false,
                 subtree: None,
@@ -719,7 +728,7 @@ impl AiChannel {
                 layout: TextLayout::Tree,
             };
             let (view, _) = project(&frame.obs, &projection)?;
-            self.capture_marked(&frame, &view, deadline).await
+            self.capture_shot(&frame, &view, opts, deadline).await
         }
         .await;
         if result.is_ok() {
@@ -1022,7 +1031,7 @@ impl AiChannel {
         }
         let frame = match seen_state.as_ref().filter(|_| !has_element || fast_ok) {
             Some(state) => state.clone(),
-            None => match self.observe_full(observation_deadline(), true).await {
+            None => match self.observe_full(observation_deadline(), true, true).await {
                 Ok(frame) => frame,
                 Err(e) => {
                     return ActionResult::Rejected {
@@ -1093,7 +1102,7 @@ impl AiChannel {
             _ => None,
         };
         if let Some(mode) = live_check {
-            match self.observe_full(observation_deadline(), true).await {
+            match self.observe_full(observation_deadline(), true, true).await {
                 Ok(fresh) => {
                     let stale = frame.context != fresh.context
                         || match mode {
@@ -1866,12 +1875,55 @@ fn digit_rows(d: u8) -> [[bool; 3]; 5] {
     rows
 }
 
-fn draw_marks(
+/// 截图参数。`clip` 为视口逻辑像素矩形 `[x, y, w, h]`。
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct ShotOpts {
+    pub marks: bool,
+    pub clip: Option<[f32; 4]>,
+}
+
+impl ShotOpts {
+    /// 带交互元素编号标注的整屏图（observe 的 tree_image 用）。
+    pub fn marked() -> Self {
+        Self {
+            marks: true,
+            clip: None,
+        }
+    }
+}
+
+/// 截图结果；`clip` 是实际交付的逻辑像素矩形（裁剪时已按视口取整收窄），
+/// `scale` 是图像像素与逻辑像素之比。
+#[derive(Clone, Debug)]
+pub struct Shot {
+    pub png: Vec<u8>,
+    pub clip: [f32; 4],
+    pub scale: f32,
+}
+
+/// 把请求的裁剪矩形收窄到视口内；空矩形、非有限数一律拒绝。
+fn clamp_clip(clip: [f32; 4], width: f32, height: f32) -> Result<[f32; 4], String> {
+    let [x, y, w, h] = clip;
+    if !clip.iter().all(|v| v.is_finite()) || w <= 0.0 || h <= 0.0 {
+        return Err("clip must be a finite rectangle with positive width and height".into());
+    }
+    let x0 = x.max(0.0);
+    let y0 = y.max(0.0);
+    let x1 = (x + w).min(width);
+    let y1 = (y + h).min(height);
+    if x1 - x0 < 1.0 || y1 - y0 < 1.0 {
+        return Err("clip is empty or outside the viewport".into());
+    }
+    Ok([x0, y0, x1 - x0, y1 - y0])
+}
+
+fn render_shot(
     png: &[u8],
     obs: &Observation,
     scale: f32,
     masks: impl IntoIterator<Item = BBox>,
-) -> Result<Vec<u8>, String> {
+    opts: ShotOpts,
+) -> Result<Shot, String> {
     use image::{Rgba, RgbaImage};
     let img = image::load_from_memory(png).map_err(|e| format!("screenshot decode failed: {e}"))?;
     let mut img = img.to_rgba8();
@@ -1904,13 +1956,15 @@ fn draw_marks(
 
     // 交互元素描边 + 编号
     let mut draw_list: Vec<(String, [f32; 4])> = Vec::new();
-    obs.each_element(&mut |e| {
-        if e.is_interactable() {
-            if let Some(b) = &e.bbox {
-                draw_list.push((e.id.clone(), b.0));
+    if opts.marks {
+        obs.each_element(&mut |e| {
+            if e.is_interactable() {
+                if let Some(b) = &e.bbox {
+                    draw_list.push((e.id.clone(), b.0));
+                }
             }
-        }
-    });
+        });
+    }
     for (id, b) in draw_list {
         let (x1, y1, x2, y2) = to_px(b);
         // 描边（2px）
@@ -1980,11 +2034,28 @@ fn draw_marks(
         );
     }
 
+    // 裁剪发生在打码之后：被裁进来的敏感区域已经是黑块。
+    let clip = match opts.clip {
+        Some(c) => clamp_clip(c, obs.space.width, obs.space.height)?,
+        None => [0.0, 0.0, obs.space.width, obs.space.height],
+    };
+    if opts.clip.is_some() {
+        let px0 = ((clip[0] * scale).floor() as u32).min(img.width().saturating_sub(1));
+        let py0 = ((clip[1] * scale).floor() as u32).min(img.height().saturating_sub(1));
+        let px1 = (((clip[0] + clip[2]) * scale).ceil() as u32).min(img.width());
+        let py1 = (((clip[1] + clip[3]) * scale).ceil() as u32).min(img.height());
+        img = image::imageops::crop_imm(&img, px0, py0, px1 - px0, py1 - py0).to_image();
+    }
+
     let mut out = Vec::new();
     let mut cur = std::io::Cursor::new(&mut out);
     img.write_to(&mut cur, image::ImageFormat::Png)
         .map_err(|e| format!("screenshot encode failed: {e}"))?;
-    Ok(out)
+    Ok(Shot {
+        png: out,
+        clip,
+        scale,
+    })
 }
 
 /// Upload 文件解析：相对路径按上传根目录解析；canonicalize 后必须落在
@@ -2100,10 +2171,111 @@ mod tests {
             .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
             .unwrap();
 
-        let out = draw_marks(&png, &view, 1.0, full.sensitive_regions()).unwrap();
-        let img = image::load_from_memory(&out).unwrap().to_rgba8();
+        let out = render_shot(
+            &png,
+            &view,
+            1.0,
+            full.sensitive_regions(),
+            ShotOpts::marked(),
+        )
+        .unwrap();
+        let img = image::load_from_memory(&out.png).unwrap().to_rgba8();
         assert_eq!(img.get_pixel(30, 20).0, [0, 0, 0, 255], "敏感区域必须打码");
         assert_eq!(img.get_pixel(80, 80).0, [255, 255, 255, 255]);
+    }
+
+    fn white_png(w: u32, h: u32) -> Vec<u8> {
+        let white = image::RgbaImage::from_pixel(w, h, image::Rgba([255, 255, 255, 255]));
+        let mut png = Vec::new();
+        image::DynamicImage::ImageRgba8(white)
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        png
+    }
+
+    fn button_obs() -> Observation {
+        use rig_proto::observation::{Element, ObservationSource, Origin, Space};
+        let space = Space {
+            width: 100.0,
+            height: 100.0,
+            scale: 1.0,
+        };
+        let mut obs = Observation::new(1, ObservationSource::Cdp, space);
+        obs.elements = vec![Element::new("e1", "button", Origin::A11y)
+            .with_bbox([20.0, 30.0, 60.0, 50.0])
+            .with_name("go")];
+        obs
+    }
+
+    /// 不带标注的截图不得出现任何标注像素；带标注时按钮边框必须是红色。
+    #[test]
+    fn render_shot_marks_only_when_requested() {
+        let obs = button_obs();
+        let png = white_png(100, 100);
+        let plain = render_shot(&png, &obs, 1.0, [], ShotOpts::default()).unwrap();
+        let img = image::load_from_memory(&plain.png).unwrap().to_rgba8();
+        assert!(img.pixels().all(|p| p.0 == [255, 255, 255, 255]));
+        assert_eq!(plain.clip, [0.0, 0.0, 100.0, 100.0]);
+        let marked = render_shot(&png, &obs, 1.0, [], ShotOpts::marked()).unwrap();
+        let img = image::load_from_memory(&marked.png).unwrap().to_rgba8();
+        assert_eq!(img.get_pixel(30, 30).0, [255, 64, 64, 255]);
+    }
+
+    /// 裁剪后尺寸与返回的矩形一致；裁进来的敏感区域仍是黑块，
+    /// 只与裁剪框部分重叠的敏感区域也不得漏出。
+    #[test]
+    fn render_shot_clip_crops_after_masking() {
+        let obs = button_obs();
+        let png = white_png(100, 100);
+        let masks = [BBox([10.0, 10.0, 40.0, 40.0])];
+        let opts = ShotOpts {
+            marks: false,
+            clip: Some([30.0, 30.0, 50.0, 50.0]),
+        };
+        let shot = render_shot(&png, &obs, 1.0, masks, opts).unwrap();
+        let img = image::load_from_memory(&shot.png).unwrap().to_rgba8();
+        assert_eq!((img.width(), img.height()), (50, 50));
+        assert_eq!(shot.clip, [30.0, 30.0, 50.0, 50.0]);
+        assert_eq!(
+            img.get_pixel(5, 5).0,
+            [0, 0, 0, 255],
+            "重叠部分必须仍是黑块"
+        );
+        assert_eq!(img.get_pixel(15, 15).0, [255, 255, 255, 255]);
+    }
+
+    #[test]
+    fn render_shot_clip_is_clamped_and_scaled() {
+        let obs = button_obs();
+        let png = white_png(200, 200); // scale 2
+        let opts = ShotOpts {
+            marks: false,
+            clip: Some([80.0, 80.0, 50.0, 50.0]),
+        };
+        let shot = render_shot(&png, &obs, 2.0, [], opts).unwrap();
+        assert_eq!(shot.clip, [80.0, 80.0, 20.0, 20.0], "超出视口的部分被收窄");
+        assert_eq!(shot.scale, 2.0);
+        let img = image::load_from_memory(&shot.png).unwrap().to_rgba8();
+        assert_eq!((img.width(), img.height()), (40, 40));
+    }
+
+    #[test]
+    fn render_shot_rejects_bad_clip() {
+        let obs = button_obs();
+        let png = white_png(100, 100);
+        for clip in [
+            [0.0, 0.0, 0.0, 10.0],
+            [0.0, 0.0, -5.0, 10.0],
+            [f32::NAN, 0.0, 10.0, 10.0],
+            [200.0, 200.0, 10.0, 10.0],
+            [0.0, 0.0, f32::INFINITY, 10.0],
+        ] {
+            let opts = ShotOpts {
+                marks: false,
+                clip: Some(clip),
+            };
+            assert!(render_shot(&png, &obs, 1.0, [], opts).is_err(), "{clip:?}");
+        }
     }
 
     use futures_util::{SinkExt, StreamExt};
@@ -2466,7 +2638,7 @@ mod tests {
                     }
                     png.ok_or(text)
                 } else {
-                    ch.marked_screenshot().await
+                    ch.screenshot(ShotOpts::marked()).await.map(|s| s.png)
                 };
                 if matches!(case, ScreenshotCase::Stable) {
                     let png = result.expect("稳定页面应交付图像");
@@ -2482,6 +2654,32 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// 截图只是呈现，不得让调用方手里的观察帧失效：
+    /// observe 之后截图，存储的帧与已交付的帧都必须仍是那一帧，
+    /// 否则带元素/坐标目标的动作会被拒为 stale_frame。
+    #[tokio::test]
+    async fn screenshot_does_not_replace_the_observed_frame() {
+        let (base, _) = spawn_fake_cdp(usize::MAX, false, Some(ScreenshotCase::Stable)).await;
+        let browser = Browser::attach(&base).await.unwrap();
+        let ch = AiChannel::new(browser, vec![], Arc::new(ExecControl::default()));
+        let (obs, _) = ch.observe().await.unwrap();
+        let stored = |ch: &AiChannel| {
+            let state = ch.state.try_lock().unwrap();
+            state.as_ref().map(|f| f.obs.frame_id)
+        };
+        let presented = |ch: &AiChannel| {
+            let p = ch.presented.try_lock().unwrap();
+            p.as_ref().map(|p| p.frame.obs.frame_id)
+        };
+        assert_eq!(stored(&ch), Some(obs.frame_id));
+        assert_eq!(presented(&ch), Some(obs.frame_id));
+        ch.screenshot(ShotOpts::default())
+            .await
+            .expect("稳定页面应交付图像");
+        assert_eq!(stored(&ch), Some(obs.frame_id), "截图不得替换存储帧");
+        assert_eq!(presented(&ch), Some(obs.frame_id), "截图不得替换已交付帧");
     }
 
     fn click_point(frame_id: u64, x: f32, y: f32) -> ActionRequest {

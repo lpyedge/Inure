@@ -6032,3 +6032,259 @@ const d=document.createElement('i');d.textContent='x';document.body.appendChild(
         );
     }
 }
+
+/// 截图的 annotate / clip 参数：默认不画标注；clip 只交付指定区域并回报实际矩形；
+/// 非法参数 400。
+#[tokio::test]
+async fn edge_screenshot_annotate_and_clip_params() {
+    if std::env::var("RIG_EDGE_IT").is_err() {
+        eprintln!("跳过：未设置 RIG_EDGE_IT");
+        return;
+    }
+    let _serial = SERIAL.lock().await;
+    let page = r#"<!DOCTYPE html><meta charset="utf-8"><title>shot</title>
+<body style="margin:0;background:#fff"><button style="position:absolute;left:100px;top:100px;width:80px;height:40px">go</button></body>"#;
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    serve(listener, vec![("/shot.html".into(), page.to_string())]);
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let edge_port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let _proc = EdgeProc(
+        edge_command()
+            .args([
+                "--listen",
+                &format!("127.0.0.1:{edge_port}"),
+                "--token",
+                TEST_TOKEN,
+                "--url",
+                &format!("http://127.0.0.1:{port}/shot.html"),
+                "--width",
+                "400",
+                "--height",
+                "300",
+            ])
+            .process_group(0)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("启动 rig-edge-browser"),
+    );
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Ok(mut s) = std::net::TcpStream::connect(("127.0.0.1", edge_port)) {
+            let _ = s.write_all(b"GET /health HTTP/1.0\r\n\r\n");
+            let mut b = String::new();
+            if s.read_to_string(&mut b).is_ok() && b.contains("\"ok\":true") {
+                break;
+            }
+        }
+        assert!(Instant::now() < deadline, "边缘程序未就绪");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+    let _ = observe(edge_port);
+
+    let (status, plain) = http(edge_port, "GET", "/screenshot.png", None);
+    assert_eq!(status, 200);
+    let plain = image::load_from_memory(&plain).unwrap().to_rgba8();
+    assert!(
+        plain.pixels().all(|p| p.0 != [255, 64, 64, 255]),
+        "默认截图不画编号标注"
+    );
+    let (status, marked) = http(edge_port, "GET", "/screenshot.png?annotate=marks", None);
+    assert_eq!(status, 200);
+    let marked = image::load_from_memory(&marked).unwrap().to_rgba8();
+    assert!(
+        marked.pixels().any(|p| p.0 == [255, 64, 64, 255]),
+        "annotate=marks 应画出元素框"
+    );
+
+    let (status, clipped) = http(edge_port, "GET", "/screenshot.png?clip=90,90,120,80", None);
+    assert_eq!(status, 200);
+    let clipped = image::load_from_memory(&clipped).unwrap().to_rgba8();
+    assert_eq!((clipped.width(), clipped.height()), (120, 80));
+
+    for bad in [
+        "clip=1,2,3",
+        "clip=0,0,0,10",
+        "annotate=all",
+        "clip=900,900,10,10",
+    ] {
+        let (status, _) = http(edge_port, "GET", &format!("/screenshot.png?{bad}"), None);
+        assert!(status == 400 || status == 500, "{bad}: {status}");
+    }
+    let (status, _) = http(edge_port, "GET", "/screenshot.png?clip=1,2,3", None);
+    assert_eq!(status, 400);
+}
+
+/// observe → screenshot → 带元素/坐标目标的 act：截图不得让 observe 的帧号过期。
+#[tokio::test]
+async fn edge_screenshot_does_not_stale_observed_frame_for_element_and_point_actions() {
+    if std::env::var("RIG_EDGE_IT").is_err() {
+        eprintln!("跳过：未设置 RIG_EDGE_IT");
+        return;
+    }
+    let _serial = SERIAL.lock().await;
+    let page = r#"<!DOCTYPE html><meta charset="utf-8"><title>frame</title>
+<body style="margin:0"><button id="b" style="position:absolute;left:100px;top:100px;width:80px;height:40px" onclick="document.title='clicked'">go</button></body>"#;
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    serve(listener, vec![("/frame.html".into(), page.to_string())]);
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let edge_port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let _proc = EdgeProc(
+        edge_command()
+            .args([
+                "--listen",
+                &format!("127.0.0.1:{edge_port}"),
+                "--token",
+                TEST_TOKEN,
+                "--url",
+                &format!("http://127.0.0.1:{port}/frame.html"),
+                "--width",
+                "400",
+                "--height",
+                "300",
+            ])
+            .process_group(0)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("启动 rig-edge-browser"),
+    );
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Ok(mut s) = std::net::TcpStream::connect(("127.0.0.1", edge_port)) {
+            let _ = s.write_all(b"GET /health HTTP/1.0\r\n\r\n");
+            let mut b = String::new();
+            if s.read_to_string(&mut b).is_ok() && b.contains("\"ok\":true") {
+                break;
+            }
+        }
+        assert!(Instant::now() < deadline, "边缘程序未就绪");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+    for target_kind in ["element", "point"] {
+        let current = observe(edge_port);
+        let frame = current["observation"]["frame_id"].as_u64().unwrap();
+        let button = find_element(&current["observation"], "button", "go").expect("应有按钮");
+        let id = button["id"].as_str().unwrap().to_string();
+        let (status, _) = http(edge_port, "GET", "/screenshot.png", None);
+        assert_eq!(status, 200);
+        let target = if target_kind == "element" {
+            json!({"by": "element", "id": id})
+        } else {
+            json!({"by": "point", "x": 140, "y": 120})
+        };
+        let result = act(edge_port, frame, json!({"kind": "click", "target": target}));
+        assert_eq!(
+            result["result"], "done",
+            "{target_kind}: 截图后沿用 observe 的帧号应被接受: {result}"
+        );
+    }
+}
+
+/// 反向：页面确实变了（目标按钮被挪走）之后，哪怕中间截过图，
+/// 沿用旧帧的元素/坐标动作也必须被拒，且不得点中任何东西。
+#[tokio::test]
+async fn edge_screenshot_does_not_launder_a_stale_frame_after_page_change() {
+    if std::env::var("RIG_EDGE_IT").is_err() {
+        eprintln!("跳过：未设置 RIG_EDGE_IT");
+        return;
+    }
+    let _serial = SERIAL.lock().await;
+    // 任意位置按下鼠标都会把按钮挪到别处；按钮被点中会把标题改成 clicked。
+    let page = r#"<!DOCTYPE html><meta charset="utf-8"><title>idle</title>
+<body style="margin:0;width:400px;height:300px" onmousedown="var b=document.getElementById('b');if(event.target.id!=='b'){b.style.left='250px';b.style.top='200px'}">
+<button id="b" style="position:absolute;left:100px;top:100px;width:80px;height:40px" onclick="document.title='clicked'">go</button></body>"#;
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    serve(listener, vec![("/moved.html".into(), page.to_string())]);
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let edge_port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let _proc = EdgeProc(
+        edge_command()
+            .args([
+                "--listen",
+                &format!("127.0.0.1:{edge_port}"),
+                "--token",
+                TEST_TOKEN,
+                "--url",
+                &format!("http://127.0.0.1:{port}/moved.html"),
+                "--width",
+                "400",
+                "--height",
+                "300",
+            ])
+            .process_group(0)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("启动 rig-edge-browser"),
+    );
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Ok(mut s) = std::net::TcpStream::connect(("127.0.0.1", edge_port)) {
+            let _ = s.write_all(b"GET /health HTTP/1.0\r\n\r\n");
+            let mut b = String::new();
+            if s.read_to_string(&mut b).is_ok() && b.contains("\"ok\":true") {
+                break;
+            }
+        }
+        assert!(Instant::now() < deadline, "边缘程序未就绪");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+    // (截图在页面变化之前, 截图在页面变化之后) 两种顺序
+    for (shot_before_change, target_kind) in [
+        (false, "element"),
+        (true, "element"),
+        (false, "point"),
+        (true, "point"),
+    ] {
+        // 复位：重新载入，按钮回到原位
+        let fresh = observe(edge_port);
+        let f0 = fresh["observation"]["frame_id"].as_u64().unwrap();
+        let _ = act(
+            edge_port,
+            f0,
+            json!({"kind":"navigate","url":format!("http://127.0.0.1:{port}/moved.html?r={target_kind}{shot_before_change}")}),
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let current = observe(edge_port);
+        let frame = current["observation"]["frame_id"].as_u64().unwrap();
+        let button = find_element(&current["observation"], "button", "go").expect("应有按钮");
+        let id = button["id"].as_str().unwrap().to_string();
+        if shot_before_change {
+            let (status, _) = http(edge_port, "GET", "/screenshot.png", None);
+            assert_eq!(status, 200);
+        }
+        // 页面变化：点击空白处，按钮被挪走（这次动作本身用当前帧）
+        let moved = act(
+            edge_port,
+            frame,
+            json!({"kind":"click","target":{"by":"point","x":350,"y":50}}),
+        );
+        assert_eq!(moved["result"], "done", "挪动按钮的点击应成功: {moved}");
+        if !shot_before_change {
+            let (status, _) = http(edge_port, "GET", "/screenshot.png", None);
+            assert_eq!(status, 200);
+        }
+        let target = if target_kind == "element" {
+            json!({"by":"element","id":id})
+        } else {
+            json!({"by":"point","x":140,"y":120})
+        };
+        let stale = act(edge_port, frame, json!({"kind":"click","target":target}));
+        assert_ne!(
+            stale["result"], "done",
+            "{target_kind}/shot_before_change={shot_before_change}: 页面已变，旧帧动作必须被拒: {stale}"
+        );
+        let after = observe(edge_port);
+        assert!(
+            find_element(&after["observation"], "document", "clicked").is_none(),
+            "{target_kind}/shot_before_change={shot_before_change}: 被拒的动作不得点中任何东西"
+        );
+    }
+}
