@@ -24,7 +24,7 @@ const SCRIPT: &str = r##"(() => {
   if (window.__rigDom) { window.__rigDom.hello(); return; }
   const S = { next: 1, ids: new WeakMap(), byId: new Map(), obs: null, queue: [], timer: 0,
               cap: {}, dead: new Set(), capT: 0, blanks: new Map(), dseq: 0,
-              watched: new Map(), fdepth: 0 };
+              watched: new Map(), frameDocs: new WeakMap(), fdepth: 0 };
   const send = (o) => {
     if (!S.obs && o.kind !== 'installed') return;
     try { window.__rigSend(JSON.stringify(o)); } catch (e) {}
@@ -155,8 +155,16 @@ const SCRIPT: &str = r##"(() => {
   // 都触发整页重同步——快照便宜且 iframe 内突变通常稀疏，比给
   // 每个内嵌文档单独维护差分流划算。表单值变化走与主文档相同
   // 的 val 旁路（id 注册表跨文档共享，镜像端按 id 定位即可）。
+  function unwatchFrame(el) {
+    const d = S.frameDocs.get(el);
+    if (!d) return;
+    S.frameDocs.delete(el);
+    S.watched.get(d)?.();
+    S.watched.delete(d);
+  }
   function watchFrame(el, d) {
     if (S.watched.has(d)) return;
+    S.frameDocs.set(el, d);
     let last = 0;
     try {
       const mo = new MutationObserver(() => {
@@ -305,6 +313,8 @@ const SCRIPT: &str = r##"(() => {
       const n = walk.pop();
       const id = S.ids.get(n);
       if (id !== undefined) { S.ids.delete(n); S.byId.delete(id); delete S.cap[id]; }
+      // 删除 iframe 不保证触发 load，监视表又按 Document 强引用：必须在这里解除。
+      if (n.nodeType === 1 && n.tagName === 'IFRAME') unwatchFrame(n);
       if (n.childNodes) for (const c of n.childNodes) walk.push(c);
     }
   }
@@ -443,6 +453,8 @@ const SCRIPT: &str = r##"(() => {
     regions,
     imgData,
     hello() { send({ kind: 'installed' }); },
+    // 诊断用：当前仍在监视的同源 iframe 文档数。
+    watchedCount() { return S.watched.size; },
     start() {
       if (!S.obs) {
         S.obs = new MutationObserver(onMutations);
@@ -455,6 +467,7 @@ const SCRIPT: &str = r##"(() => {
       if (S.capT) { clearInterval(S.capT); S.capT = 0; }
       for (const cleanup of S.watched.values()) cleanup();
       S.watched.clear();
+      S.frameDocs = new WeakMap();
       for (const timer of [S.timer, S.hT, scrTrail, rzSend]) clearTimeout(timer);
       S.timer = S.hT = scrTrail = rzSend = 0;
       S.queue = [];

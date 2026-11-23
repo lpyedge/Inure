@@ -339,8 +339,9 @@ pub async fn build_observation(
 
     let ax_dom_ms = t_axdom.elapsed().as_secs_f64() * 1000.0;
 
-    // 帧偏移合成：子帧的原点 = 父帧中 iframe 元素包围盒的左上角（父帧全局坐标）
-    for _ in 0..4 {
+    // 帧偏移合成：子帧的原点 = 父帧中 iframe 元素包围盒的左上角（父帧全局坐标）。
+    // 每一轮至少放置一层，所以最多 sessions.len() 轮；没有进展即退出。
+    for _ in 0..sessions.len().max(1) {
         let mut progress = false;
         for i in 0..sessions.len() {
             if sessions[i].placed || sessions[i].root_frame.is_empty() {
@@ -380,10 +381,18 @@ pub async fn build_observation(
         }
     }
 
+    // 没能定位的会话（宿主 iframe 没有几何、已隐藏或被拆除等）原点未知：
+    // 不输出它的元素，宁可缺也不给出错位的可点击坐标。
+    for sd in sessions.iter().filter(|sd| !sd.placed) {
+        warnings.push(format!(
+            "Frame session {} could not be positioned; its elements are omitted",
+            sd.session
+        ));
+    }
     // 逐会话建树
     let mut locate: LocateMap = HashMap::new();
     let mut roots_by_session: HashMap<String, Vec<Element>> = HashMap::new();
-    for sd in &sessions {
+    for sd in sessions.iter().filter(|sd| sd.placed) {
         let roots = build_tree(browser, ids, sd, &sd.nodes, vw, vh, &mut locate).await;
         roots_by_session.insert(sd.session.clone(), roots);
     }
@@ -416,7 +425,7 @@ pub async fn build_observation(
             top.extend(roots);
         }
     }
-    for sd in &sessions {
+    for sd in sessions.iter().filter(|sd| sd.placed) {
         for (owner, nodes) in &sd.local_frames {
             let key = (sd.session.clone(), *owner);
             if let std::collections::hash_map::Entry::Vacant(entry) = graft.entry(key) {

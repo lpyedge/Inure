@@ -6791,6 +6791,180 @@ async fn edge_batch_step_may_target_element_enabled_by_previous_step() {
     );
 }
 
+/// 深层跨进程 iframe（10 层，每层不同站点）：最深处元素的坐标必须是页面全局坐标，
+/// 不能因为嵌套超过偏移传播轮数而落回 (0,0) 偏移。会话枚举顺序是随机的，
+/// 所以重复观察多次，任何一次错位都算失败。
+#[tokio::test]
+async fn edge_deeply_nested_oopif_coordinates_are_global() {
+    if std::env::var("RIG_EDGE_IT").is_err() {
+        eprintln!("跳过：未设置 RIG_EDGE_IT");
+        return;
+    }
+    let _serial = SERIAL.lock().await;
+    let hosts = [
+        "127.0.0.1",
+        "localhost",
+        "127.0.0.2",
+        "127.0.0.3",
+        "127.0.0.4",
+        "127.0.0.5",
+        "127.0.0.6",
+        "127.0.0.7",
+        "127.0.0.8",
+        "127.0.0.9",
+    ];
+    // 监听所有回环地址：不同主机名/IP = 不同站点 = 各自独立进程
+    let listener = TcpListener::bind("0.0.0.0:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let mut pages: Vec<(String, String)> = Vec::new();
+    for (i, _) in hosts.iter().enumerate() {
+        let body = if i + 1 < hosts.len() {
+            format!(
+                r#"<!DOCTYPE html><meta charset="utf-8"><body style="margin:0"><iframe src="http://{}:{port}/p{}.html" style="position:absolute;left:10px;top:10px;width:700px;height:500px;border:0"></iframe></body>"#,
+                hosts[i + 1],
+                i + 1
+            )
+        } else {
+            r#"<!DOCTYPE html><meta charset="utf-8"><body style="margin:0"><button style="position:absolute;left:20px;top:20px;width:80px;height:30px">deep</button></body>"#.to_string()
+        };
+        pages.push((format!("/p{i}.html"), body));
+    }
+    serve(listener, pages);
+    let edge_port = free_port();
+    let _proc = spawn_edge(&[
+        "--listen".into(),
+        format!("127.0.0.1:{edge_port}"),
+        "--token".into(),
+        TEST_TOKEN.into(),
+        "--url".into(),
+        format!("http://{}:{port}/p0.html", hosts[0]),
+        "--width".into(),
+        "900".into(),
+        "--height".into(),
+        "700".into(),
+    ]);
+    wait_health(edge_port).await;
+    // 最深按钮的全局坐标：9 层 iframe 各偏 10px，再加按钮自己的 20px。
+    let expected = 9.0 * 10.0 + 20.0;
+    let deadline = Instant::now() + Duration::from_secs(40);
+    let mut seen = 0;
+    while seen < 8 {
+        let o = observe(edge_port);
+        match find_element(&o["observation"], "button", "deep") {
+            Some(b) => {
+                let bbox = b["bbox"].as_array().expect("bbox");
+                let (x, y) = (bbox[0].as_f64().unwrap(), bbox[1].as_f64().unwrap());
+                assert!(
+                    (x - expected).abs() < 3.0 && (y - expected).abs() < 3.0,
+                    "最深层按钮坐标应为全局 ({expected},{expected})，实际 ({x},{y})\n{}",
+                    o["text"].as_str().unwrap_or("")
+                );
+                seen += 1;
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+            None => {
+                // 未能定位时必须不输出可点击的错误坐标：要么出现且正确，要么暂时没有
+                assert!(Instant::now() < deadline, "应观察到 10 层嵌套里的最深按钮");
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+        }
+    }
+}
+
+const DOM_IFRAME_CHURN_HTML: &str = r#"<!DOCTYPE html><html><head><meta charset="utf-8"><title>churn</title></head>
+<body><div id="host"></div>
+<script>
+// 等镜像脚本装好并开始，再反复增删同源 iframe；每个存活足够久，让镜像来得及监视它。
+(async () => {
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  while (!(window.__rigDom && window.__rigDom.watchedCount)) await sleep(100);
+  await sleep(1500);
+  for (let i = 0; i < 30; i++) {
+    const f = document.createElement('iframe');
+    f.srcdoc = '<p>frame ' + i + '</p>';
+    document.getElementById('host').appendChild(f);
+    await sleep(150);
+    f.remove();
+    await sleep(60);
+  }
+  await sleep(500);
+  document.title = 'watched=' + window.__rigDom.watchedCount();
+})();
+</script></body></html>"#;
+
+/// 反复增删同源 iframe 后，DOM 镜像里对已删除 iframe 文档的监视器必须被清掉
+/// （此前删除 iframe 不触发 load，监视表按 Document 强引用，只增不减）。
+#[tokio::test]
+async fn edge_dom_mirror_releases_watchers_of_removed_iframes() {
+    if std::env::var("RIG_EDGE_IT").is_err() {
+        eprintln!("跳过：未设置 RIG_EDGE_IT");
+        return;
+    }
+    let _serial = SERIAL.lock().await;
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    serve(
+        listener,
+        vec![("/churn.html".into(), DOM_IFRAME_CHURN_HTML.into())],
+    );
+    let edge_port = free_port();
+    let _edge = spawn_edge(&[
+        "--listen".into(),
+        format!("127.0.0.1:{edge_port}"),
+        "--token".into(),
+        TEST_TOKEN.into(),
+        "--url".into(),
+        format!("http://127.0.0.1:{port}/churn.html"),
+        "--human".into(),
+        "--width".into(),
+        "900".into(),
+        "--height".into(),
+        "700".into(),
+    ]);
+    wait_health(edge_port).await;
+
+    use futures_util::SinkExt;
+    let (mut ws, _) = ws_connect(format!("ws://127.0.0.1:{edge_port}/ws"))
+        .await
+        .expect("人通道 WS 应可连接");
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        json!({"type": "dom-start"}).to_string().into(),
+    ))
+    .await
+    .unwrap();
+    // 页面自己在增删完成后把监视表大小写进标题；一边排空 WS，一边轮询观察
+    let deadline = Instant::now() + Duration::from_secs(40);
+    let watched = loop {
+        while let Ok(Some(Ok(_))) = tokio::time::timeout(Duration::from_millis(50), ws.next()).await
+        {
+        }
+        let o = observe(edge_port);
+        let title = o["text"]
+            .as_str()
+            .unwrap_or("")
+            .lines()
+            .find_map(|l| l.split("watched=").nth(1))
+            .map(|v| {
+                v.split(|c: char| !c.is_ascii_digit())
+                    .next()
+                    .unwrap_or("")
+                    .to_string()
+            });
+        if let Some(n) = title.and_then(|v| v.parse::<usize>().ok()) {
+            break n;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "页面应在增删完成后写出 watched=N"
+        );
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    };
+    assert!(
+        watched <= 2,
+        "已删除 iframe 的监视器应被释放，实际残留 {watched} 个"
+    );
+}
+
 /// Control+A 必须真的全选（无头 Chromium 的组合键需要带编辑命令才会触发全选），
 /// 随后 Backspace 清空输入框。
 #[tokio::test]

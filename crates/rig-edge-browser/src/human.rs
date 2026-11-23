@@ -112,6 +112,15 @@ impl Drop for CaptureLease {
     }
 }
 
+/// 帧泵运行中检查任务是否已退出的间隔。
+const PUMP_WATCH: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// 整页采集启动失败后的重试等待：500ms 起翻倍，上限 30s，避免瞬时故障时空转。
+fn capture_retry_delay(failures: u32) -> std::time::Duration {
+    let ms = 500u64.saturating_mul(1u64 << failures.saturating_sub(1).min(6));
+    std::time::Duration::from_millis(ms.min(30_000))
+}
+
 pub struct HumanChannel {
     browser: Arc<Browser>,
     exec: Arc<ExecControl>,
@@ -573,11 +582,15 @@ impl HumanChannel {
     // ── 启停与帧泵 ──────────────────────────────────────────
 
     /// 只有这个任务启动、停止或更换整页采集。
+    ///
+    /// 需求不变时也会自己醒来：泵运行中每 `PUMP_WATCH` 看一次任务是否已退出，
+    /// 启动失败后按有上限的指数退避重试，而不是一直等需求变化才有机会重启。
     pub fn manage_capture(self: &Arc<Self>) {
         let mut request = self.capture.subscribe();
         let weak = Arc::downgrade(self);
         tokio::spawn(async move {
             let mut pump: Option<(ActivePage, tokio::task::JoinHandle<()>)> = None;
+            let mut start_failures: u32 = 0;
             loop {
                 let demand = request.borrow_and_update().clone();
                 let wanted = demand.page.filter(|_| demand.consumers != 0);
@@ -600,16 +613,45 @@ impl HumanChannel {
                     }
                 }
                 if pump.is_none() {
-                    if let Some(page) = wanted {
+                    if let Some(page) = wanted.clone() {
                         match human.start_frame_pump(page.clone()).await {
-                            Ok(task) => pump = Some((page, task)),
-                            Err(e) => eprintln!("failed to start full-page capture: {e}"),
+                            Ok(task) => {
+                                start_failures = 0;
+                                pump = Some((page, task));
+                            }
+                            Err(e) => {
+                                start_failures = start_failures.saturating_add(1);
+                                eprintln!("failed to start full-page capture: {e}");
+                            }
                         }
+                    } else {
+                        start_failures = 0;
                     }
                 }
                 drop(human);
-                if request.changed().await.is_err() {
-                    break;
+                // 有泵：定期看它是否已退出；有需求却没泵（启动失败）：退避后重试；
+                // 无需求：只等需求变化。
+                let wake = match (pump.is_some(), wanted.is_some()) {
+                    (true, _) => Some(PUMP_WATCH),
+                    (false, true) => Some(capture_retry_delay(start_failures)),
+                    (false, false) => None,
+                };
+                match wake {
+                    Some(after) => {
+                        tokio::select! {
+                            changed = request.changed() => {
+                                if changed.is_err() {
+                                    break;
+                                }
+                            }
+                            () = tokio::time::sleep(after) => {}
+                        }
+                    }
+                    None => {
+                        if request.changed().await.is_err() {
+                            break;
+                        }
+                    }
                 }
             }
             if let Some((_, task)) = pump {
@@ -2051,6 +2093,18 @@ fn decode_jpeg_rgb(raw: &[u8]) -> Option<image::RgbImage> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 整页采集启动失败后的重试等待：翻倍增长、有上限，且首次失败不会立即空转。
+    #[test]
+    fn capture_retry_delay_backs_off_with_a_cap() {
+        let d = |n| capture_retry_delay(n).as_millis();
+        assert_eq!(d(1), 500);
+        assert_eq!(d(2), 1000);
+        assert_eq!(d(3), 2000);
+        assert!(d(10) <= 30_000);
+        assert_eq!(d(u32::MAX), d(100), "极端失败次数也不得溢出");
+        assert!((1..=100).all(|n| d(n) >= 500 && d(n) <= 30_000));
+    }
 
     /// 图片贴上的 base64 会拼进页面 JS，必须只含标准字母表且有上限
     #[test]

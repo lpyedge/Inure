@@ -34,7 +34,31 @@ struct PipelineInner {
     stop: Arc<AtomicBool>,
     handle: std::thread::JoinHandle<()>,
     last_request: tokio::time::Instant,
+    /// 合流线程因写包持续失败而主动退出时留下的原因（/health 如实回报）。
+    failure: Arc<std::sync::Mutex<Option<String>>>,
     _capture: CaptureLease,
+}
+
+/// 连续写包失败达到这个次数就放弃本次管线（10fps 下约 3 秒），
+/// 由下一次播放列表请求重启，而不是一直宣称运行中却不再出片。
+const MAX_WRITE_FAILURES: u32 = 30;
+
+/// 写包健康度：连续失败计数，成功即清零。
+#[derive(Default)]
+struct WriteHealth {
+    consecutive: u32,
+}
+
+impl WriteHealth {
+    /// 记录一轮写包结果；连续失败达到上限返回 true（应放弃管线）。
+    fn note(&mut self, failed: bool) -> bool {
+        if failed {
+            self.consecutive += 1;
+        } else {
+            self.consecutive = 0;
+        }
+        self.consecutive >= MAX_WRITE_FAILURES
+    }
 }
 
 /// HLS 合流管线：一个进程内编码/合流线程 + 切片目录。
@@ -52,6 +76,13 @@ pub struct MediaPipeline {
 /// HLS 分片的一次性临时目录（本进程专属；含屏幕画面，退出时由 main 清理）
 pub fn hls_dir() -> std::path::PathBuf {
     std::env::temp_dir().join(format!("rig-edge-hls-{}", std::process::id()))
+}
+
+/// 每次启动管线用自己的代次目录：上一次的合流线程即使停机超时仍没退出，
+/// 也不会和新管线写同一个目录。整个 `hls_dir()` 由 main 在退出时清理。
+fn generation_dir() -> std::path::PathBuf {
+    static GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    hls_dir().join(format!("g{}", GENERATION.fetch_add(1, Ordering::SeqCst)))
 }
 
 impl MediaPipeline {
@@ -87,8 +118,7 @@ impl MediaPipeline {
         if let Some(old) = guard.take() {
             Self::stop_pipeline(old).await;
         }
-        let dir = hls_dir();
-        let _ = tokio::fs::remove_dir_all(&dir).await;
+        let dir = generation_dir();
         tokio::fs::create_dir_all(dir.join("hevc"))
             .await
             .map_err(|e| format!("failed to create HLS directory: {e}"))?;
@@ -101,15 +131,20 @@ impl MediaPipeline {
         let thread_dir = dir.clone();
         let thread_stop = stop.clone();
         let pulse_server = self.pulse_server.clone();
+        let failure = Arc::new(std::sync::Mutex::new(None));
+        let thread_failure = failure.clone();
         let handle = std::thread::Builder::new()
             .name("rig-media".into())
-            .spawn(move || pipeline_main(human, thread_dir, thread_stop, pulse_server))
+            .spawn(move || {
+                pipeline_main(human, thread_dir, thread_stop, pulse_server, thread_failure)
+            })
             .map_err(|e| format!("failed to start the muxing thread: {e}"))?;
         *guard = Some(PipelineInner {
             dir,
             stop: stop.clone(),
             handle,
             last_request: tokio::time::Instant::now(),
+            failure,
             _capture: capture,
         });
 
@@ -143,14 +178,18 @@ impl MediaPipeline {
         drop(inner._capture);
         let handle = inner.handle;
         // Pulse 阻塞读时不让通道开关无限等线程退出。
-        let _ = tokio::time::timeout(
+        let joined = tokio::time::timeout(
             Duration::from_secs(10),
             tokio::task::spawn_blocking(move || {
                 let _ = handle.join();
             }),
         )
-        .await;
-        let _ = tokio::fs::remove_dir_all(&inner.dir).await;
+        .await
+        .is_ok();
+        // 线程没退出就不删它还在写的目录，留给 main 退出时整体清理。
+        if joined {
+            let _ = tokio::fs::remove_dir_all(&inner.dir).await;
+        }
     }
 
     pub async fn apply_wanted(&self, av: bool) {
@@ -169,11 +208,19 @@ impl MediaPipeline {
 
     /// 运行态 + 最近启动错误（M03：给 /channels 与 /health）
     pub async fn state_summary(&self) -> (bool, bool, Option<String>) {
-        (
-            self.wanted(),
-            self.running().await,
-            self.last_error.lock().unwrap().clone(),
-        )
+        let running = self.running().await;
+        let failure = self
+            .inner
+            .lock()
+            .await
+            .as_ref()
+            .and_then(|inner| inner.failure.lock().ok().and_then(|f| f.clone()));
+        let start_error = self
+            .last_error
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        (self.wanted(), running, start_error.or(failure))
     }
 
     /// 有效列表请求可启动输出。成功获取文件才续期，猜测不存在的分片不续期。
@@ -306,11 +353,17 @@ impl Rendition {
         })
     }
 
-    fn write(&mut self, pkt: &ff::Packet, idx: usize, src_tb: ff::Rational, dst_tb: ff::Rational) {
+    fn write(
+        &mut self,
+        pkt: &ff::Packet,
+        idx: usize,
+        src_tb: ff::Rational,
+        dst_tb: ff::Rational,
+    ) -> Result<(), ff::Error> {
         let mut p = pkt.clone();
         p.set_stream(idx);
         p.rescale_ts(src_tb, dst_tb);
-        let _ = p.write_interleaved(&mut self.out);
+        p.write_interleaved(&mut self.out)
     }
 
     fn close(mut self) {
@@ -424,6 +477,7 @@ fn pipeline_main(
     dir: PathBuf,
     stop: Arc<AtomicBool>,
     pulse_server: Option<String>,
+    failure: Arc<std::sync::Mutex<Option<String>>>,
 ) {
     crate::encode::ensure_init();
     // 音频子线程：pulse 采集 → AAC packet 经 channel 送来；打不开则无音频轨。
@@ -463,9 +517,11 @@ fn pipeline_main(
     let aac_params_ref = aac_params.as_ref();
 
     let mut mux: Option<Mux> = None;
+    let mut health = WriteHealth::default();
     let mut next = std::time::Instant::now();
     while !stop.load(Ordering::SeqCst) {
         next += std::time::Duration::from_millis(1000 / FPS as u64);
+        let mut write_error: Option<ff::Error> = None;
         // 视频：取最近合成帧（尺寸变化或首帧时重建合流器组）
         if let Some((rgb, _composed_at)) = human.last_rgb() {
             let (w, h) = even_dims(rgb.width(), rgb.height());
@@ -492,7 +548,9 @@ fn pipeline_main(
                     if let Ok(pkts) = one.enc.encode_raw(&frame, false) {
                         let tb = one.enc.time_base();
                         for p in &pkts {
-                            one.r.write(p, one.r.v_idx, tb, one.r.v_tb);
+                            if let Err(e) = one.r.write(p, one.r.v_idx, tb, one.r.v_tb) {
+                                write_error = Some(e);
+                            }
                         }
                     }
                 }
@@ -503,11 +561,26 @@ fn pipeline_main(
             if let Some(m) = mux.as_mut() {
                 for one in m.hevc.as_mut().into_iter().chain(m.h264.as_mut()) {
                     if let (Some(idx), Some(tb)) = (one.r.a_idx, one.r.a_tb) {
-                        one.r
-                            .write(&p, idx, ff::Rational::new(1, AUDIO_RATE as i32), tb);
+                        if let Err(e) =
+                            one.r
+                                .write(&p, idx, ff::Rational::new(1, AUDIO_RATE as i32), tb)
+                        {
+                            write_error = Some(e);
+                        }
                     }
                 }
             }
+        }
+        if mux.is_some() && health.note(write_error.is_some()) {
+            let reason = format!(
+                "HLS muxer write failed {MAX_WRITE_FAILURES} times in a row ({}); the pipeline stopped and restarts on the next playlist request",
+                write_error.map(|e| e.to_string()).unwrap_or_default()
+            );
+            eprintln!("[media] {reason}");
+            if let Ok(mut slot) = failure.lock() {
+                *slot = Some(reason);
+            }
+            break;
         }
         let now = std::time::Instant::now();
         if next > now {
@@ -734,9 +807,15 @@ fn audio_main(
 mod tests {
     use super::*;
 
+    /// 这两个测试都改进程级环境变量 RIG_HLS_SINGLE，必须串行。
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// RIG_HLS_SINGLE 取值口径
     #[test]
     fn single_rendition_parses() {
+        let _env = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         std::env::remove_var("RIG_HLS_SINGLE");
         assert_eq!(single_rendition().unwrap(), None);
         for (k, v) in [
@@ -754,9 +833,34 @@ mod tests {
         assert_eq!(offered_renditions(), vec!["hevc", "h264"]);
     }
 
+    /// 每次启动用独立目录，且都在本进程的 HLS 根目录之下
+    #[test]
+    fn generation_dirs_are_unique_and_under_the_hls_root() {
+        let (a, b) = (generation_dir(), generation_dir());
+        assert_ne!(a, b);
+        assert!(a.starts_with(hls_dir()) && b.starts_with(hls_dir()));
+    }
+
+    /// 连续写包失败达到上限才放弃管线，一次成功即清零
+    #[test]
+    fn write_health_gives_up_only_after_consecutive_failures() {
+        let mut h = WriteHealth::default();
+        for _ in 0..MAX_WRITE_FAILURES - 1 {
+            assert!(!h.note(true), "未到上限不应放弃");
+        }
+        assert!(!h.note(false), "一次成功应清零");
+        for _ in 0..MAX_WRITE_FAILURES - 1 {
+            assert!(!h.note(true));
+        }
+        assert!(h.note(true), "连续失败达到上限应放弃");
+    }
+
     /// 单路构建只建一路编码器 + 一路输出目录（省一路编码）
     #[test]
     fn single_rendition_builds_one_output() {
+        let _env = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         crate::encode::ensure_init();
         std::env::set_var("RIG_HLS_SINGLE", "h264");
         let dir = std::env::temp_dir().join(format!("rig-test-single-{}", std::process::id()));
