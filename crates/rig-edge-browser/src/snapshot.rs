@@ -621,10 +621,11 @@ pub(crate) fn element_core(
         for p in props {
             let pname = p.get("name").and_then(Value::as_str).unwrap_or("");
             let pval = p.get("value");
-            let truthy = pval
-                .and_then(|v| v.get("value"))
+            // 布尔属性是 bool；checked 等三态属性是字符串 "true"/"false"/"mixed"。
+            let inner = pval.and_then(|v| v.get("value"));
+            let truthy = inner
                 .and_then(Value::as_bool)
-                .unwrap_or(false);
+                .unwrap_or_else(|| inner.and_then(Value::as_str) == Some("true"));
             match (pname, truthy) {
                 ("disabled", true) => states.push(ElementState::Disabled),
                 ("focused", true) => states.push(ElementState::Focused),
@@ -962,6 +963,38 @@ mod tests {
         let mut e = Element::new(format!("x{}", role.len()), role, Origin::A11y);
         e.name = name.map(str::to_string);
         e
+    }
+
+    #[test]
+    fn checked_tristate_string_from_cdp_sets_checked_state() {
+        // CDP 的 checked 是 tristate，值为字符串 "true"/"false"/"mixed"，不是布尔
+        let node = |checked: &str| {
+            serde_json::json!({
+                "role": {"type": "role", "value": "checkbox"},
+                "name": {"type": "computedString", "value": "Agree"},
+                "properties": [{"name": "checked", "value": {"type": "tristate", "value": checked}}]
+            })
+        };
+        let on = element_core(
+            "e1".into(),
+            &node("true"),
+            None,
+            None,
+            (0.0, 0.0),
+            100.0,
+            100.0,
+        );
+        assert!(on.has(ElementState::Checked));
+        let off = element_core(
+            "e1".into(),
+            &node("false"),
+            None,
+            None,
+            (0.0, 0.0),
+            100.0,
+            100.0,
+        );
+        assert!(!off.has(ElementState::Checked));
     }
 
     #[test]

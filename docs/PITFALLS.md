@@ -429,3 +429,10 @@
 - **结构通知只反映部分变化**：滚动、CSS 动画与 `:hover` 都可能没有 DOM 事件。边缘每次采集候选观察，再与相容的基帧比较。见 [感知设计](PERCEPTION.md)。
 - **不要依赖 `Accessibility.nodesUpdated`**：Chromium 156 下 getFullAXTree/getPartialAXTree 之后做各种改动都从未触发。
 - **测试里的页面定时器要留足余量**：`setTimeout 1200ms` 的变化会抢在基线 observe 之前发生，“没变”断言随机失败；定时拉到 5s、等 5.5s 后稳定（3/3）。
+
+## AX 三态属性 `checked` 是字符串（2026-11-23）
+
+- **症状**：点击复选框/单选框后页面状态已变（脚本读到 `checked=true`），观察里却没有 `(Checked)`，AI 无法判断是否已选中。
+- **根因**：`Accessibility` 的 `checked`（以及 `pressed`）是 tristate，`value` 是字符串 `"true"`/`"false"`/`"mixed"`，不是布尔；`element_core` 只用 `as_bool()`，所以 `Checked` 状态从未出现过。`disabled`、`expanded`、`selected` 等是布尔，不受影响。
+- **解法**：布尔属性取 `bool`，三态属性取字符串 `"true"`。回归测试 `checked_tristate_string_from_cdp_sets_checked_state`，真浏览器探针：点击后观察出现 `(Checked)`。
+- **教训**：状态映射别只看“有没有这个枚举”，要用真页面点一次再看观察；这个缺口是在对比渲染方案时用“当前是否选中”这类题目才暴露的。
