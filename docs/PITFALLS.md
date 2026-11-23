@@ -436,3 +436,9 @@
 - **根因**：`Accessibility` 的 `checked`（以及 `pressed`）是 tristate，`value` 是字符串 `"true"`/`"false"`/`"mixed"`，不是布尔；`element_core` 只用 `as_bool()`，所以 `Checked` 状态从未出现过。`disabled`、`expanded`、`selected` 等是布尔，不受影响。
 - **解法**：布尔属性取 `bool`，三态属性取字符串 `"true"`。回归测试 `checked_tristate_string_from_cdp_sets_checked_state`，真浏览器探针：点击后观察出现 `(Checked)`。
 - **教训**：状态映射别只看“有没有这个枚举”，要用真页面点一次再看观察；这个缺口是在对比渲染方案时用“当前是否选中”这类题目才暴露的。
+
+## 动画页（游戏）截图永远被拒（2026-11-23）
+
+- **症状**：`entanglement.gopherwoodstudios.com` 加载完成后，`/screenshot.png` 与 `tree_image` 连续报 “The page, viewport or sensitive regions changed during the screenshot”，模型在 canvas 游戏里看不到棋盘。
+- **根因**：截图校验要求截图期间没有结构变化事件（防“敏感元素短暂出现又恢复”）；游戏每帧改 DOM 文本/属性，事件不断，永远过不了。
+- **解法（用户批准）**：前后两次敏感区域核对都为空（整页没有敏感区域）时，只核对页面身份与根导航；有敏感区域的页面维持严格口径。回归测试 `edge_screenshot_allows_animated_page_only_without_sensitive_fields`（含密码框的动画页仍被拒）。残余风险见 [08](08-安全模型.md)。

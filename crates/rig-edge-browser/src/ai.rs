@@ -683,12 +683,18 @@ impl AiChannel {
             let after = screenshot_masks(&self.browser, session, context.view.visual_offset)
                 .await
                 .map_err(|_| "Cannot confirm the sensitive regions of the screenshot")?;
-            if masks != after
-                || !self.context_is_current(frame).await
-                || self
-                    .changes
+            // 整页没有任何敏感区域（前后两次核对一致）时，截图里没有需要打码的内容，
+            // 持续刷新 DOM 的动画页（游戏）不应因“截图期间有变化事件”而永远拿不到图；
+            // 页面身份（页面/文档/视口）与根导航仍照常核对。有敏感区域的页面维持原严格口径。
+            let no_sensitive = masks.regions.is_empty() && after.regions.is_empty();
+            let changed = if no_sensitive {
+                self.changes
+                    .root_navigated_since(mark, &context.page.session)
+            } else {
+                self.changes
                     .changed_in_sessions_since(mark, &masks.sessions)
-            {
+            };
+            if masks != after || !self.context_is_current(frame).await || changed {
                 return Err(
                     "The page, viewport or sensitive regions changed during the screenshot".into(),
                 );

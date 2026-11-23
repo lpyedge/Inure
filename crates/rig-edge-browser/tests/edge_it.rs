@@ -5951,3 +5951,84 @@ async fn edge_batch_act_runs_in_order_and_stops_at_first_failure() {
         );
     }
 }
+
+/// 持续改 DOM/重绘的动画页（游戏）：无敏感元素时截图可用；有密码框时仍拒绝（保留打码校验）。
+#[tokio::test]
+async fn edge_screenshot_allows_animated_page_only_without_sensitive_fields() {
+    if std::env::var("RIG_EDGE_IT").is_err() {
+        eprintln!("跳过：未设置 RIG_EDGE_IT");
+        return;
+    }
+    let _serial = SERIAL.lock().await;
+    let anim = r#"<!DOCTYPE html><meta charset="utf-8"><title>anim</title>
+<canvas id="c" width="300" height="100"></canvas><p id="s">0</p>
+<script>let n=0;const g=document.getElementById('c').getContext('2d');
+setInterval(()=>{n++;document.getElementById('s').textContent='score '+n;
+document.getElementById('s').setAttribute('data-n',n);g.fillStyle='hsl('+(n*7%360)+',80%,50%)';g.fillRect(0,0,300,100);
+const d=document.createElement('i');d.textContent='x';document.body.appendChild(d);if(document.body.children.length>40)document.body.removeChild(d)},10);</script>"#;
+    let anim_pw = anim.replace(
+        "<p id=\"s\">",
+        "<input type=\"password\" aria-label=\"pw\"><p id=\"s\">",
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let origin = format!("http://127.0.0.1:{port}");
+    serve(
+        listener,
+        vec![
+            ("/anim.html".into(), anim.to_string()),
+            ("/anim-pw.html".into(), anim_pw),
+        ],
+    );
+    for (page, want_png) in [("/anim.html", true), ("/anim-pw.html", false)] {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let edge_port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let _proc = EdgeProc(
+            edge_command()
+                .args([
+                    "--listen",
+                    &format!("127.0.0.1:{edge_port}"),
+                    "--token",
+                    TEST_TOKEN,
+                    "--url",
+                    &format!("{origin}{page}"),
+                    "--width",
+                    "800",
+                    "--height",
+                    "600",
+                ])
+                .process_group(0)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("启动 rig-edge-browser"),
+        );
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            if let Ok(mut s) = std::net::TcpStream::connect(("127.0.0.1", edge_port)) {
+                let _ = s.write_all(b"GET /health HTTP/1.0\r\n\r\n");
+                let mut b = String::new();
+                if s.read_to_string(&mut b).is_ok() && b.contains("\"ok\":true") {
+                    break;
+                }
+            }
+            assert!(Instant::now() < deadline, "边缘程序未就绪");
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+        // 动画持续进行，多试几次
+        let mut got_png = false;
+        for _ in 0..5 {
+            let (status, bytes) = http(edge_port, "GET", "/screenshot.png", None);
+            if status == 200 && bytes.starts_with(&[0x89, b'P', b'N', b'G']) {
+                got_png = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+        assert_eq!(
+            got_png, want_png,
+            "{page}: 无敏感元素的动画页应出图，有密码框的应拒绝"
+        );
+    }
+}
