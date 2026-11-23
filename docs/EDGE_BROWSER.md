@@ -137,7 +137,7 @@ platform/arch——版本取 product 的真實完整版本，UA 串裡的是約�
 | `/ready` | GET | CDP/session 健康探針（免鑑權、無敏感信息）：CDP 存活且至少一個會話 → 200，否則 503；不代表媒體或觀看頁就緒 |
 | `/channels` | GET | 查通道狀態：`ai`、`human`、`av`、`audio_available`、`av_wanted` 等 |
 | `/channels` | POST | 設通道開關，請求體同上形狀（部分欄位可省略） |
-| `/observe` | POST | AI 觀察：請求體為 rig-proto 的 `ObserveRequest`（可空 `{}`）。回應組成由 `mode` 定：`text` 只回 `{"text"}`；`tree`（默認）回 `{"text", "observation"}`；`tree_image` 再加 `"image_png_base64"`。`budget_tokens` 按預算裁剪**響應視圖**（存儲幀不動、被裁元素憑 id 仍可操作，裁剪說明附在 text 末尾）；`subtree` 只回某元素子樹（id 不存在回 400）。`include_offscreen` 默認 false：視口外元素不進響應視圖（存儲幀保留、帶 Offscreen 狀態），true 才帶。`since_frame` 使用客戶端最後套用的觀察幀。當 `mode=tree` 且分頁、文件、座標空間與輸出投影相容時，可回 `{"delta": ObservationDelta, "text"}`。基幀須在最近 8 個已輸出的結構化觀察內。無法重建目前視圖時回整幀 |
+| `/observe` | POST | AI 觀察：請求體為 rig-proto 的 `ObserveRequest`（可空 `{}`）。回應組成由 `mode` 定：`text` 只回 `{"text"}`；`tree`（默認）回 `{"text", "observation"}`；`tree_image` 再加 `"image_png_base64"`。`budget_tokens` 按預算裁剪**響應視圖**（存儲幀不動、被裁元素憑 id 仍可操作，裁剪說明附在 text 末尾）；`subtree` 只回某元素子樹（id 不存在回 400）。`include_offscreen` 默認 false：視口外元素不進響應視圖（存儲幀保留、帶 Offscreen 狀態），true 才帶。`since_frame` 使用客戶端最後套用的觀察幀。當 `mode=tree` 且分頁、文件、座標空間與輸出投影相容時，可回 `{"delta": ObservationDelta, "text"}`。基幀須在最近 8 個已輸出的結構化觀察內。無法重建目前視圖時回整幀。`mode=text` 且 `since_frame` 命中同樣相容的 text 基幀時，回行級差分文本：首行 `# frame N (delta from M)`，`~ 整行` 為變化（或其後新增行的錨點）、`+ 整行` 為新增、`- [id]` 為刪除；無變化回 `# frame N (unchanged since M)`；差分不小於完整文本 0.8 倍或無法重建時回完整文本 |
 | `/act` | POST | AI 動作：接受 `ActionRequest`，回 `{"result": ActionResult}`。頁面狀態類拒絕另附最新觀察及文字，或附無法取得最新狀態的說明 |
 | `/screenshot.png` | GET | 當前頁編號截圖（PNG；敏感元素區域黑塊遮罩） |
 | `/ws` | GET→WS | 人通道：連上後 3 秒內首幀 `{type:auth,access}` 認證；下行 screencast 幀與狀態；上行輸入事件（見 §9） |

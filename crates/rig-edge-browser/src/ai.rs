@@ -1,14 +1,16 @@
 //! AI 通道：观察（快照+可选编号截圖）、动作执行（陈旧校验后落点）、
 //! 导航白名单。通道开关在 main.rs 的 ChannelGate 把守，本模块只管逻辑。
 
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use rig_proto::observation::{
-    check_element_target, check_point_target, diff_observations, AbortReason, Action,
-    ActionRequest, ActionResult, BBox, ElementState, MouseButton, Observation, ObservationDelta,
-    ObserveMode, ObserveRequest, RejectReason, Target,
+    check_element_scroll_target, check_element_target, check_point_target, diff_observations,
+    AbortReason, Action, ActionRequest, ActionResult, BBox, BatchActionRequest, BatchActionResult,
+    ElementState, MouseButton, Observation, ObservationDelta, ObserveMode, ObserveRequest,
+    RejectReason, Target, MAX_BATCH_ACTIONS,
 };
 use tokio::sync::Mutex;
 
@@ -72,6 +74,149 @@ struct PresentedFrame {
     context: PageContext,
     mark: u64,
     projection: Projection,
+    /// 呈现给客户端的是 text 视图（只有文本，没有结构化树）。
+    /// Tree 与 text 的基帧互不通用：客户端只持有其中一种。
+    text_view: bool,
+}
+
+/// text 增量的行键：元素行取 `[id]`，无法解析时按整行内容作键。
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+enum LineKey<'a> {
+    Id(&'a str),
+    Line(&'a str),
+}
+
+fn line_key(line: &str) -> LineKey<'_> {
+    element_id(line).map_or(LineKey::Line(line), LineKey::Id)
+}
+
+/// 解析 render_node 的元素行：`{indent}- {role}[ "name"] [id]...`。
+/// 名字是转义后的引号文本，整体跳过，避免名字里的 `[eN]` 被误认为 id。
+fn element_id(line: &str) -> Option<&str> {
+    let body = line.trim_start_matches(' ').strip_prefix("- ")?;
+    let (_role, rest) = body.split_once(' ')?;
+    let rest = if rest.starts_with('"') {
+        let mut escaped = false;
+        let mut close = None;
+        for (i, c) in rest.char_indices().skip(1) {
+            match c {
+                _ if escaped => escaped = false,
+                '\\' => escaped = true,
+                '"' => {
+                    close = Some(i);
+                    break;
+                }
+                _ => {}
+            }
+        }
+        rest[close? + 1..].strip_prefix(' ')?
+    } else {
+        rest
+    };
+    let id = rest.strip_prefix('[')?.split(']').next()?;
+    (!id.is_empty() && !id.contains(' ')).then_some(id)
+}
+
+/// Text 模式的行级增量。基帧与当前都是 `render` 的输出（首行帧头，其余为元素行）。
+/// 输出格式：`~ 整行`（变化，或作为紧随其后新增行的锚点）、`+ 整行`（新增）、
+/// `- [id]`（删除，无 id 的行为 `- 整行`）。
+/// 返回 None 表示应回完整文本：键重复、行序变化（套用结果不等于当前文本），
+/// 或差分长度不小于完整文本的 0.8 倍。
+fn diff_rendered_text(base_frame: u64, base: &str, frame_id: u64, cur: &str) -> Option<String> {
+    let base_lines: Vec<&str> = base.lines().skip(1).collect();
+    let cur_lines: Vec<&str> = cur.lines().skip(1).collect();
+    let base_keys: Vec<LineKey> = base_lines.iter().map(|l| line_key(l)).collect();
+    let cur_keys: Vec<LineKey> = cur_lines.iter().map(|l| line_key(l)).collect();
+    if has_duplicate(&base_keys) || has_duplicate(&cur_keys) {
+        return None;
+    }
+    let in_base: HashSet<LineKey> = base_keys.iter().copied().collect();
+    let in_cur: HashSet<LineKey> = cur_keys.iter().copied().collect();
+    let base_by_key: HashMap<LineKey, &str> = base_keys
+        .iter()
+        .copied()
+        .zip(base_lines.iter().copied())
+        .collect();
+
+    // 按当前文本顺序输出：保留行仅在变化或紧邻新增行时输出（后者作锚点）
+    let mut ops = String::new();
+    for (i, (key, line)) in cur_keys.iter().zip(&cur_lines).enumerate() {
+        if !in_base.contains(key) {
+            ops.push_str(&format!("+ {line}\n"));
+            continue;
+        }
+        let next_is_new = cur_keys.get(i + 1).is_some_and(|k| !in_base.contains(k));
+        if next_is_new || base_by_key.get(key) != Some(line) {
+            ops.push_str(&format!("~ {line}\n"));
+        }
+    }
+    for (key, line) in base_keys.iter().zip(&base_lines) {
+        if !in_cur.contains(key) {
+            match key {
+                LineKey::Id(id) => ops.push_str(&format!("- [{id}]\n")),
+                LineKey::Line(_) => ops.push_str(&format!("- {line}\n")),
+            }
+        }
+    }
+    let out = if ops.is_empty() {
+        format!("# frame {frame_id} (unchanged since {base_frame})\n")
+    } else {
+        format!("# frame {frame_id} (delta from {base_frame})\n{ops}")
+    };
+    // 服务端按客户端规则套用一遍：不等于当前文本即行序等原因无法重建，回完整文本
+    if apply_text_delta(base, &out).as_deref() != Some(cur) {
+        return None;
+    }
+    (out.chars().count() * 10 < cur.chars().count() * 8).then_some(out)
+}
+
+/// 套用 text 增量（客户端协议，服务端也用它校验）：先删除 `- `，再按顺序处理
+/// `~`（按键替换，游标移到其后）与 `+`（插在游标处，游标后移）。
+fn apply_text_delta(base: &str, delta: &str) -> Option<String> {
+    let header = delta.lines().next()?;
+    let frame = header.strip_prefix("# frame ")?.split_whitespace().next()?;
+    let ops: Vec<&str> = delta.lines().skip(1).collect();
+    let mut removed = HashSet::new();
+    for op in &ops {
+        if let Some(rest) = op.strip_prefix("- ") {
+            removed.insert(
+                match rest.strip_prefix('[').and_then(|r| r.strip_suffix(']')) {
+                    Some(id) => LineKey::Id(id),
+                    None => LineKey::Line(rest),
+                },
+            );
+        }
+    }
+    let mut lines: Vec<&str> = base
+        .lines()
+        .skip(1)
+        .filter(|l| !removed.contains(&line_key(l)))
+        .collect();
+    let mut cursor = 0;
+    for op in &ops {
+        if let Some(line) = op.strip_prefix("~ ") {
+            let key = line_key(line);
+            let idx = lines.iter().position(|l| line_key(l) == key)?;
+            lines[idx] = line;
+            cursor = idx + 1;
+        } else if let Some(line) = op.strip_prefix("+ ") {
+            lines.insert(cursor, line);
+            cursor += 1;
+        } else if !op.starts_with("- ") {
+            return None;
+        }
+    }
+    let mut out = format!("# frame {frame}\n");
+    for line in lines {
+        out.push_str(line);
+        out.push('\n');
+    }
+    Some(out)
+}
+
+fn has_duplicate(keys: &[LineKey]) -> bool {
+    let mut seen = HashSet::new();
+    keys.iter().any(|k| !seen.insert(*k))
 }
 
 struct Presentation {
@@ -343,12 +488,24 @@ impl AiChannel {
         } else {
             None
         };
+        if req.mode == ObserveMode::Text {
+            // 附注与警告不进入基帧：客户端持有的文本必须恰好是 render 的输出
+            let recordable = note.is_none() && warnings.is_empty();
+            if let Some(text) = self
+                .text_delta(frame, &view, &projection, req, recordable)
+                .await
+            {
+                self.note_presented(frame, req).await;
+                return Ok(ObserveOut::Text(text));
+            }
+        }
         let mut delta = None;
         if req.mode != ObserveMode::Text {
             let mut history = self.history.lock().await;
             if req.mode == ObserveMode::Tree && warnings.is_empty() {
                 if let Some(base) = history.iter().find(|base| {
-                    Some(base.obs.frame_id) == req.since_frame
+                    !base.text_view
+                        && Some(base.obs.frame_id) == req.since_frame
                         && base.obs.frame_id < view.frame_id
                         && base.context.page == frame.context.page
                         && base.context.loader == frame.context.loader
@@ -385,13 +542,14 @@ impl AiChannel {
 
             if !history
                 .iter()
-                .any(|entry| entry.obs.frame_id == view.frame_id)
+                .any(|entry| !entry.text_view && entry.obs.frame_id == view.frame_id)
             {
                 history.push(PresentedFrame {
                     obs: view.clone(),
                     context: frame.context.clone(),
                     mark: frame.mark,
                     projection,
+                    text_view: false,
                 });
                 if history.len() > 8 {
                     history.remove(0);
@@ -415,6 +573,58 @@ impl AiChannel {
         } else {
             Ok(ObserveOut::Full(view, text, image))
         }
+    }
+
+    /// Text 模式：since_frame 命中 text 基帧且可重建时回差分文本。
+    /// 可记入基帧池的呈现都会留存，供后续 since_frame 使用；未命中返回 None，由调用方回完整文本。
+    async fn text_delta(
+        &self,
+        frame: &FrameState,
+        view: &Observation,
+        projection: &Projection,
+        req: &ObserveRequest,
+        recordable: bool,
+    ) -> Option<String> {
+        if !recordable {
+            return None;
+        }
+        let cur = render(view);
+        let mut history = self.history.lock().await;
+        let delta = req.since_frame.and_then(|since| {
+            history
+                .iter()
+                .find(|base| {
+                    base.text_view
+                        && base.obs.frame_id == since
+                        && base.obs.frame_id < view.frame_id
+                        && base.context.page == frame.context.page
+                        && base.context.loader == frame.context.loader
+                        && base.context.view.same_space(&frame.context.view)
+                        && base.projection == *projection
+                        && !self
+                            .changes
+                            .root_navigated_since(base.mark, &frame.context.page.session)
+                })
+                .and_then(|base| {
+                    diff_rendered_text(base.obs.frame_id, &render(&base.obs), view.frame_id, &cur)
+                })
+        });
+        if !history
+            .iter()
+            .any(|entry| entry.text_view && entry.obs.frame_id == view.frame_id)
+        {
+            history.push(PresentedFrame {
+                obs: view.clone(),
+                context: frame.context.clone(),
+                mark: frame.mark,
+                projection: projection.clone(),
+                text_view: true,
+            });
+            if history.len() > 8 {
+                history.remove(0);
+            }
+        }
+        delta
     }
 
     async fn note_presented(&self, frame: &Arc<FrameState>, request: &ObserveRequest) {
@@ -549,6 +759,7 @@ impl AiChannel {
             // 拒绝后先呈现当前可见状态，避免整页离屏内容再次送进模型。
             req.include_offscreen = false;
         }
+        // 拒绝兜底必须给可直接阅读的完整文本，text 不走差分。
         req.since_frame = (req.mode == ObserveMode::Tree).then_some(req_frame);
         let deadline = observation_deadline();
         let state = self.state.lock().await.clone();
@@ -573,6 +784,47 @@ impl AiChannel {
                 .map(Some)
                 .map_err(|_| "Could not obtain the latest page state".into()),
         )
+    }
+
+    /// 批量动作：逐步调用单步 act（各步完整校验、幂等、接管检查），
+    /// 遇第一个非 Done 即停；附带的最新状态取自停止的那一步。
+    pub async fn act_batch_with_fresh(
+        &self,
+        req: BatchActionRequest,
+    ) -> (BatchActionResult, Result<Option<ObserveOut>, String>) {
+        let total = req.actions.len();
+        if total == 0 || total > MAX_BATCH_ACTIONS {
+            return (
+                BatchActionResult {
+                    results: vec![ActionResult::Rejected {
+                        reason: RejectReason::PolicyDenied {
+                            detail: format!("a batch needs 1 to {MAX_BATCH_ACTIONS} actions"),
+                        },
+                    }],
+                    skipped: 0,
+                },
+                Ok(None),
+            );
+        }
+        let mut results = Vec::with_capacity(total);
+        let mut fresh = Ok(None);
+        for (i, action) in req.actions.into_iter().enumerate() {
+            let step = ActionRequest {
+                request_id: format!("{}/{i}", req.request_id),
+                frame_id: req.frame_id,
+                lease: None,
+                action,
+            };
+            let (result, f) = self.act_with_fresh(step).await;
+            let done = matches!(result, ActionResult::Done { .. });
+            results.push(result);
+            fresh = f;
+            if !done {
+                break;
+            }
+        }
+        let skipped = total - results.len();
+        (BatchActionResult { results, skipped }, fresh)
     }
 
     #[cfg(test)]
@@ -781,9 +1033,12 @@ impl AiChannel {
                     } else {
                         None
                     };
-                    if let Err(reason) =
+                    let checked = if matches!(req.action, Action::ScrollIntoView { .. }) {
+                        check_element_scroll_target(req.frame_id, seen_ref, current, id, 2.0)
+                    } else {
                         check_element_target(req.frame_id, seen_ref, current, id, 2.0)
-                    {
+                    };
+                    if let Err(reason) = checked {
                         return ActionResult::Rejected { reason };
                     }
                 }
@@ -1176,6 +1431,21 @@ impl AiChannel {
                     .map_err(denied)?;
                 Ok(None)
             }
+            Action::ScrollIntoView { target } => {
+                let Target::Element { id } = target else {
+                    return Err(denied(
+                        "ScrollIntoView only supports element targets".into(),
+                    ));
+                };
+                let (session, backend) = self.locate_session_backend(locate, id).await?;
+                self.browser
+                    .scroll_into_view(&session, backend)
+                    .await
+                    .map_err(denied)?;
+                // 与点击路径一致：等滚动后的重排落定，调用方随后 observe 才看到新视口。
+                tokio::time::sleep(Duration::from_millis(60)).await;
+                Ok(None)
+            }
             Action::Select { target, values } => {
                 let Target::Element { id } = target else {
                     return Err(denied("Select only supports element targets".into()));
@@ -1508,6 +1778,7 @@ fn action_label(action: &Action, current: &Observation) -> String {
         },
         Action::Key { key } => format!("Press {key}"),
         Action::Scroll { .. } => "Scroll".to_string(),
+        Action::ScrollIntoView { target } => format!("Scroll to {}", desc(target, current)),
         Action::Select { target, .. } => format!("Select {}", desc(target, current)),
         Action::Upload { target, files } => {
             format!(
@@ -2464,6 +2735,149 @@ mod tests {
         browser.set_main(&page).await;
         assert!(matches!(
             ch.observe_req(&since_req(obs.frame_id)).await.unwrap(),
+            ObserveOut::Full(..)
+        ));
+    }
+
+    fn text_rows(n: usize) -> Vec<(String, String)> {
+        (0..n)
+            .map(|i| {
+                (
+                    format!("第{i}段正文内容用于撑开文本长度"),
+                    format!("e{}", i + 1),
+                )
+            })
+            .collect()
+    }
+
+    fn text_doc(frame: u64, rows: &[(String, String)]) -> String {
+        let mut out = format!("# frame {frame}\n");
+        for (name, id) in rows {
+            out.push_str(&format!("- text \"{name}\" [{id}]\n"));
+        }
+        out
+    }
+
+    #[test]
+    fn text_element_id_skips_escaped_name() {
+        assert_eq!(
+            element_id("  - button \"x \\\"[e9]\\\"\" [e1] value=\"a\""),
+            Some("e1")
+        );
+        assert_eq!(element_id("- text \"a [e9]\" [e4]"), Some("e4"));
+        assert_eq!(element_id("- button [e3] (Focused)"), Some("e3"));
+        assert_eq!(element_id("plain note"), None);
+    }
+
+    #[test]
+    fn text_delta_unchanged_and_rebuilds_each_change_kind() {
+        let base_rows = text_rows(40);
+        let base = text_doc(1, &base_rows);
+
+        let cur = text_doc(2, &base_rows);
+        let delta = diff_rendered_text(1, &base, 2, &cur).expect("未变应回 unchanged");
+        assert_eq!(delta, "# frame 2 (unchanged since 1)\n");
+        assert_eq!(
+            apply_text_delta(&base, &delta).as_deref(),
+            Some(cur.as_str())
+        );
+
+        // 输入框值变化：整行替换，保留缩进与原文
+        let mut rows = base_rows.clone();
+        rows[5].0 = "已改写的正文".to_string();
+        let cur = text_doc(2, &rows);
+        let delta = diff_rendered_text(1, &base, 2, &cur).expect("局部变更应回差分");
+        assert!(delta.starts_with("# frame 2 (delta from 1)\n~ - text \"已改写的正文\" [e6]\n"));
+        assert_eq!(
+            apply_text_delta(&base, &delta).as_deref(),
+            Some(cur.as_str())
+        );
+
+        // 末尾新增行 → `+`
+        let mut rows = base_rows.clone();
+        rows.push(("新增的一行".to_string(), "e100".to_string()));
+        let cur = text_doc(2, &rows);
+        let delta = diff_rendered_text(1, &base, 2, &cur).expect("末尾新增应回差分");
+        assert!(delta.contains("+ - text \"新增的一行\" [e100]\n"));
+        assert_eq!(
+            apply_text_delta(&base, &delta).as_deref(),
+            Some(cur.as_str())
+        );
+
+        // 中间插入：紧邻的保留行以 `~` 作锚点，新增行随后以 `+` 接上
+        let mut rows = base_rows.clone();
+        rows.insert(3, ("中间插入".to_string(), "e200".to_string()));
+        let cur = text_doc(2, &rows);
+        let delta = diff_rendered_text(1, &base, 2, &cur).expect("中间插入应回差分");
+        assert!(delta.contains(
+            "~ - text \"第2段正文内容用于撑开文本长度\" [e3]\n+ - text \"中间插入\" [e200]\n"
+        ));
+        assert_eq!(
+            apply_text_delta(&base, &delta).as_deref(),
+            Some(cur.as_str())
+        );
+
+        // 删除末尾元素 → `- [id]`
+        let cur = text_doc(2, &base_rows[..39]);
+        let delta = diff_rendered_text(1, &base, 2, &cur).expect("删除应回差分");
+        assert!(delta.contains("- [e40]\n"));
+        assert_eq!(
+            apply_text_delta(&base, &delta).as_deref(),
+            Some(cur.as_str())
+        );
+    }
+
+    #[test]
+    fn text_delta_falls_back_to_full_text_when_it_cannot_rebuild_or_saves_little() {
+        let base_rows = text_rows(40);
+        let base = text_doc(1, &base_rows);
+
+        // 行序变化
+        let mut rows = base_rows.clone();
+        rows.swap(0, 1);
+        assert_eq!(diff_rendered_text(1, &base, 2, &text_doc(2, &rows)), None);
+
+        // 大幅变化：差分不小于完整文本的 0.8 倍
+        let rows: Vec<(String, String)> = base_rows
+            .iter()
+            .map(|(name, id)| (format!("改{name}"), id.clone()))
+            .collect();
+        assert_eq!(diff_rendered_text(1, &base, 2, &text_doc(2, &rows)), None);
+
+        // 键重复无法唯一定位
+        let mut rows = base_rows.clone();
+        rows.push(("重复".to_string(), "e1".to_string()));
+        assert_eq!(diff_rendered_text(1, &base, 2, &text_doc(2, &rows)), None);
+    }
+
+    #[tokio::test]
+    async fn text_observe_since_returns_unchanged_and_tree_ignores_text_base() {
+        let (_browser, ch) = attach_fake(usize::MAX).await;
+        let text_req = |since| ObserveRequest {
+            since_frame: since,
+            mode: ObserveMode::Text,
+            ..Default::default()
+        };
+        let ObserveOut::Text(first) = ch.observe_req(&text_req(None)).await.unwrap() else {
+            panic!("text 模式应回文本");
+        };
+        let base: u64 = first
+            .lines()
+            .next()
+            .and_then(|h| h.strip_prefix("# frame "))
+            .and_then(|n| n.parse().ok())
+            .expect("首行应为帧头");
+        let ObserveOut::Text(second) = ch.observe_req(&text_req(Some(base))).await.unwrap() else {
+            panic!("text 模式应回文本");
+        };
+        let header = second.lines().next().unwrap();
+        assert!(
+            header.ends_with(&format!("(unchanged since {base})")),
+            "静态页应回 unchanged: {second}"
+        );
+        // text 基帧客户端只持有文本，Tree 不能把它当结构化基帧
+        assert!(matches!(
+            ch.observe_req(&since_req(base)).await.unwrap(),
             ObserveOut::Full(..)
         ));
     }

@@ -4078,8 +4078,10 @@ async fn edge_observe_modes_budget() {
     assert_eq!(st, 200);
     assert_eq!(denied["result"]["reason"]["code"], "out_of_bounds");
     assert!(denied.get("observation").is_none() && denied.get("delta").is_none());
+    // text 的拒绝附带完整文本（不走差分），操作未生效，页面状态保持
+    let denied_text = denied["text"].as_str().unwrap();
     assert!(
-        denied["text"].as_str().unwrap().contains("计数:0"),
+        denied_text.contains("计数:0") && !denied_text.contains("(unchanged since"),
         "拒绝后应保留页面状态，且操作不生效: {denied}"
     );
 
@@ -4183,10 +4185,55 @@ async fn edge_observe_modes_budget() {
     );
     let (st, v) = observe_with(json!({"since_frame": frame_a, "mode": "text"}));
     assert_eq!(st, 200, "text 模式带 since_frame: {v}");
+    // text 不返回结构化 delta 字段；该基帧的输出投影与此次不相容，故回完整文本
     assert!(
         v.get("delta").is_none() && v.get("text").is_some(),
-        "text 模式不走增量: {v}"
+        "text 模式不返回结构化增量: {v}"
     );
+
+    // scroll_into_view：视口外目标可被滚入视口；之后默认观察就带得到它，且可点击
+    let (st, v) = observe_with(json!({"include_offscreen": true}));
+    assert_eq!(st, 200);
+    let frame_b = v["observation"]["frame_id"].as_u64().unwrap();
+    let bottom = find_element(&v["observation"], "button", "底部按钮").expect("应带底部按钮")["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let r = act(
+        edge_port,
+        frame_b,
+        json!({"kind": "scroll_into_view", "target": {"by": "element", "id": bottom}}),
+    );
+    assert_eq!(r["result"], "done", "视口外目标应可滚入: {r}");
+    let (st, v) = observe_with(json!({}));
+    assert_eq!(st, 200);
+    assert!(
+        find_element(&v["observation"], "button", "底部按钮").is_some(),
+        "滚动后默认观察应带底部按钮: {v}"
+    );
+    let frame_c = v["observation"]["frame_id"].as_u64().unwrap();
+    let r = act(
+        edge_port,
+        frame_c,
+        json!({"kind": "click", "target": {"by": "element", "id": bottom}}),
+    );
+    assert_eq!(r["result"], "done", "滚入后应可点击: {r}");
+    // 不存在的目标与坐标目标都被拒绝
+    let r = act(
+        edge_port,
+        frame_c,
+        json!({"kind": "scroll_into_view", "target": {"by": "element", "id": "e99999"}}),
+    );
+    assert_eq!(r["reason"]["code"], "unknown_element", "{r}");
+    let (st, v) = observe_with(json!({}));
+    assert_eq!(st, 200);
+    let frame_d = v["observation"]["frame_id"].as_u64().unwrap();
+    let r = act(
+        edge_port,
+        frame_d,
+        json!({"kind": "scroll_into_view", "target": {"by": "point", "x": 10, "y": 10}}),
+    );
+    assert_eq!(r["reason"]["code"], "policy_denied", "{r}");
 }
 
 /// 子樹投影排除密碼欄位時，HTTP 與 MCP 的 tree_image 仍以完整觀察遮罩，且編號一致。
@@ -5488,4 +5535,399 @@ field.addEventListener('keyup',e=>{if(e.code==='F7'||e.code==='F8')field.value='
         "keyboard regression failures:\n{}",
         failures.join("\n")
     );
+}
+
+fn text_delta_html() -> String {
+    let paras: String = (1..=8)
+        .map(|i| format!("<p>第{i}段静态正文</p>\n"))
+        .collect();
+    format!(
+        r#"<!DOCTYPE html><html lang="zh"><head><meta charset="utf-8"><title>文本增量</title></head>
+<body>
+<h1>文本增量夹具</h1>
+{paras}<label>查询 <input type="text" aria-label="查询"></label>
+<label>口令 <input type="password" aria-label="口令"></label>
+<button onclick="const p = document.createElement('p'); p.textContent = '新增段落'; document.body.appendChild(p);">追加</button>
+</body></html>"#
+    )
+}
+
+/// text 视图的帧号（首行 `# frame N`）
+fn text_frame_of(text: &str) -> u64 {
+    text.lines()
+        .next()
+        .and_then(|h| h.strip_prefix("# frame "))
+        .and_then(|r| r.split_whitespace().next())
+        .and_then(|n| n.parse().ok())
+        .expect("text 视图首行应为帧头")
+}
+
+fn text_body_of(text: &str) -> &str {
+    text.split_once('\n').map_or("", |(_, body)| body)
+}
+
+/// 元素行的键：`[id]`（名字经转义，整体跳过），否则整行
+fn element_key(line: &str) -> String {
+    let body = line
+        .trim_start_matches(' ')
+        .strip_prefix("- ")
+        .unwrap_or(line);
+    let Some((_, rest)) = body.split_once(' ') else {
+        return line.to_string();
+    };
+    let rest = if rest.starts_with('"') {
+        let mut escaped = false;
+        let mut close = None;
+        for (i, c) in rest.char_indices().skip(1) {
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '"' {
+                close = Some(i);
+                break;
+            }
+        }
+        match close.and_then(|i| rest[i + 1..].strip_prefix(' ')) {
+            Some(r) => r,
+            None => return line.to_string(),
+        }
+    } else {
+        rest
+    };
+    match rest.strip_prefix('[').and_then(|r| r.split(']').next()) {
+        Some(id) if !id.is_empty() => id.to_string(),
+        _ => line.to_string(),
+    }
+}
+
+/// 客户端套用 text 增量（规格的参考实现）：先按键删除 `- `；再按顺序处理
+/// `~`（按键替换，游标移到其后）与 `+`（插在游标处，游标后移）。
+fn apply_text_delta(base: &str, delta: &str) -> String {
+    let frame = text_frame_of(delta);
+    let ops: Vec<&str> = delta.lines().skip(1).collect();
+    let removed: std::collections::HashSet<String> = ops
+        .iter()
+        .filter_map(|op| op.strip_prefix("- "))
+        .map(
+            |rest| match rest.strip_prefix('[').and_then(|r| r.strip_suffix(']')) {
+                Some(id) => id.to_string(),
+                None => rest.to_string(),
+            },
+        )
+        .collect();
+    let mut lines: Vec<String> = text_body_of(base)
+        .lines()
+        .filter(|l| !removed.contains(&element_key(l)))
+        .map(str::to_string)
+        .collect();
+    let mut cursor = 0;
+    for op in ops {
+        if let Some(line) = op.strip_prefix("~ ") {
+            let key = element_key(line);
+            let idx = lines
+                .iter()
+                .position(|l| element_key(l) == key)
+                .expect("~ 应命中基帧中的同键行");
+            lines[idx] = line.to_string();
+            cursor = idx + 1;
+        } else if let Some(line) = op.strip_prefix("+ ") {
+            lines.insert(cursor, line.to_string());
+            cursor += 1;
+        } else {
+            assert!(op.starts_with("- "), "未知增量行: {op}");
+        }
+    }
+    let mut out = format!("# frame {frame}\n");
+    for line in lines {
+        out.push_str(&line);
+        out.push('\n');
+    }
+    out
+}
+
+/// text 模式：静态页回 unchanged；输入与追加回差分且套用后与完整文本一致；
+/// 口令值不出现在任何输出中；导航后与过旧基帧回完整文本。
+#[tokio::test]
+async fn edge_observe_text_line_delta() {
+    if std::env::var("RIG_EDGE_IT").is_err() {
+        eprintln!("跳过：未设置 RIG_EDGE_IT");
+        return;
+    }
+    let _serial = SERIAL.lock().await;
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    serve(
+        listener,
+        vec![
+            ("/text.html".to_string(), text_delta_html()),
+            (
+                "/other.html".to_string(),
+                r#"<!DOCTYPE html><html lang="zh"><head><meta charset="utf-8"><title>其他</title></head><body><p>其他页面</p></body></html>"#
+                    .to_string(),
+            ),
+        ],
+    );
+    let edge_port = free_port();
+    let mut proc = spawn_edge(&[
+        "--listen".into(),
+        format!("127.0.0.1:{edge_port}"),
+        "--url".into(),
+        format!("http://127.0.0.1:{port}/text.html"),
+        "--width".into(),
+        "900".into(),
+        "--height".into(),
+        "600".into(),
+    ]);
+    wait_health(edge_port).await;
+    let _ = &mut proc;
+    let text_of = |since: Option<u64>| -> String {
+        let body = match since {
+            Some(s) => json!({"mode": "text", "since_frame": s}),
+            None => json!({"mode": "text"}),
+        };
+        let (status, v) = http_json(edge_port, "POST", "/observe", Some(body));
+        assert_eq!(status, 200, "text observe 应成功: {v}");
+        assert!(
+            v.get("observation").is_none(),
+            "text 模式不应回结构化观察: {v}"
+        );
+        v["text"].as_str().unwrap().to_string()
+    };
+    let is_full = |t: &str| !t.contains("(delta from") && !t.contains("(unchanged since");
+
+    // ① 初始全量，再以它为基帧：静态页回 unchanged
+    let t0 = text_of(None);
+    let f0 = text_frame_of(&t0);
+    let t1 = text_of(Some(f0));
+    assert!(
+        t1.lines()
+            .next()
+            .unwrap()
+            .ends_with(&format!("(unchanged since {f0})")),
+        "静态页应回 unchanged: {t1}"
+    );
+
+    // ② 输入框值变化：差分，套用后与完整文本一致
+    let obs = observe(edge_port);
+    let query = find_element(&obs["observation"], "textbox", "查询").expect("应有查询框")["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let frame = obs["observation"]["frame_id"].as_u64().unwrap();
+    let r = act(
+        edge_port,
+        frame,
+        json!({"kind": "type", "target": {"by": "element", "id": query}, "text": "hello-delta", "submit": false}),
+    );
+    assert_eq!(r["result"], "done", "{r}");
+    let t2 = text_of(Some(f0));
+    assert!(
+        t2.lines().next().unwrap().contains("(delta from"),
+        "局部输入应回差分: {t2}"
+    );
+    assert!(t2.contains("hello-delta"), "差分应带出新值: {t2}");
+    let full2 = text_of(None);
+    assert_eq!(
+        text_body_of(&apply_text_delta(&t0, &t2)),
+        text_body_of(&full2),
+        "套用差分应重建完整文本"
+    );
+
+    // ③ 口令：输入后任何 text 输出都不得出现明文
+    let obs = observe(edge_port);
+    let pw = find_element(&obs["observation"], "textbox", "口令").expect("应有口令框")["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let frame = obs["observation"]["frame_id"].as_u64().unwrap();
+    let r = act(
+        edge_port,
+        frame,
+        json!({"kind": "type", "target": {"by": "element", "id": pw}, "text": "hunter2-secret", "submit": false}),
+    );
+    assert_eq!(r["result"], "done", "{r}");
+    let t3 = text_of(Some(text_frame_of(&full2)));
+    assert!(
+        !t3.contains("hunter2"),
+        "口令明文不得出现在 text 输出中: {t3}"
+    );
+    let full3 = text_of(None);
+    assert!(
+        !full3.contains("hunter2"),
+        "完整文本不得含口令明文: {full3}"
+    );
+
+    // ④ 末尾追加段落：`+` 增量，套用后与完整文本一致
+    let obs = observe(edge_port);
+    let add = find_element(&obs["observation"], "button", "追加").expect("应有追加按钮")["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let frame = obs["observation"]["frame_id"].as_u64().unwrap();
+    let r = act(
+        edge_port,
+        frame,
+        json!({"kind": "click", "target": {"by": "element", "id": add}}),
+    );
+    assert_eq!(r["result"], "done", "{r}");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let t4 = text_of(Some(text_frame_of(&full3)));
+    assert!(
+        t4.contains("新增段落") && t4.contains("(delta from"),
+        "追加应回差分: {t4}"
+    );
+    let full4 = text_of(None);
+    assert_eq!(
+        text_body_of(&apply_text_delta(&full3, &t4)),
+        text_body_of(&full4),
+        "追加后套用差分应重建完整文本"
+    );
+
+    // ⑤ 导航后：旧基帧不可用，回完整文本
+    let obs = observe(edge_port);
+    let frame = obs["observation"]["frame_id"].as_u64().unwrap();
+    let r = act(
+        edge_port,
+        frame,
+        json!({"kind": "navigate", "url": format!("http://127.0.0.1:{port}/other.html")}),
+    );
+    assert_eq!(r["result"], "done", "{r}");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let after_nav = text_of(Some(text_frame_of(&full4)));
+    assert!(
+        is_full(&after_nav) && after_nav.contains("其他页面"),
+        "导航后应回完整文本: {after_nav}"
+    );
+
+    // ⑥ 过旧基帧（已被 8 条上限淘汰）：回完整文本
+    let old = text_frame_of(&after_nav);
+    for _ in 0..9 {
+        text_of(None);
+    }
+    let stale = text_of(Some(old));
+    assert!(is_full(&stale), "过旧 since_frame 应回完整文本: {stale}");
+}
+
+/// 批量 act：同一 frame_id 下逐步校验；全部成功 / 首个被拒即止 / 超过上限被拒。
+#[tokio::test]
+async fn edge_batch_act_runs_in_order_and_stops_at_first_failure() {
+    if std::env::var("RIG_EDGE_IT").is_err() {
+        eprintln!("跳过：未设置 RIG_EDGE_IT");
+        return;
+    }
+    let _serial = SERIAL.lock().await;
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let origin = format!("http://127.0.0.1:{port}");
+    serve(listener, vec![("/login.html".into(), LOGIN_HTML.into())]);
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let edge_port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let _proc = EdgeProc(
+        edge_command()
+            .args([
+                "--listen",
+                &format!("127.0.0.1:{edge_port}"),
+                "--token",
+                TEST_TOKEN,
+                "--url",
+                &format!("{origin}/login.html"),
+                "--width",
+                "900",
+                "--height",
+                "700",
+            ])
+            .process_group(0)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("启动 rig-edge-browser"),
+    );
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Ok(mut s) = std::net::TcpStream::connect(("127.0.0.1", edge_port)) {
+            let _ = s.write_all(b"GET /health HTTP/1.0\r\n\r\n");
+            let mut b = String::new();
+            if s.read_to_string(&mut b).is_ok() && b.contains("\"ok\":true") {
+                break;
+            }
+        }
+        assert!(Instant::now() < deadline, "边缘程序未就绪");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+    let batch = |frame: u64, id: &str, actions: Value| {
+        let (st, v) = http_json(
+            edge_port,
+            "POST",
+            "/act",
+            Some(json!({"request_id": id, "frame_id": frame, "actions": actions})),
+        );
+        assert_eq!(st, 200, "批量 act 应返回 200: {v}");
+        v
+    };
+
+    let o = observe(edge_port);
+    let frame = o["observation"]["frame_id"].as_u64().unwrap();
+    let id_of = |name: &str, role: &str| {
+        find_element(&o["observation"], role, name).expect("元素")["id"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    let (user, pass, login) = (
+        id_of("用户名", "textbox"),
+        id_of("密码", "textbox"),
+        id_of("登录", "button"),
+    );
+    let el = |id: &str| json!({"by": "element", "id": id});
+
+    // 1) 三步全成功：输入用户名、密码，点击登录
+    let v = batch(
+        frame,
+        "b1",
+        json!([
+            {"kind": "type", "target": el(&user), "text": "alice"},
+            {"kind": "type", "target": el(&pass), "text": "hunter2"},
+            {"kind": "click", "target": el(&login)},
+        ]),
+    );
+    let results = v["result"]["results"].as_array().unwrap();
+    assert_eq!(v["result"]["skipped"], 0, "{v}");
+    assert!(
+        results.len() == 3 && results.iter().all(|r| r["result"] == "done"),
+        "三步应全部成功: {v}"
+    );
+    let after = observe(edge_port);
+    assert!(
+        after["text"].as_str().unwrap().contains("欢迎 alice"),
+        "批量登录应生效: {after}"
+    );
+
+    // 2) 第一步目标不存在 → 被拒即止，其余步骤不执行
+    let frame = after["observation"]["frame_id"].as_u64().unwrap();
+    let v = batch(
+        frame,
+        "b2",
+        json!([
+            {"kind": "click", "target": el("e99999")},
+            {"kind": "click", "target": el(&login)},
+        ]),
+    );
+    let results = v["result"]["results"].as_array().unwrap();
+    assert_eq!(results.len(), 1, "{v}");
+    assert_eq!(results[0]["reason"]["code"], "unknown_element", "{v}");
+    assert_eq!(v["result"]["skipped"], 1, "{v}");
+
+    // 3) 空批与超限批被拒
+    for (id, n) in [("b3", 0usize), ("b4", 9)] {
+        let actions: Vec<Value> = (0..n)
+            .map(|_| json!({"kind": "key", "key": "Tab"}))
+            .collect();
+        let v = batch(frame, id, json!(actions));
+        assert_eq!(
+            v["result"]["results"][0]["reason"]["code"], "policy_denied",
+            "{v}"
+        );
+    }
 }

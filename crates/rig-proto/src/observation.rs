@@ -688,6 +688,11 @@ pub enum Action {
         dx: f32,
         dy: f32,
     },
+    /// 把已观察到的元素滚入视口（不点击、不输入）。目标必须是元素，
+    /// 允许视口外元素；滚动后调用方应重新 observe 再对它操作。
+    ScrollIntoView {
+        target: Target,
+    },
     Select {
         target: Target,
         values: Vec<String>,
@@ -716,6 +721,7 @@ impl Action {
         match self {
             Action::Click { target, .. }
             | Action::Hover { target }
+            | Action::ScrollIntoView { target }
             | Action::Select { target, .. }
             | Action::Upload { target, .. } => vec![target],
             Action::Type { target, .. } | Action::Scroll { target, .. } => target.iter().collect(),
@@ -739,6 +745,27 @@ pub struct ActionRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lease: Option<LeaseStamp>,
     pub action: Action,
+}
+
+/// 批量动作的步数上限。
+pub const MAX_BATCH_ACTIONS: usize = 8;
+
+/// 批量动作：按序执行，**每一步都以同一个 `frame_id` 独立走完整的校验**，
+/// 遇到第一个非 `Done`（被拒或被中断）立即停止，后续步骤不执行。
+/// 页面因前一步变化而使后一步目标过期时，后一步被拒即止，不会盲打。
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct BatchActionRequest {
+    pub request_id: String,
+    pub frame_id: FrameId,
+    pub actions: Vec<Action>,
+}
+
+/// 批量动作结果：`results` 为已尝试各步的结果（最后一项可能是 Rejected/Aborted），
+/// `skipped` 是因提前停止而未尝试的步数。
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct BatchActionResult {
+    pub results: Vec<ActionResult>,
+    pub skipped: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -826,16 +853,40 @@ pub fn check_element_target(
     id: &str,
     tol_px: f32,
 ) -> Result<(), RejectReason> {
+    check_element(requested, seen, current, id, tol_px, true)
+}
+
+/// 校验 `scroll_into_view` 的目标：与 [`check_element_target`] 相同的存在与陈旧规则，
+/// 但允许目标在视口外或被禁用——滚动不产生点击等副作用，视口外正是它的用途。
+pub fn check_element_scroll_target(
+    requested: FrameId,
+    seen: Option<&Observation>,
+    current: &Observation,
+    id: &str,
+    tol_px: f32,
+) -> Result<(), RejectReason> {
+    check_element(requested, seen, current, id, tol_px, false)
+}
+
+fn check_element(
+    requested: FrameId,
+    seen: Option<&Observation>,
+    current: &Observation,
+    id: &str,
+    tol_px: f32,
+    need_interactable: bool,
+) -> Result<(), RejectReason> {
     let current_frame = current.frame_id;
     let stale = move || RejectReason::StaleFrame { current_frame };
     let unknown = || RejectReason::UnknownElement { id: id.to_string() };
     let not_interactable = || RejectReason::NotInteractable { id: id.to_string() };
+    let ok = |el: &Element| !need_interactable || el.is_interactable();
 
     let now = current.find(id);
 
     if requested == current.frame_id {
         let el = now.ok_or_else(unknown)?;
-        return if el.is_interactable() {
+        return if ok(el) {
             Ok(())
         } else {
             Err(not_interactable())
@@ -851,7 +902,7 @@ pub fn check_element_target(
     if !element_unchanged(before, after, tol_px) {
         return Err(stale());
     }
-    if after.is_interactable() {
+    if ok(after) {
         Ok(())
     } else {
         Err(not_interactable())
@@ -1059,6 +1110,63 @@ mod tests {
     }
 
     // ── 动作校验 ──
+
+    #[test]
+    fn scroll_into_view_and_batch_json_shapes_are_stable() {
+        let a: Action = serde_json::from_str(
+            r#"{"kind":"scroll_into_view","target":{"by":"element","id":"e9"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            a,
+            Action::ScrollIntoView {
+                target: Target::Element { id: "e9".into() }
+            }
+        );
+        assert_eq!(a.targets().len(), 1);
+        let req: BatchActionRequest = serde_json::from_str(
+            r#"{"request_id":"b","frame_id":3,"actions":[{"kind":"key","key":"Tab"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(req.actions.len(), 1);
+        let res = BatchActionResult {
+            results: vec![ActionResult::Done {
+                frame_id: 3,
+                note: None,
+            }],
+            skipped: 2,
+        };
+        assert_eq!(
+            serde_json::to_string(&res).unwrap(),
+            r#"{"results":[{"result":"done","frame_id":3}],"skipped":2}"#
+        );
+    }
+
+    #[test]
+    fn scroll_target_accepts_offscreen_but_still_rejects_unknown_and_stale() {
+        let off = |frame, y| {
+            obs(
+                frame,
+                vec![button("e1", "far", [0.0, y, 10.0, y + 10.0]).with_states(&[Offscreen])],
+            )
+        };
+        let cur = off(5, 2000.0);
+        // 视口外元素对 click 不可交互，但可以作为滚动目标
+        assert!(check_element_target(5, None, &cur, "e1", 2.0).is_err());
+        assert!(check_element_scroll_target(5, None, &cur, "e1", 2.0).is_ok());
+        assert!(matches!(
+            check_element_scroll_target(5, None, &cur, "e9", 2.0),
+            Err(RejectReason::UnknownElement { .. })
+        ));
+        // 旧帧：目标移动过就是过期，不能滚向过期位置的元素
+        let seen = off(3, 2000.0);
+        assert!(check_element_scroll_target(3, Some(&seen), &cur, "e1", 2.0).is_ok());
+        let moved = off(5, 2600.0);
+        assert!(matches!(
+            check_element_scroll_target(3, Some(&seen), &moved, "e1", 2.0),
+            Err(RejectReason::StaleFrame { .. })
+        ));
+    }
 
     #[test]
     fn same_frame_target_must_exist_and_be_interactable() {

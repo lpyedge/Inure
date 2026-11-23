@@ -57,7 +57,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use futures_util::{SinkExt, StreamExt};
 use rig_proto::observation::{
-    AbortReason, ActionRequest, ActionResult, ObserveMode, ObserveRequest,
+    AbortReason, ActionRequest, ActionResult, BatchActionRequest, ObserveMode, ObserveRequest,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -1032,12 +1032,28 @@ async fn observe(State(app): State<Arc<App>>, Json(req): Json<ObserveRequest>) -
     }
 }
 
-async fn act(State(app): State<Arc<App>>, Json(req): Json<ActionRequest>) -> Response {
+async fn act(State(app): State<Arc<App>>, Json(body): Json<serde_json::Value>) -> Response {
     if !app.gate_ai.load(Ordering::SeqCst) {
         return channel_off();
     }
     // 被拒（页面状态不符）时附带最新一帧，调用方不必再补一次 observe
-    let (result, fresh) = app.ai.act_with_fresh(req).await;
+    let (result, fresh) = if body.get("actions").is_some() {
+        match serde_json::from_value::<BatchActionRequest>(body) {
+            Ok(req) => {
+                let (r, fresh) = app.ai.act_batch_with_fresh(req).await;
+                (json!(r), fresh)
+            }
+            Err(e) => return (StatusCode::UNPROCESSABLE_ENTITY, e.to_string()).into_response(),
+        }
+    } else {
+        match serde_json::from_value::<ActionRequest>(body) {
+            Ok(req) => {
+                let (r, fresh) = app.ai.act_with_fresh(req).await;
+                (json!(r), fresh)
+            }
+            Err(e) => return (StatusCode::UNPROCESSABLE_ENTITY, e.to_string()).into_response(),
+        }
+    };
     match fresh {
         Ok(Some(ObserveOut::Text(text))) => {
             Json(json!({"result": result, "text": text})).into_response()
@@ -1592,20 +1608,21 @@ fn mcp_tools() -> serde_json::Value {
     json!([
         {
             "name": "observe",
-            "description": "Observe the current page: returns a compact text rendering and a full semantic snapshot (Observation JSON). Observe before acting; actions reference element ids and the frame_id from the snapshot. Optional parameters (ObserveRequest): mode='text' returns only the text view (cheapest), 'tree' returns tree + text (default), 'tree_image' additionally attaches a numbered screenshot; budget_tokens trims the response view to a budget (trimmed elements can still be operated on by id); subtree returns only the subtree of one element; include_offscreen=true also includes elements outside the viewport (default: not included); since_frame is the last observation frame number the client received and applied. When the page, coordinate space and projection are compatible, an incremental result (summary and ObservationDelta JSON) is returned, otherwise a full snapshot.",
+            "description": "Observe the current page: returns a compact text rendering and a full semantic snapshot (Observation JSON). Observe before acting; actions reference element ids and the frame_id from the snapshot. Optional parameters (ObserveRequest): mode='text' returns only the text view (cheapest), 'tree' returns tree + text (default), 'tree_image' additionally attaches a numbered screenshot; budget_tokens trims the response view to a budget (trimmed elements can still be operated on by id); subtree returns only the subtree of one element; include_offscreen=true also includes elements outside the viewport (default: not included); since_frame is the last observation frame number the client received and applied. When the page, coordinate space and projection are compatible, an incremental result (summary and ObservationDelta JSON) is returned, otherwise a full snapshot. With mode='text' and a matching since_frame, the text is returned as a line delta against that frame ('# frame N (delta from M)': '~ line' replaces the line with the same id (or is an unchanged anchor line before a new one), '+ line' is inserted after the preceding line, '- [id]' removes the element; apply them in order to the previous full text; '# frame N (unchanged since M)' when nothing changed), otherwise the full text.",
             "inputSchema": {"type": "object", "properties": {"mode": {"type": "string", "enum": ["text", "tree", "tree_image"]}, "budget_tokens": {"type": "integer", "minimum": 0}, "subtree": {"type": "string"}, "since_frame": {"type": "integer", "minimum": 0}, "include_offscreen": {"type": "boolean"}}, "additionalProperties": false}
         },
         {
             "name": "act",
-            "description": "Perform one action. Parameters are an ActionRequest: {frame_id, action}. Action examples: {kind:'click', target:{by:'element', id:'e3'}}, {kind:'type', target:{by:'element', id:'e3'}, text:'content', submit:false}, {kind:'key', key:'Control+A'}, {kind:'navigate', url:'https://…'}, {kind:'scroll', dx:0, dy:600}, {kind:'upload', target:{by:'element', id:'e3'}, files:['a.pdf']} (feeds files to a file input; files must come from the edge's upload directory, relative names are resolved against it, anything outside it is rejected). Use the frame_id of the most recent observe; a stale frame is rejected once the page has changed (just observe again).",
+            "description": "Perform one action, or a batch. Parameters are an ActionRequest {frame_id, action}, or a batch {frame_id, actions:[…up to 8 actions]}: batch steps run in order, each is fully validated against the same frame_id, and the batch stops at the first step that is not done (the result lists the attempted steps and how many were skipped). Action examples: {kind:'click', target:{by:'element', id:'e3'}}, {kind:'type', target:{by:'element', id:'e3'}, text:'content', submit:false}, {kind:'key', key:'Control+A'}, {kind:'navigate', url:'https://…'}, {kind:'scroll', dx:0, dy:600}, {kind:'scroll_into_view', target:{by:'element', id:'e9'}} (brings an observed element, even an offscreen one listed with include_offscreen, into view; observe again afterwards), {kind:'upload', target:{by:'element', id:'e3'}, files:['a.pdf']} (feeds files to a file input; files must come from the edge's upload directory, relative names are resolved against it, anything outside it is rejected). Use the frame_id of the most recent observe; a stale frame is rejected once the page has changed (just observe again).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "frame_id": {"type": "integer"},
                     "action": {"type": "object"},
+                    "actions": {"type": "array", "items": {"type": "object"}, "minItems": 1, "maxItems": 8, "description": "Batch alternative to action"},
                     "request_id": {"type": "string", "description": "Optional; for idempotency and tracing. Generated by the edge when omitted"}
                 },
-                "required": ["frame_id", "action"],
+                "required": ["frame_id"],
                 "additionalProperties": false
             }
         },
@@ -1691,18 +1708,42 @@ async fn mcp_call(app: &Arc<App>, params: &serde_json::Value) -> (serde_json::Va
                     );
                 }
             }
-            match serde_json::from_value::<ActionRequest>(args) {
-                Ok(req) => {
-                    let (r, fresh) = app.ai.act_with_fresh(req).await;
-                    let taken = matches!(
-                        r,
-                        ActionResult::Aborted {
-                            reason: AbortReason::UserTakeover
+            let parsed = if args.get("actions").is_some() {
+                serde_json::from_value::<BatchActionRequest>(args)
+                    .map_err(|e| e.to_string())
+                    .map(Ok)
+            } else {
+                serde_json::from_value::<ActionRequest>(args)
+                    .map_err(|e| e.to_string())
+                    .map(Err)
+            };
+            match parsed {
+                Ok(parsed) => {
+                    let (r, taken, fresh) = match parsed {
+                        Ok(batch) => {
+                            let (r, fresh) = app.ai.act_batch_with_fresh(batch).await;
+                            let taken = r.results.iter().any(|x| {
+                                matches!(
+                                    x,
+                                    ActionResult::Aborted {
+                                        reason: AbortReason::UserTakeover
+                                    }
+                                )
+                            });
+                            (serde_json::to_string(&r).unwrap_or_default(), taken, fresh)
                         }
-                    );
-                    let mut content = vec![
-                        json!({"type": "text", "text": serde_json::to_string(&r).unwrap_or_default()}),
-                    ];
+                        Err(single) => {
+                            let (r, fresh) = app.ai.act_with_fresh(single).await;
+                            let taken = matches!(
+                                r,
+                                ActionResult::Aborted {
+                                    reason: AbortReason::UserTakeover
+                                }
+                            );
+                            (serde_json::to_string(&r).unwrap_or_default(), taken, fresh)
+                        }
+                    };
+                    let mut content = vec![json!({"type": "text", "text": r})];
                     if taken {
                         // 契约里的 Aborted 不变；停止指示以附加文本块给到智能体
                         content.push(json!({"type": "text", "text": "The user has forcibly taken over the browser: stop the current task, do not retry the interrupted action, and wait for the user's new instructions before observing again."}));
