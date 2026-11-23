@@ -696,6 +696,9 @@ pub enum Action {
         /// 输入后是否按回车。
         #[serde(default)]
         submit: bool,
+        /// 先全选再输入，覆盖已有内容（缺省 false：追加）。
+        #[serde(default)]
+        replace: bool,
     },
     /// 按键或组合键，例如 "Enter"、"Control+A"。
     Key {
@@ -715,6 +718,12 @@ pub enum Action {
     Select {
         target: Target,
         values: Vec<String>,
+    },
+    /// 把复选框/单选框/开关设为已选或未选（幂等）：已经是目标状态就不动，
+    /// 不像 click 那样来回切换。目标必须是元素。
+    SetChecked {
+        target: Target,
+        checked: bool,
     },
     /// 给文件输入框喂文件（仅 Web）。`files` 是边缘主机上的路径，
     /// 边缘经 CDP `DOM.setFileInputFiles` 设置，页面随后照常收到
@@ -742,7 +751,8 @@ impl Action {
             | Action::Hover { target }
             | Action::ScrollIntoView { target }
             | Action::Select { target, .. }
-            | Action::Upload { target, .. } => vec![target],
+            | Action::Upload { target, .. }
+            | Action::SetChecked { target, .. } => vec![target],
             Action::Type { target, .. } | Action::Scroll { target, .. } => target.iter().collect(),
             Action::Key { .. } | Action::Navigate { .. } => Vec::new(),
         }
@@ -777,6 +787,20 @@ pub struct BatchActionRequest {
     pub request_id: String,
     pub frame_id: FrameId,
     pub actions: Vec<Action>,
+    /// 整批**全部 Done** 后是否随回包附上页面文本；缺省不附。只回文本，不回截图。
+    /// 批量在某一步被拒或被中断时沿用原有行为（附最新状态），本字段不起作用。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observe_after: Option<ObserveAfter>,
+}
+
+/// 批量动作全部完成后附带的文本呈现。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ObserveAfter {
+    /// 相对请求帧的文本行增量（与 `observe` 的 `mode=text` + `since_frame` 同口径，对不上时回完整文本）。
+    Delta,
+    /// 完整文本。
+    Text,
 }
 
 /// 批量动作结果：`results` 为已尝试各步的结果（最后一项可能是 Rejected/Aborted），
@@ -1148,6 +1172,16 @@ mod tests {
         )
         .unwrap();
         assert_eq!(req.actions.len(), 1);
+        assert_eq!(req.observe_after, None);
+        let req: BatchActionRequest = serde_json::from_str(
+            r#"{"request_id":"b","frame_id":3,"actions":[{"kind":"key","key":"Tab"}],"observe_after":"delta"}"#,
+        )
+        .unwrap();
+        assert_eq!(req.observe_after, Some(ObserveAfter::Delta));
+        assert!(serde_json::from_str::<BatchActionRequest>(
+            r#"{"request_id":"b","frame_id":3,"actions":[],"observe_after":"image"}"#
+        )
+        .is_err());
         let res = BatchActionResult {
             results: vec![ActionResult::Done {
                 frame_id: 3,
@@ -1373,6 +1407,7 @@ mod tests {
             target: Some(Target::Element { id: "e1".into() }),
             text: "x".into(),
             submit: false,
+            replace: false,
         };
         assert_eq!(t.targets().len(), 1);
         assert!(Action::Key {

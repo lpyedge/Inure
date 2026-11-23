@@ -6288,3 +6288,476 @@ async fn edge_screenshot_does_not_launder_a_stale_frame_after_page_change() {
         );
     }
 }
+
+/// 同一观察帧下连续动作：key 之后再对元素 click/type 不得因“校验重采替换了存储帧”被拒。
+/// 页面没有变化到目标，所以每一步都应放行（实测此前向导里的残留 stale_frame 全来自这里）。
+#[tokio::test]
+async fn edge_actions_after_key_on_same_frame_are_not_stale() {
+    if std::env::var("RIG_EDGE_IT").is_err() {
+        eprintln!("跳过：未设置 RIG_EDGE_IT");
+        return;
+    }
+    let _serial = SERIAL.lock().await;
+    let page = r#"<!DOCTYPE html><meta charset="utf-8"><title>chain</title>
+<body style="margin:0"><input id="a" aria-label="first" style="position:absolute;left:20px;top:20px;width:200px">
+<input id="b" aria-label="second" style="position:absolute;left:20px;top:80px;width:200px">
+<button id="g" style="position:absolute;left:20px;top:140px;width:80px;height:40px" onclick="document.title='clicked'">go</button></body>"#;
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    serve(listener, vec![("/chain.html".into(), page.to_string())]);
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let edge_port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let _proc = EdgeProc(
+        edge_command()
+            .args([
+                "--listen",
+                &format!("127.0.0.1:{edge_port}"),
+                "--token",
+                TEST_TOKEN,
+                "--url",
+                &format!("http://127.0.0.1:{port}/chain.html"),
+                "--width",
+                "400",
+                "--height",
+                "300",
+            ])
+            .process_group(0)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("启动 rig-edge-browser"),
+    );
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Ok(mut s) = std::net::TcpStream::connect(("127.0.0.1", edge_port)) {
+            let _ = s.write_all(b"GET /health HTTP/1.0\r\n\r\n");
+            let mut b = String::new();
+            if s.read_to_string(&mut b).is_ok() && b.contains("\"ok\":true") {
+                break;
+            }
+        }
+        assert!(Instant::now() < deadline, "边缘程序未就绪");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+    let current = observe(edge_port);
+    let frame = current["observation"]["frame_id"].as_u64().unwrap();
+    let first = find_element(&current["observation"], "textbox", "first").expect("first");
+    let second = find_element(&current["observation"], "textbox", "second").expect("second");
+    let go = find_element(&current["observation"], "button", "go").expect("go");
+    let (first, second, go) = (
+        first["id"].as_str().unwrap().to_string(),
+        second["id"].as_str().unwrap().to_string(),
+        go["id"].as_str().unwrap().to_string(),
+    );
+    let steps = [
+        json!({"kind":"type","target":{"by":"element","id":first},"text":"abc"}),
+        json!({"kind":"key","key":"Backspace"}),
+        json!({"kind":"type","target":{"by":"element","id":first},"text":"xyz"}),
+        json!({"kind":"key","key":"Control+A"}),
+        json!({"kind":"type","target":{"by":"element","id":second},"text":"hello"}),
+        json!({"kind":"click","target":{"by":"element","id":go}}),
+    ];
+    for (i, step) in steps.iter().enumerate() {
+        let result = act(edge_port, frame, step.clone());
+        assert_eq!(
+            result["result"],
+            "done",
+            "同一观察帧的第 {} 步应被接受: {step} -> {result}",
+            i + 1
+        );
+    }
+}
+
+/// 批量动作可选 `observe_after`：整批全 Done 后回包附文本（delta 或完整），帧号可直接用于下一批；
+/// 缺省不附；某一步被拒时仍走原有的“附最新状态”。
+#[tokio::test]
+async fn edge_batch_observe_after_returns_text_and_usable_frame() {
+    if std::env::var("RIG_EDGE_IT").is_err() {
+        eprintln!("跳过：未设置 RIG_EDGE_IT");
+        return;
+    }
+    let _serial = SERIAL.lock().await;
+    let page = r#"<!DOCTYPE html><meta charset="utf-8"><title>after</title>
+<body style="margin:0"><input id="a" aria-label="first" style="position:absolute;left:20px;top:20px;width:200px">
+<button id="g" style="position:absolute;left:20px;top:80px;width:80px;height:40px" onclick="document.getElementById('r').textContent='result-ready'">go</button>
+<p id="r" style="position:absolute;left:20px;top:140px"></p></body>"#;
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    serve(listener, vec![("/after.html".into(), page.to_string())]);
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let edge_port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let _proc = EdgeProc(
+        edge_command()
+            .args([
+                "--listen",
+                &format!("127.0.0.1:{edge_port}"),
+                "--token",
+                TEST_TOKEN,
+                "--url",
+                &format!("http://127.0.0.1:{port}/after.html"),
+                "--width",
+                "400",
+                "--height",
+                "300",
+            ])
+            .process_group(0)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("启动 rig-edge-browser"),
+    );
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Ok(mut s) = std::net::TcpStream::connect(("127.0.0.1", edge_port)) {
+            let _ = s.write_all(b"GET /health HTTP/1.0\r\n\r\n");
+            let mut b = String::new();
+            if s.read_to_string(&mut b).is_ok() && b.contains("\"ok\":true") {
+                break;
+            }
+        }
+        assert!(Instant::now() < deadline, "边缘程序未就绪");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+    let frame_of = |text: &str| -> u64 {
+        text.lines()
+            .next()
+            .and_then(|l| l.strip_prefix("# frame "))
+            .and_then(|l| l.split_whitespace().next())
+            .and_then(|n| n.parse().ok())
+            .unwrap_or_else(|| panic!("文本首行应为 '# frame N': {text}"))
+    };
+    let batch = |frame: u64, id: &str, actions: Value, after: Option<&str>| {
+        let mut body = json!({"request_id": id, "frame_id": frame, "actions": actions});
+        if let Some(a) = after {
+            body["observe_after"] = json!(a);
+        }
+        let (st, v) = http_json(edge_port, "POST", "/act", Some(body));
+        assert_eq!(st, 200, "批量 act 应返回 200: {v}");
+        v
+    };
+    let (st, text0) = http_json(edge_port, "POST", "/observe", Some(json!({"mode": "text"})));
+    assert_eq!(st, 200);
+    let text0 = text0["text"].as_str().unwrap().to_string();
+    let frame0 = frame_of(&text0);
+    let id_of = |text: &str, name: &str| -> String {
+        let line = text
+            .lines()
+            .find(|l| l.contains(name))
+            .unwrap_or_else(|| panic!("文本里应有 {name}: {text}"));
+        let start = line.find("[e").expect("元素 id") + 1;
+        line[start..]
+            .split(|c: char| !c.is_ascii_alphanumeric())
+            .next()
+            .unwrap()
+            .to_string()
+    };
+    let (first, go) = (id_of(&text0, "first"), id_of(&text0, "go"));
+    let el = |id: &str| json!({"by": "element", "id": id});
+
+    // 缺省不附文本
+    let v = batch(
+        frame0,
+        "o0",
+        json!([{"kind": "type", "target": el(&first), "text": "abc"}]),
+        None,
+    );
+    assert_eq!(v["result"]["results"][0]["result"], "done", "{v}");
+    assert!(
+        v.get("text").is_none() && v.get("delta").is_none(),
+        "缺省不应附带观察: {v}"
+    );
+
+    // delta：回包附相对请求帧的文本增量，里面能看到点击后的结果
+    let v = batch(
+        frame0,
+        "o1",
+        json!([{"kind": "click", "target": el(&go)}]),
+        Some("delta"),
+    );
+    assert_eq!(v["result"]["results"][0]["result"], "done", "{v}");
+    let t1 = v["text"]
+        .as_str()
+        .unwrap_or_else(|| panic!("应附文本: {v}"));
+    assert!(t1.contains("result-ready"), "增量应含点击后的内容: {t1}");
+    assert!(v.get("observation").is_none(), "不应附整棵树: {v}");
+    let frame1 = frame_of(t1);
+
+    // 回包里的帧号可直接用于下一批（不必再 observe），完整文本也可选
+    let v = batch(
+        frame1,
+        "o2",
+        json!([{"kind": "type", "target": el(&first), "text": "def", "replace": true}]),
+        Some("text"),
+    );
+    assert_eq!(
+        v["result"]["results"][0]["result"], "done",
+        "回包帧号应可直接使用: {v}"
+    );
+    let t2 = v["text"]
+        .as_str()
+        .unwrap_or_else(|| panic!("应附文本: {v}"));
+    assert!(
+        t2.contains("first") && t2.contains("go"),
+        "text 应是完整文本: {t2}"
+    );
+
+    // 某一步被拒：照旧被拒即止
+    let v = batch(
+        frame_of(t2),
+        "o3",
+        json!([{"kind": "click", "target": el("e99999")}]),
+        Some("delta"),
+    );
+    assert_eq!(v["result"]["results"][0]["result"], "rejected", "{v}");
+}
+
+/// Control+A 必须真的全选（无头 Chromium 的组合键需要带编辑命令才会触发全选），
+/// 随后 Backspace 清空输入框。
+#[tokio::test]
+async fn edge_control_a_selects_all_in_textbox() {
+    if std::env::var("RIG_EDGE_IT").is_err() {
+        eprintln!("跳过：未设置 RIG_EDGE_IT");
+        return;
+    }
+    let _serial = SERIAL.lock().await;
+    let page = r#"<!DOCTYPE html><meta charset="utf-8"><title>selall</title>
+<body style="margin:0"><input id="a" aria-label="first" style="position:absolute;left:20px;top:20px;width:200px"></body>"#;
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    serve(listener, vec![("/selall.html".into(), page.to_string())]);
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let edge_port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let _proc = EdgeProc(
+        edge_command()
+            .args([
+                "--listen",
+                &format!("127.0.0.1:{edge_port}"),
+                "--token",
+                TEST_TOKEN,
+                "--url",
+                &format!("http://127.0.0.1:{port}/selall.html"),
+                "--width",
+                "400",
+                "--height",
+                "300",
+            ])
+            .process_group(0)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("启动 rig-edge-browser"),
+    );
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Ok(mut s) = std::net::TcpStream::connect(("127.0.0.1", edge_port)) {
+            let _ = s.write_all(b"GET /health HTTP/1.0\r\n\r\n");
+            let mut b = String::new();
+            if s.read_to_string(&mut b).is_ok() && b.contains("\"ok\":true") {
+                break;
+            }
+        }
+        assert!(Instant::now() < deadline, "边缘程序未就绪");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+    let current = observe(edge_port);
+    let frame = current["observation"]["frame_id"].as_u64().unwrap();
+    let first = find_element(&current["observation"], "textbox", "first").expect("first");
+    let id = first["id"].as_str().unwrap().to_string();
+    for step in [
+        json!({"kind":"type","target":{"by":"element","id":id},"text":"hello 12345"}),
+        json!({"kind":"key","key":"Control+A"}),
+        json!({"kind":"key","key":"Backspace"}),
+    ] {
+        let result = act(edge_port, frame, step.clone());
+        assert_eq!(result["result"], "done", "{step} -> {result}");
+    }
+    let after = observe(edge_port);
+    let value = find_element(&after["observation"], "textbox", "first").expect("first")["value"]
+        .as_str()
+        .unwrap_or("")
+        .to_string();
+    assert_eq!(value, "", "Control+A 之后 Backspace 应清空输入框");
+}
+
+/// type 默认追加；replace=true 先全选再输入，覆盖已有内容（一次动作完成“清空并填入”）。
+#[tokio::test]
+async fn edge_type_replace_overwrites_existing_text() {
+    if std::env::var("RIG_EDGE_IT").is_err() {
+        eprintln!("跳过：未设置 RIG_EDGE_IT");
+        return;
+    }
+    let _serial = SERIAL.lock().await;
+    let page = r#"<!DOCTYPE html><meta charset="utf-8"><title>replace</title>
+<body style="margin:0"><input id="a" aria-label="first" style="position:absolute;left:20px;top:20px;width:200px"></body>"#;
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    serve(listener, vec![("/replace.html".into(), page.to_string())]);
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let edge_port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let _proc = EdgeProc(
+        edge_command()
+            .args([
+                "--listen",
+                &format!("127.0.0.1:{edge_port}"),
+                "--token",
+                TEST_TOKEN,
+                "--url",
+                &format!("http://127.0.0.1:{port}/replace.html"),
+                "--width",
+                "400",
+                "--height",
+                "300",
+            ])
+            .process_group(0)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("启动 rig-edge-browser"),
+    );
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Ok(mut s) = std::net::TcpStream::connect(("127.0.0.1", edge_port)) {
+            let _ = s.write_all(b"GET /health HTTP/1.0\r\n\r\n");
+            let mut b = String::new();
+            if s.read_to_string(&mut b).is_ok() && b.contains("\"ok\":true") {
+                break;
+            }
+        }
+        assert!(Instant::now() < deadline, "边缘程序未就绪");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+    let value_of = |port: u16| {
+        let after = observe(port);
+        find_element(&after["observation"], "textbox", "first").expect("first")["value"]
+            .as_str()
+            .unwrap_or("")
+            .to_string()
+    };
+    let current = observe(edge_port);
+    let frame = current["observation"]["frame_id"].as_u64().unwrap();
+    let id = find_element(&current["observation"], "textbox", "first").expect("first")["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let target = json!({"by":"element","id":id});
+    let r = act(
+        edge_port,
+        frame,
+        json!({"kind":"type","target":target,"text":"hello"}),
+    );
+    assert_eq!(r["result"], "done", "{r}");
+    let r = act(
+        edge_port,
+        frame,
+        json!({"kind":"type","target":target,"text":"-more"}),
+    );
+    assert_eq!(r["result"], "done", "{r}");
+    assert_eq!(value_of(edge_port), "hello-more", "缺省是追加");
+    let frame = observe(edge_port)["observation"]["frame_id"]
+        .as_u64()
+        .unwrap();
+    let r = act(
+        edge_port,
+        frame,
+        json!({"kind":"type","target":target,"text":"fresh","replace":true}),
+    );
+    assert_eq!(r["result"], "done", "{r}");
+    assert_eq!(value_of(edge_port), "fresh", "replace=true 应覆盖已有内容");
+}
+
+/// set_checked 是幂等的“设为已选/未选”：已经是目标状态就不动，不会像 click 那样来回切换。
+#[tokio::test]
+async fn edge_set_checked_is_idempotent() {
+    if std::env::var("RIG_EDGE_IT").is_err() {
+        eprintln!("跳过：未设置 RIG_EDGE_IT");
+        return;
+    }
+    let _serial = SERIAL.lock().await;
+    let page = r#"<!DOCTYPE html><meta charset="utf-8"><title>setchecked</title>
+<body style="margin:0"><label style="position:absolute;left:20px;top:20px"><input type="checkbox" id="c" checked> subscribe</label>
+<button id="b" style="position:absolute;left:20px;top:80px">plain</button></body>"#;
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    serve(
+        listener,
+        vec![("/setchecked.html".into(), page.to_string())],
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let edge_port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let _proc = EdgeProc(
+        edge_command()
+            .args([
+                "--listen",
+                &format!("127.0.0.1:{edge_port}"),
+                "--token",
+                TEST_TOKEN,
+                "--url",
+                &format!("http://127.0.0.1:{port}/setchecked.html"),
+                "--width",
+                "400",
+                "--height",
+                "300",
+            ])
+            .process_group(0)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("启动 rig-edge-browser"),
+    );
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Ok(mut s) = std::net::TcpStream::connect(("127.0.0.1", edge_port)) {
+            let _ = s.write_all(b"GET /health HTTP/1.0\r\n\r\n");
+            let mut b = String::new();
+            if s.read_to_string(&mut b).is_ok() && b.contains("\"ok\":true") {
+                break;
+            }
+        }
+        assert!(Instant::now() < deadline, "边缘程序未就绪");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+    let state = |port: u16| {
+        let cur = observe(port);
+        let frame = cur["observation"]["frame_id"].as_u64().unwrap();
+        let cb = find_element(&cur["observation"], "checkbox", "subscribe").expect("checkbox");
+        let checked = cb["states"]
+            .as_array()
+            .map(|a| a.iter().any(|s| s == "checked"))
+            .unwrap_or(false);
+        (frame, cb["id"].as_str().unwrap().to_string(), checked)
+    };
+    let (frame, id, checked) = state(edge_port);
+    assert!(checked, "初始应为已选");
+    for (want, expect_after) in [(false, false), (false, false), (true, true), (true, true)] {
+        let (frame, id, _) = state(edge_port);
+        let r = act(
+            edge_port,
+            frame,
+            json!({"kind":"set_checked","target":{"by":"element","id":id},"checked":want}),
+        );
+        assert_eq!(r["result"], "done", "set_checked({want}) -> {r}");
+        let (_, _, after) = state(edge_port);
+        assert_eq!(after, expect_after, "set_checked({want}) 之后的状态");
+    }
+    // 非勾选类元素必须被拒，不能悄悄当成 click
+    let plain = {
+        let cur = observe(edge_port);
+        let b = find_element(&cur["observation"], "button", "plain").expect("button");
+        (
+            cur["observation"]["frame_id"].as_u64().unwrap(),
+            b["id"].as_str().unwrap().to_string(),
+        )
+    };
+    let r = act(
+        edge_port,
+        plain.0,
+        json!({"kind":"set_checked","target":{"by":"element","id":plain.1},"checked":true}),
+    );
+    assert_ne!(r["result"], "done", "非勾选类元素应被拒: {r}");
+    let _ = (frame, id);
+}

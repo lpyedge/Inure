@@ -9,8 +9,8 @@ use std::time::{Duration, Instant};
 use rig_proto::observation::{
     check_element_scroll_target, check_element_target, check_point_target, diff_observations,
     AbortReason, Action, ActionRequest, ActionResult, BBox, BatchActionRequest, BatchActionResult,
-    ElementState, MouseButton, Observation, ObservationDelta, ObserveMode, ObserveRequest,
-    RejectReason, Target, TextLayout, MAX_BATCH_ACTIONS,
+    ElementState, MouseButton, Observation, ObservationDelta, ObserveAfter, ObserveMode,
+    ObserveRequest, RejectReason, Target, TextLayout, MAX_BATCH_ACTIONS,
 };
 use tokio::sync::Mutex;
 
@@ -824,6 +824,7 @@ impl AiChannel {
         req: BatchActionRequest,
     ) -> (BatchActionResult, Result<Option<ObserveOut>, String>) {
         let total = req.actions.len();
+        let (req_frame, observe_after) = (req.frame_id, req.observe_after);
         if total == 0 || total > MAX_BATCH_ACTIONS {
             return (
                 BatchActionResult {
@@ -855,7 +856,43 @@ impl AiChannel {
             }
         }
         let skipped = total - results.len();
+        // 全部 Done 才按需附文本；被拒/中断沿用上面的“附最新状态”。
+        if skipped == 0
+            && results
+                .iter()
+                .all(|r| matches!(r, ActionResult::Done { .. }))
+        {
+            if let Some(after) = observe_after {
+                fresh = self.observe_after_batch(after, req_frame).await.map(Some);
+            }
+        }
         (BatchActionResult { results, skipped }, fresh)
+    }
+
+    /// 批量全部完成后的文本呈现：沿用客户端最近的排版，强制 text 模式、不含视口外；
+    /// `Delta` 以请求帧为基准（对不上时回完整文本）。这是一次正常的观察，会成为新的存储帧，
+    /// 回包里的 `# frame N` 可直接用于下一次动作。
+    async fn observe_after_batch(
+        &self,
+        after: ObserveAfter,
+        req_frame: u64,
+    ) -> Result<ObserveOut, String> {
+        let layout = self
+            .presented
+            .lock()
+            .await
+            .as_ref()
+            .map(|prior| prior.request.layout)
+            .unwrap_or_default();
+        let req = ObserveRequest {
+            mode: ObserveMode::Text,
+            layout,
+            since_frame: (after == ObserveAfter::Delta).then_some(req_frame),
+            ..Default::default()
+        };
+        self.observe_req(&req)
+            .await
+            .map_err(|_| "Could not obtain the latest page state".into())
     }
 
     #[cfg(test)]
@@ -1031,7 +1068,7 @@ impl AiChannel {
         }
         let frame = match seen_state.as_ref().filter(|_| !has_element || fast_ok) {
             Some(state) => state.clone(),
-            None => match self.observe_full(observation_deadline(), true, true).await {
+            None => match self.observe_full(observation_deadline(), true, false).await {
                 Ok(frame) => frame,
                 Err(e) => {
                     return ActionResult::Rejected {
@@ -1102,7 +1139,7 @@ impl AiChannel {
             _ => None,
         };
         if let Some(mode) = live_check {
-            match self.observe_full(observation_deadline(), true, true).await {
+            match self.observe_full(observation_deadline(), true, false).await {
                 Ok(fresh) => {
                     let stale = frame.context != fresh.context
                         || match mode {
@@ -1399,6 +1436,7 @@ impl AiChannel {
                 target,
                 text,
                 submit,
+                replace,
             } => {
                 if let Some(t) = target {
                     self.click_target(frame, t, MouseButton::Left, 1, h).await?;
@@ -1419,6 +1457,9 @@ impl AiChannel {
                         .await
                         .unwrap_or_else(|| main.clone()),
                 };
+                if *replace {
+                    self.press_key(&session, "Control+A", h).await?;
+                }
                 self.browser
                     .insert_text(&session, text)
                     .await
@@ -1475,6 +1516,30 @@ impl AiChannel {
                     .map_err(denied)?;
                 // 与点击路径一致：等滚动后的重排落定，调用方随后 observe 才看到新视口。
                 tokio::time::sleep(Duration::from_millis(60)).await;
+                Ok(None)
+            }
+            Action::SetChecked { target, checked } => {
+                let Target::Element { id } = target else {
+                    return Err(denied("SetChecked only supports element targets".into()));
+                };
+                let el = current
+                    .find(id)
+                    .ok_or_else(|| denied(format!("unknown element {id}")))?;
+                if !matches!(
+                    el.role.as_str(),
+                    "checkbox" | "radio" | "switch" | "menuitemcheckbox" | "menuitemradio"
+                ) {
+                    return Err(denied(format!(
+                        "SetChecked needs a checkbox, radio or switch, got {}",
+                        el.role
+                    )));
+                }
+                // 已经是目标状态就不动：幂等，不像 click 那样来回切换。
+                if el.has(ElementState::Checked) == *checked {
+                    return Ok(None);
+                }
+                self.click_target(frame, target, MouseButton::Left, 1, h)
+                    .await?;
                 Ok(None)
             }
             Action::Select { target, values } => {
@@ -1811,6 +1876,11 @@ fn action_label(action: &Action, current: &Observation) -> String {
         Action::Scroll { .. } => "Scroll".to_string(),
         Action::ScrollIntoView { target } => format!("Scroll to {}", desc(target, current)),
         Action::Select { target, .. } => format!("Select {}", desc(target, current)),
+        Action::SetChecked { target, checked } => format!(
+            "{} {}",
+            if *checked { "Check" } else { "Uncheck" },
+            desc(target, current)
+        ),
         Action::Upload { target, files } => {
             format!(
                 "Upload {} file(s) to {}",
