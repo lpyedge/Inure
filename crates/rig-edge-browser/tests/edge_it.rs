@@ -6513,6 +6513,204 @@ async fn edge_batch_observe_after_returns_text_and_usable_frame() {
     assert_eq!(v["result"]["results"][0]["result"], "rejected", "{v}");
 }
 
+/// 拒绝回包里的 `current_frame` 必须等于随包文本的 `# frame N`，照它重发应被接受
+/// （此前附带的新观察又把存储帧推进一步，current_frame 比文本帧号小 1，照它重发会再被拒）。
+#[tokio::test]
+async fn edge_stale_reject_current_frame_matches_attached_frame() {
+    if std::env::var("RIG_EDGE_IT").is_err() {
+        eprintln!("跳过：未设置 RIG_EDGE_IT");
+        return;
+    }
+    let _serial = SERIAL.lock().await;
+    let page = r#"<!DOCTYPE html><meta charset="utf-8"><title>cur</title>
+<body style="margin:0"><button id="a" style="position:absolute;left:20px;top:20px;width:100px;height:40px">alpha</button></body>"#;
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    serve(listener, vec![("/cur.html".into(), page.to_string())]);
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let edge_port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let _proc = EdgeProc(
+        edge_command()
+            .args([
+                "--listen",
+                &format!("127.0.0.1:{edge_port}"),
+                "--token",
+                TEST_TOKEN,
+                "--url",
+                &format!("http://127.0.0.1:{port}/cur.html"),
+                "--width",
+                "400",
+                "--height",
+                "300",
+            ])
+            .process_group(0)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("启动 rig-edge-browser"),
+    );
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Ok(mut s) = std::net::TcpStream::connect(("127.0.0.1", edge_port)) {
+            let _ = s.write_all(b"GET /health HTTP/1.0\r\n\r\n");
+            let mut b = String::new();
+            if s.read_to_string(&mut b).is_ok() && b.contains("\"ok\":true") {
+                break;
+            }
+        }
+        assert!(Instant::now() < deadline, "边缘程序未就绪");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+    let (st, v) = http_json(edge_port, "POST", "/observe", Some(json!({"mode": "text"})));
+    assert_eq!(st, 200);
+    let text = v["text"].as_str().unwrap().to_string();
+    let frame: u64 = text
+        .lines()
+        .next()
+        .unwrap()
+        .strip_prefix("# frame ")
+        .unwrap()
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let id = {
+        let line = text
+            .lines()
+            .find(|l| l.contains("alpha"))
+            .expect("alpha 按钮");
+        let start = line.find("[e").unwrap() + 1;
+        line[start..]
+            .split(|c: char| !c.is_ascii_alphanumeric())
+            .next()
+            .unwrap()
+            .to_string()
+    };
+    let body = |frame: u64, rid: &str| json!({"request_id": rid, "frame_id": frame, "action": {"kind": "click", "target": {"by": "element", "id": id}}});
+    // 请求一个不存在的旧帧 → StaleFrame，随包文本是新的一帧
+    let (st, v) = http_json(edge_port, "POST", "/act", Some(body(frame + 100, "c1")));
+    assert_eq!(st, 200, "{v}");
+    assert_eq!(v["result"]["result"], "rejected", "{v}");
+    assert_eq!(v["result"]["reason"]["code"], "stale_frame", "{v}");
+    let attached: u64 = v["text"]
+        .as_str()
+        .expect("应附最新状态")
+        .lines()
+        .next()
+        .unwrap()
+        .strip_prefix("# frame ")
+        .unwrap()
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_eq!(
+        v["result"]["reason"]["current_frame"].as_u64().unwrap(),
+        attached,
+        "current_frame 应等于随包文本的帧号: {v}"
+    );
+    // 照它重发应被接受
+    let (st, v) = http_json(edge_port, "POST", "/act", Some(body(attached, "c2")));
+    assert_eq!(st, 200, "{v}");
+    assert_eq!(
+        v["result"]["result"], "done",
+        "照 current_frame 重发应被接受: {v}"
+    );
+}
+
+/// 已交付过的旧帧：目标元素没变就仍可用（例如调用方连续观察两次后用第一次的帧）；目标变了照旧被拒。
+#[tokio::test]
+async fn edge_recent_delivered_frame_stays_usable_when_target_unchanged() {
+    if std::env::var("RIG_EDGE_IT").is_err() {
+        eprintln!("跳过：未设置 RIG_EDGE_IT");
+        return;
+    }
+    let _serial = SERIAL.lock().await;
+    let page = r#"<!DOCTYPE html><meta charset="utf-8"><title>old</title>
+<body style="margin:0"><button id="a" style="position:absolute;left:20px;top:20px;width:100px;height:40px">alpha</button>
+<button id="b" style="position:absolute;left:20px;top:80px;width:100px;height:40px" onclick="this.textContent='beta2'">beta</button></body>"#;
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    serve(listener, vec![("/old.html".into(), page.to_string())]);
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let edge_port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let _proc = EdgeProc(
+        edge_command()
+            .args([
+                "--listen",
+                &format!("127.0.0.1:{edge_port}"),
+                "--token",
+                TEST_TOKEN,
+                "--url",
+                &format!("http://127.0.0.1:{port}/old.html"),
+                "--width",
+                "400",
+                "--height",
+                "300",
+            ])
+            .process_group(0)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("启动 rig-edge-browser"),
+    );
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Ok(mut s) = std::net::TcpStream::connect(("127.0.0.1", edge_port)) {
+            let _ = s.write_all(b"GET /health HTTP/1.0\r\n\r\n");
+            let mut b = String::new();
+            if s.read_to_string(&mut b).is_ok() && b.contains("\"ok\":true") {
+                break;
+            }
+        }
+        assert!(Instant::now() < deadline, "边缘程序未就绪");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+    let o1 = observe(edge_port);
+    let f1 = o1["observation"]["frame_id"].as_u64().unwrap();
+    let a = find_element(&o1["observation"], "button", "alpha").expect("alpha")["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let b = find_element(&o1["observation"], "button", "beta").expect("beta")["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let el = |id: &str| json!({"by": "element", "id": id});
+    // 每次请求用不同的 request_id，避免命中幂等缓存
+    let act = |port: u16, frame: u64, action: Value| {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let (st, v) = http_json(
+            port,
+            "POST",
+            "/act",
+            Some(json!({"request_id": format!("old-{n}"), "frame_id": frame, "action": action})),
+        );
+        assert_eq!(st, 200, "{v}");
+        v["result"].clone()
+    };
+    // 点 beta（改名为 beta2），页面随之变化
+    let r = act(edge_port, f1, json!({"kind": "click", "target": el(&b)}));
+    assert_eq!(r["result"], "done", "{r}");
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    // 第二次观察 → 新的一帧；f1 已不是存储帧，但已交付过
+    let o2 = observe(edge_port);
+    let f2 = o2["observation"]["frame_id"].as_u64().unwrap();
+    assert!(f2 > f1, "第二次观察应是新帧");
+    // alpha 没变：用旧帧 f1 仍应被接受
+    let r = act(edge_port, f1, json!({"kind": "click", "target": el(&a)}));
+    assert_eq!(r["result"], "done", "目标没变，已交付的旧帧应仍可用: {r}");
+    // beta 已改名：用旧帧 f1 必须被拒
+    let r = act(edge_port, f1, json!({"kind": "click", "target": el(&b)}));
+    assert_eq!(r["result"], "rejected", "目标变了必须被拒: {r}");
+    assert_eq!(r["reason"]["code"], "stale_frame", "{r}");
+}
+
 /// Control+A 必须真的全选（无头 Chromium 的组合键需要带编辑命令才会触发全选），
 /// 随后 Backspace 清空输入框。
 #[tokio::test]

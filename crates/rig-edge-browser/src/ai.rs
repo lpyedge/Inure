@@ -81,6 +81,14 @@ struct PresentedFrame {
     text_view: bool,
 }
 
+/// 已交付旧帧的比较基准：请求帧不是存储帧时，用历史里的那一帧判断
+/// 导航与目标是否变化（只作比较，不改变执行帧）。
+struct SeenBaseline {
+    obs: Observation,
+    context: PageContext,
+    mark: u64,
+}
+
 /// text 增量的行键：元素行取 `[id]`，无法解析时按整行内容作键。
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 enum LineKey<'a> {
@@ -809,12 +817,29 @@ impl AiChannel {
             self.observe_req_inner(&req, deadline).await
         }
         .await;
-        (
-            result,
-            fresh
-                .map(Some)
-                .map_err(|_| "Could not obtain the latest page state".into()),
-        )
+        // 附带的新观察就是客户端随后拿到的那一帧：拒绝里的 current_frame 必须与
+        // 文本帧头的 `# frame N` 一致，否则照它重发仍会被判陈旧。
+        let fresh = fresh
+            .map(Some)
+            .map_err(|_| "Could not obtain the latest page state".into());
+        let result = match result {
+            ActionResult::Rejected {
+                reason: RejectReason::StaleFrame { current_frame },
+            } if matches!(&fresh, Ok(Some(_))) => {
+                let presented = self
+                    .presented
+                    .lock()
+                    .await
+                    .as_ref()
+                    .map(|presented| presented.frame.obs.frame_id);
+                let current_frame = presented.unwrap_or(current_frame);
+                ActionResult::Rejected {
+                    reason: RejectReason::StaleFrame { current_frame },
+                }
+            }
+            other => other,
+        };
+        (result, fresh)
     }
 
     /// 批量动作：逐步调用单步 act（各步完整校验、幂等、接管检查），
@@ -1033,6 +1058,39 @@ impl AiChannel {
             self.state.lock().await.clone()
         };
         let seen = seen_state.as_ref().map(|fs| &fs.obs);
+        // 已交付过的旧帧（非焦点动作）：请求帧不是存储帧时，从最近的交付历史里
+        // 取同一帧作比较基准；目标没变就放行，变了仍由 element_unchanged 判陈旧。
+        let history_baseline =
+            if !focus_targeted && seen.map(|obs| obs.frame_id) != Some(req.frame_id) {
+                let history = self.history.lock().await;
+                history
+                    .iter()
+                    .rev()
+                    // 历史里存的是投影后的视图（同一帧可能有 text 与 tree 两份），
+                    // 取第一份含全部目标元素的；都不含则退回原行为（陈旧），
+                    // 避免把本应判陈旧的动作误报成 unknown_element。
+                    .find(|entry| {
+                        entry.obs.frame_id == req.frame_id
+                            && req.action.targets().iter().all(|t| match t {
+                                Target::Element { id } => entry.obs.find(id).is_some(),
+                                _ => true,
+                            })
+                    })
+                    .map(|entry| SeenBaseline {
+                        obs: entry.obs.clone(),
+                        context: entry.context.clone(),
+                        mark: entry.mark,
+                    })
+            } else {
+                None
+            };
+        // 比较基准：历史旧帧优先，其次是存储/呈现帧。执行帧仍是存储帧，不受影响。
+        let baseline = match history_baseline.as_ref() {
+            Some(entry) => Some((&entry.obs, &entry.context, entry.mark)),
+            None => seen_state
+                .as_ref()
+                .map(|fs| (&fs.obs, &fs.context, fs.mark)),
+        };
         let has_element = req
             .action
             .targets()
@@ -1078,13 +1136,13 @@ impl AiChannel {
             },
         };
         let current = &frame.obs;
-        if seen_state.as_ref().is_some_and(|seen| {
-            seen.obs.frame_id == req.frame_id
-                && (seen.context.page != frame.context.page
-                    || seen.context.loader != frame.context.loader
+        if baseline.is_some_and(|(obs, context, mark)| {
+            obs.frame_id == req.frame_id
+                && (context.page != frame.context.page
+                    || context.loader != frame.context.loader
                     || self
                         .changes
-                        .root_navigated_since(seen.mark, &frame.context.page.session))
+                        .root_navigated_since(mark, &frame.context.page.session))
         }) && !matches!(&req.action, Action::Navigate { .. })
         {
             return ActionResult::Rejected {
@@ -1096,11 +1154,8 @@ impl AiChannel {
         for t in req.action.targets() {
             match t {
                 Target::Element { id } => {
-                    let seen_ref = if seen.map(|o| o.frame_id) == Some(req.frame_id) {
-                        seen
-                    } else {
-                        None
-                    };
+                    let seen_ref = baseline
+                        .and_then(|(obs, _, _)| (obs.frame_id == req.frame_id).then_some(obs));
                     let checked = if matches!(req.action, Action::ScrollIntoView { .. }) {
                         check_element_scroll_target(req.frame_id, seen_ref, current, id, 2.0)
                     } else {
@@ -1614,7 +1669,7 @@ impl AiChannel {
                     }
                     Some("ERR_NOT_SELECT") => {
                         return Err(denied(
-                            "Select target is not a native select element".into(),
+                            "Select target is not a native select element; for a custom combobox click it, type the text, then click the option".into(),
                         ))
                     }
                     Some("ERR_UNKNOWN_OPTION") => {
