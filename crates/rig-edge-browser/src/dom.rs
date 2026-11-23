@@ -24,7 +24,7 @@ const SCRIPT: &str = r##"(() => {
   if (window.__rigDom) { window.__rigDom.hello(); return; }
   const S = { next: 1, ids: new WeakMap(), byId: new Map(), obs: null, queue: [], timer: 0,
               cap: {}, dead: new Set(), capT: 0, blanks: new Map(), dseq: 0,
-              watched: new Map(), frameDocs: new WeakMap(), fdepth: 0 };
+              watched: new Map(), frameDocs: new WeakMap(), watchedEl: new Map(), fdepth: 0 };
   const send = (o) => {
     if (!S.obs && o.kind !== 'installed') return;
     try { window.__rigSend(JSON.stringify(o)); } catch (e) {}
@@ -51,6 +51,12 @@ const SCRIPT: &str = r##"(() => {
       return ac.includes('cc-') || ac.includes('one-time-code');
     }
     return false;
+  }
+  // 敏感下拉框（如 cc-exp-month）的选项：选中状态同样不进镜像，否则会泄露选了哪个。
+  function inSecretSelect(n) {
+    if (!n || n.nodeType !== 1 || n.tagName !== 'OPTION') return false;
+    const sel = n.closest ? n.closest('select') : null;
+    return !!sel && isPw(sel);
   }
   function pwMask(v) { return v ? '\u2022\u2022\u2022\u2022\u2022\u2022' : ''; }
   function absUrl(v) {
@@ -98,6 +104,7 @@ const SCRIPT: &str = r##"(() => {
     const attrs = {};
     for (const at of node.attributes) { if (!/^on/i.test(at.name)) attrs[at.name] = at.value; }
     if (isPw(node)) delete attrs.value;
+    if (inSecretSelect(node)) delete attrs.selected;
     for (const k of ['href', 'src', 'poster', 'action', 'data', 'background']) {
       if (attrs[k]) attrs[k] = absUrl(attrs[k]);
     }
@@ -109,7 +116,7 @@ const SCRIPT: &str = r##"(() => {
     // 按钮成空白圆圈即此故
     if (node.namespaceURI === 'http://www.w3.org/2000/svg') out.ns = 1;
     if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') { out.v = isPw(node) ? pwMask(node.value) : node.value; if (node.checked) out.k = 1; }
-    if (tag === 'OPTION' && node.selected) out.k = 1;
+    if (tag === 'OPTION' && node.selected && !inSecretSelect(node)) out.k = 1;
     if (tag === 'VIDEO') {
       const r = node.getBoundingClientRect();
       out.rect = [Math.round(r.width), Math.round(r.height)];
@@ -170,12 +177,23 @@ const SCRIPT: &str = r##"(() => {
     const d = S.frameDocs.get(el);
     if (!d) return;
     S.frameDocs.delete(el);
+    S.watchedEl.delete(d);
     S.watched.get(d)?.();
     S.watched.delete(d);
+    // 嵌套的同源 iframe：外层被删时，里面各层的监视也要一起解除
+    try { for (const inner of d.querySelectorAll('iframe')) unwatchFrame(inner); } catch (e) {}
+  }
+  // 兜底清扫：iframe 元素已不在文档里（比如在某个被监视的 iframe 文档内部被移除，
+  // 那边的突变只触发整页重同步，不走 dropSubtree），其监视器一并解除。
+  function sweepWatchers() {
+    for (const [d, el] of [...S.watchedEl]) {
+      if (!el.isConnected) { S.watchedEl.delete(d); unwatchFrame(el); }
+    }
   }
   function watchFrame(el, d) {
     if (S.watched.has(d)) return;
     S.frameDocs.set(el, d);
+    S.watchedEl.set(d, el);
     let last = 0;
     try {
       const mo = new MutationObserver(() => {
@@ -186,6 +204,7 @@ const SCRIPT: &str = r##"(() => {
       const onLoad = () => {
         S.watched.get(d)?.();
         S.watched.delete(d);
+        S.watchedEl.delete(d);
         send({ kind: 'resync' });
       };
       S.watched.set(d, () => {
@@ -264,6 +283,7 @@ const SCRIPT: &str = r##"(() => {
     return { css, links };
   }
   function snapshot() {
+    sweepWatchers();
     S.cap = {}; // 镜像重建后占位块是新的：强制下一拍重发 canvas 帧
     // 快照读的是当前整棵 DOM，队列里尚未发出的增量都已被它包含；留着的话
     // 这批 add 会排在快照之后送达，镜像里同一 id 的节点就多出一份（旧的那份
@@ -366,6 +386,7 @@ const SCRIPT: &str = r##"(() => {
         }
       } else if (r.type === 'attributes') {
         if (r.attributeName === 'value' && isPw(r.target)) continue;
+        if (r.attributeName === 'selected' && inSecretSelect(r.target)) continue;
         let v = r.target.getAttribute(r.attributeName);
         // 差分里的资源属性同样要绝对化（与快照同一口径）
         if (v && ['href', 'src', 'poster', 'action', 'data', 'background'].includes(r.attributeName)) v = absUrl(v);
@@ -479,6 +500,7 @@ const SCRIPT: &str = r##"(() => {
       for (const cleanup of S.watched.values()) cleanup();
       S.watched.clear();
       S.frameDocs = new WeakMap();
+      S.watchedEl.clear();
       for (const timer of [S.timer, S.hT, scrTrail, rzSend]) clearTimeout(timer);
       S.timer = S.hT = scrTrail = rzSend = 0;
       S.queue = [];

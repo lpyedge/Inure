@@ -1371,6 +1371,74 @@ async fn edge_dom_mirror_does_not_carry_card_or_otp_values() {
     }
 }
 
+const DOM_SENSITIVE_SELECT_HTML: &str = r#"<!DOCTYPE html><html lang="zh"><head><meta charset="utf-8"><title>DOM 敏感下拉探针</title></head>
+<body><select id="m" autocomplete="cc-exp-month"><option value="a">MON-AAA</option><option value="b" selected>MON-SELECTED-SECRET</option></select>
+<script>
+setTimeout(() => { document.getElementById('m').value = 'a'; document.getElementById('m').dispatchEvent(new Event('input', {bubbles: true})); }, 1200);
+</script></body></html>"#;
+
+/// 敏感字段是下拉框（如 cc-exp-month）时，值被遮蔽还不够：已选中的选项状态
+/// （`k:1` 与 `selected` 属性）同样会泄露选了哪个，镜像里也不能有。
+#[tokio::test]
+async fn edge_dom_mirror_does_not_reveal_the_selected_option_of_a_sensitive_select() {
+    if std::env::var("RIG_EDGE_IT").is_err() {
+        eprintln!("跳过：未设置 RIG_EDGE_IT");
+        return;
+    }
+    let _serial = SERIAL.lock().await;
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    serve(
+        listener,
+        vec![("/sel.html".into(), DOM_SENSITIVE_SELECT_HTML.into())],
+    );
+    let edge_port = free_port();
+    let _edge = spawn_edge(&[
+        "--listen".into(),
+        format!("127.0.0.1:{edge_port}"),
+        "--url".into(),
+        format!("http://127.0.0.1:{port}/sel.html"),
+        "--human".into(),
+        "--width".into(),
+        "900".into(),
+        "--height".into(),
+        "700".into(),
+    ]);
+    wait_health(edge_port).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    use futures_util::SinkExt;
+    let (mut ws, _) = ws_connect(format!("ws://127.0.0.1:{edge_port}/ws"))
+        .await
+        .expect("人通道 WS 应可连接");
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        json!({"type": "dom-start"}).to_string().into(),
+    ))
+    .await
+    .unwrap();
+    let mut all = String::new();
+    let deadline = Instant::now() + Duration::from_secs(4);
+    while Instant::now() < deadline {
+        if let Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Text(t)))) =
+            tokio::time::timeout(Duration::from_millis(500), ws.next()).await
+        {
+            all.push_str(&t);
+        }
+    }
+    assert!(all.contains("dom-snapshot"), "应收到 DOM 快照");
+    assert!(
+        all.contains("MON-AAA"),
+        "选项文字本身照常镜像（只遮蔽选中状态）"
+    );
+    assert!(
+        !all.contains("\"k\":1"),
+        "敏感下拉的已选中状态（k:1）不得进镜像: {all}"
+    );
+    assert!(
+        !all.contains("\"selected\""),
+        "敏感下拉选项的 selected 属性不得进镜像: {all}"
+    );
+}
+
 const DOM_BIG_CANVAS_HTML: &str = r#"<!DOCTYPE html><html><head><meta charset="utf-8"><title>Big canvas</title></head>
 <body style="margin:0;background:#000">
 <canvas id="game" width="1280" height="400"></canvas>
@@ -6965,7 +7033,22 @@ const DOM_IFRAME_CHURN_HTML: &str = r#"<!DOCTYPE html><html><head><meta charset=
     f.remove();
     await sleep(60);
   }
-  await sleep(500);
+  // 嵌套：外层带内层 iframe，整棵一起删
+  for (let i = 0; i < 12; i++) {
+    const o = document.createElement('iframe');
+    o.srcdoc = '<p>outer ' + i + '</p><iframe srcdoc="<p>inner</p>"></iframe>';
+    document.getElementById('host').appendChild(o);
+    await sleep(400);
+    o.remove();
+    await sleep(60);
+  }
+  // 在被监视的 iframe 文档内部反复增删 iframe（那边的突变只触发整页重同步）
+  const p = document.createElement('iframe');
+  p.srcdoc = '<script>setInterval(() => { const f = document.createElement("iframe"); f.srcdoc = "x"; document.body.appendChild(f); setTimeout(() => f.remove(), 200); }, 350);<\/script>';
+  document.getElementById('host').appendChild(p);
+  await sleep(6000);
+  p.remove();
+  await sleep(2500);
   document.title = 'watched=' + window.__rigDom.watchedCount();
 })();
 </script></body></html>"#;
@@ -7011,7 +7094,7 @@ async fn edge_dom_mirror_releases_watchers_of_removed_iframes() {
     .await
     .unwrap();
     // 页面自己在增删完成后把监视表大小写进标题；一边排空 WS，一边轮询观察
-    let deadline = Instant::now() + Duration::from_secs(40);
+    let deadline = Instant::now() + Duration::from_secs(60);
     let watched = loop {
         while let Ok(Some(Ok(_))) = tokio::time::timeout(Duration::from_millis(50), ws.next()).await
         {
@@ -7165,12 +7248,20 @@ async fn edge_hls_pipeline_gives_up_on_write_failures_and_restarts_in_a_new_dire
     let mut reason = String::new();
     for attempt in 1..=3 {
         std::fs::remove_dir_all(hls_root.join(&current[0])).unwrap();
+        let injected_at = Instant::now();
         let deadline = Instant::now() + Duration::from_secs(14);
         while Instant::now() < deadline {
             let (_, h) = http_json(edge_port, "GET", "/health", None);
             if h["media"]["running"] == false {
                 if let Some(e) = h["media"]["error"].as_str() {
                     reason = e.to_string();
+                    // 放弃管线本身必须及时结束线程；晚于空闲回收（约 12 秒）才变成“未运行”
+                    // 说明是回收器替它停的（带音频时会卡在回收音频线程上）。
+                    assert!(
+                        injected_at.elapsed() < Duration::from_secs(10),
+                        "放弃管线应在空闲回收之前结束线程，实际用了 {:?}",
+                        injected_at.elapsed()
+                    );
                 }
                 break;
             }
@@ -7200,6 +7291,57 @@ async fn edge_hls_pipeline_gives_up_on_write_failures_and_restarts_in_a_new_dire
     let (_, h) = http_json(edge_port, "GET", "/health", None);
     assert_eq!(h["media"]["running"], true, "{h}");
     assert!(h["media"]["error"].is_null(), "重启后错误应清除: {h}");
+}
+
+/// 页面里有隐藏的跨站 iframe（广告、追踪器很常见：display:none，没有几何）：
+/// 它的子会话无法定位、元素不输出，但这不该变成会让截图被拒、文本差分失效的告警。
+#[tokio::test]
+async fn edge_hidden_cross_site_iframe_does_not_raise_a_snapshot_warning() {
+    if std::env::var("RIG_EDGE_IT").is_err() {
+        eprintln!("跳过：未设置 RIG_EDGE_IT");
+        return;
+    }
+    let _serial = SERIAL.lock().await;
+    let listener = TcpListener::bind("0.0.0.0:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    serve(
+        listener,
+        vec![
+            (
+                "/main.html".into(),
+                format!(
+                    r#"<!DOCTYPE html><meta charset="utf-8"><title>hid</title><body style="margin:0"><button style="position:absolute;left:20px;top:20px;width:80px;height:30px">visible</button><iframe style="display:none" src="http://localhost:{port}/tracker.html"></iframe></body>"#
+                ),
+            ),
+            (
+                "/tracker.html".into(),
+                r#"<!DOCTYPE html><meta charset="utf-8"><body><button>tracker</button></body>"#
+                    .into(),
+            ),
+        ],
+    );
+    let edge_port = free_port();
+    let _edge = spawn_edge(&[
+        "--listen".into(),
+        format!("127.0.0.1:{edge_port}"),
+        "--url".into(),
+        format!("http://127.0.0.1:{port}/main.html"),
+        "--width".into(),
+        "900".into(),
+        "--height".into(),
+        "700".into(),
+    ]);
+    wait_health(edge_port).await;
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let (_, v) = http_json(edge_port, "POST", "/observe", Some(json!({"mode": "text"})));
+    let text = v["text"].as_str().unwrap_or("");
+    assert!(text.contains("visible"), "可见按钮应在观察里: {text}");
+    assert!(
+        !text.contains('\u{26a0}') && !text.contains("could not be positioned"),
+        "隐藏的跨站 iframe 不应产生告警: {text}"
+    );
+    let (status, _) = http(edge_port, "GET", "/screenshot.png", None);
+    assert_eq!(status, 200, "隐藏 iframe 不应让截图被拒");
 }
 
 /// Control+A 必须真的全选（无头 Chromium 的组合键需要带编辑命令才会触发全选），

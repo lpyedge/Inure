@@ -604,6 +604,9 @@ fn pipeline_main(
             if let Ok(mut slot) = failure.lock() {
                 *slot = Some(reason);
             }
+            // 必须置停止标志：退出时要回收音频线程，它只在 stop 置位或队列断开时才退出，
+            // 不置位就卡在 join 上，线程永远“没结束”，管线看上去还在运行。
+            stop.store(true, Ordering::SeqCst);
             break;
         }
         let now = std::time::Instant::now();

@@ -424,11 +424,21 @@ pub async fn build_observation(
 
     // 没能定位的会话（宿主 iframe 没有几何、已隐藏或被拆除等）原点未知：
     // 不输出它的元素，宁可缺也不给出错位的可点击坐标。
+    //
+    // 宿主 iframe 在已放置会话的 DOM 里找得到、只是没有几何（display:none、零尺寸，
+    // 广告与追踪器常见）：本来就不可见，静默跳过。只有连宿主都找不到（层级没传播完整）
+    // 才告警，否则每次观察都带告警会让截图被拒、文本差分失效。
     for sd in sessions.iter().filter(|sd| !sd.placed) {
-        warnings.push(format!(
-            "Frame session {} could not be positioned; its elements are omitted",
-            sd.session
-        ));
+        let host_known = !sd.root_frame.is_empty()
+            && sessions
+                .iter()
+                .any(|o| o.placed && frame_owner_backend(&o.dom, &sd.root_frame).is_some());
+        if !host_known {
+            warnings.push(format!(
+                "Frame session {} could not be positioned; its elements are omitted",
+                sd.session
+            ));
+        }
     }
     // 逐会话建树
     let mut locate: LocateMap = HashMap::new();
