@@ -16,6 +16,13 @@ pub type DomInfo = (String, HashMap<String, String>, Option<String>);
 /// backendNodeId → DOM 节点信息
 pub type DomMap = HashMap<i64, DomInfo>;
 
+#[derive(PartialEq, Eq)]
+pub(crate) struct LocalFrame {
+    pub id: String,
+    pub owner: i64,
+    pub document: i64,
+}
+
 #[derive(Clone, Debug)]
 pub struct SessionInfo {
     pub target_id: String,
@@ -797,10 +804,11 @@ impl Browser {
 
     // ── 页面门面 ─────────────────────────────────────────────
 
-    pub async fn ax_tree(&self, session: &str) -> CdpResult<Vec<Value>> {
+    pub async fn ax_tree(&self, session: &str, frame: Option<&str>) -> CdpResult<Vec<Value>> {
+        let params = frame.map_or_else(|| json!({}), |id| json!({"frameId": id}));
         let mut r = self
             .cdp
-            .call(Some(session), "Accessibility.getFullAXTree", json!({}))
+            .call(Some(session), "Accessibility.getFullAXTree", params)
             .await?;
         match r.get_mut("nodes").map(Value::take) {
             Some(Value::Array(nodes)) => Ok(nodes),
@@ -856,6 +864,15 @@ impl Browser {
 
     /// 整页 DOM 映射：backendNodeId → DomInfo
     pub async fn dom_map(&self, session: &str) -> CdpResult<DomMap> {
+        self.dom_map_with_local_frames(session)
+            .await
+            .map(|(dom, _)| dom)
+    }
+
+    pub(crate) async fn dom_map_with_local_frames(
+        &self,
+        session: &str,
+    ) -> CdpResult<(DomMap, Vec<LocalFrame>)> {
         let r = self
             .cdp
             .call(
@@ -869,8 +886,9 @@ impl Browser {
             .filter(|node| node.is_object())
             .ok_or("DOM.getDocument returned no root node")?;
         let mut map = HashMap::new();
-        collect_dom(root, &mut map);
-        Ok(map)
+        let mut frames = Vec::new();
+        collect_dom(root, &mut map, &mut frames);
+        Ok((map, frames))
     }
 
     /// 截图打码使用完整边框。四个角都必须是有效的视口坐标。
@@ -1018,7 +1036,8 @@ impl Browser {
         let Some(docs) = r.get("documents").and_then(Value::as_array) else {
             return out;
         };
-        for doc in docs {
+        // 子文档的布局盒使用子文档坐标，交给 quads 转成会话视口坐标。
+        for doc in docs.iter().take(1) {
             let Some(backend) = doc
                 .pointer("/nodes/backendNodeId")
                 .and_then(Value::as_array)
@@ -1185,12 +1204,31 @@ impl Browser {
 
     /// 当前 CSS 视口坐标实际命中的 DOM 节点。
     async fn hit_backend_node(&self, session: &str, x: f32, y: f32) -> CdpResult<i64> {
+        // DOM 命中使用文档坐标。滚动后重新读取本会话的视觉视口原点。
+        let layout = self
+            .cdp
+            .call(Some(session), "Page.getLayoutMetrics", json!({}))
+            .await?;
+        let viewport = layout
+            .get("cssVisualViewport")
+            .ok_or("getLayoutMetrics returned no cssVisualViewport")?;
+        let document_coordinate = |point: f32, key: &str| {
+            viewport
+                .get(key)
+                .and_then(Value::as_f64)
+                .map(|origin| (f64::from(point) + origin).round())
+                .filter(|point| (f64::from(i32::MIN)..=f64::from(i32::MAX)).contains(point))
+                .map(|point| point as i32)
+                .ok_or_else(|| format!("cannot convert viewport coordinate using {key}"))
+        };
+        let x = document_coordinate(x, "pageX")?;
+        let y = document_coordinate(y, "pageY")?;
         let hit = self
             .cdp
             .call(
                 Some(session),
                 "DOM.getNodeForLocation",
-                json!({"x": x.round() as i32, "y": y.round() as i32, "ignorePointerEventsNone": false}),
+                json!({"x": x, "y": y, "ignorePointerEventsNone": false}),
             )
             .await?;
         hit.get("backendNodeId")
@@ -1814,7 +1852,7 @@ fn dom_contains_backend(node: &Value, backend: i64) -> bool {
         })
 }
 
-fn collect_dom(node: &Value, map: &mut DomMap) {
+fn collect_dom(node: &Value, map: &mut DomMap, frames: &mut Vec<LocalFrame>) {
     if let Some(backend) = node.get("backendNodeId").and_then(Value::as_i64) {
         let tag = node
             .get("nodeName")
@@ -1834,20 +1872,31 @@ fn collect_dom(node: &Value, map: &mut DomMap) {
             .get("frameId")
             .and_then(Value::as_str)
             .map(str::to_string);
+        if let (Some(id), Some(document)) = (
+            &frame_id,
+            node.pointer("/contentDocument/backendNodeId")
+                .and_then(Value::as_i64),
+        ) {
+            frames.push(LocalFrame {
+                id: id.clone(),
+                owner: backend,
+                document,
+            });
+        }
         map.insert(backend, (tag, attrs, frame_id));
     }
-    for key in ["children", "shadowRoots"] {
+    for key in ["children", "shadowRoots", "pseudoElements"] {
         if let Some(arr) = node.get(key).and_then(Value::as_array) {
             for c in arr {
-                collect_dom(c, map);
+                collect_dom(c, map, frames);
             }
         }
     }
     if let Some(cd) = node.get("contentDocument") {
-        collect_dom(cd, map);
+        collect_dom(cd, map, frames);
     }
     if let Some(t) = node.get("templateContent") {
-        collect_dom(t, map);
+        collect_dom(t, map, frames);
     }
 }
 

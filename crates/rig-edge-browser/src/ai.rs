@@ -37,6 +37,7 @@ impl From<RejectReason> for ExecErr {
 /// text 字段是给人看的摘要，增量本体走 JSON（HTTP 的 delta
 /// 字段 / MCP 的第二个文本块）。
 pub enum ObserveOut {
+    Text(String),
     Full(Observation, String, Option<Vec<u8>>),
     Delta(ObservationDelta, String),
 }
@@ -71,6 +72,11 @@ struct PresentedFrame {
     context: PageContext,
     mark: u64,
     projection: Projection,
+}
+
+struct Presentation {
+    frame: Arc<FrameState>,
+    request: ObserveRequest,
 }
 
 /// 把 CDP 结构类事件同步喂进变化日志（读泵内、先于其后的命令响应，
@@ -137,7 +143,7 @@ pub struct AiChannel {
     frame: AtomicU64,
     state: Mutex<Option<Arc<FrameState>>>,
     /// 最近成功呈現給呼叫方的觀察；內部動作校驗採集不推進此基準。
-    presented: Mutex<Option<Arc<FrameState>>>,
+    presented: Mutex<Option<Presentation>>,
     /// 最近 8 个已输出的结构化观察。动作内部校验帧不进入这个池。
     history: Mutex<Vec<PresentedFrame>>,
     /// act 串行锁：同一时刻只执行一个动作，避免多客户端动作交错
@@ -277,7 +283,9 @@ impl AiChannel {
     async fn observe(&self) -> Result<(Observation, String), String> {
         match self.observe_req(&ObserveRequest::default()).await? {
             ObserveOut::Full(obs, text, _) => Ok((obs, text)),
-            ObserveOut::Delta(..) => Err("内部错误：默认 observe 不应返回增量".into()),
+            ObserveOut::Text(..) | ObserveOut::Delta(..) => {
+                Err("内部错误：默认 observe 应返回结构化整帧".into())
+            }
         }
     }
 
@@ -362,7 +370,13 @@ impl AiChannel {
                         });
                     } else {
                         let candidate = diff_observations(&base.obs, &view);
-                        if base.obs.apply_delta(&candidate).as_ref() == Some(&view) {
+                        // 目标大幅变更时，子树增量本身可能比完整结构化观察更大。
+                        if base.obs.apply_delta(&candidate).as_ref() == Some(&view)
+                            && matches!(
+                                (serde_json::to_vec(&candidate), serde_json::to_vec(&view)),
+                                (Ok(delta), Ok(full)) if delta.len() < full.len()
+                            )
+                        {
                             delta = Some(candidate);
                         }
                     }
@@ -385,7 +399,7 @@ impl AiChannel {
             }
         }
         if let Some(delta) = delta {
-            self.note_presented(frame).await;
+            self.note_presented(frame, req).await;
             return Ok(delta_out(delta, note.as_deref()));
         }
         let mut text = render(&view);
@@ -395,19 +409,26 @@ impl AiChannel {
         for warning in warnings {
             text.push_str(&format!("[⚠ {warning}]\n"));
         }
-        self.note_presented(frame).await;
-        Ok(ObserveOut::Full(view, text, image))
+        self.note_presented(frame, req).await;
+        if req.mode == ObserveMode::Text {
+            Ok(ObserveOut::Text(text))
+        } else {
+            Ok(ObserveOut::Full(view, text, image))
+        }
     }
 
-    async fn note_presented(&self, frame: &Arc<FrameState>) {
+    async fn note_presented(&self, frame: &Arc<FrameState>, request: &ObserveRequest) {
         let mut presented = self.presented.lock().await;
         if presented
             .as_ref()
-            .is_some_and(|previous| previous.obs.frame_id >= frame.obs.frame_id)
+            .is_some_and(|previous| previous.frame.obs.frame_id >= frame.obs.frame_id)
         {
             return;
         }
-        *presented = Some(Arc::clone(frame));
+        *presented = Some(Presentation {
+            frame: Arc::clone(frame),
+            request: request.clone(),
+        });
     }
 
     async fn capture_marked(
@@ -514,10 +535,21 @@ impl AiChannel {
         ) {
             return (result, Ok(None));
         }
-        let req = ObserveRequest {
-            since_frame: Some(req_frame),
-            ..ObserveRequest::default()
-        };
+        let prior = self.presented.lock().await;
+        let mut req = prior
+            .as_ref()
+            .filter(|prior| prior.frame.obs.frame_id == req_frame)
+            .map(|prior| prior.request.clone())
+            .unwrap_or_default();
+        drop(prior);
+        if req.mode == ObserveMode::TreeImage {
+            req.mode = ObserveMode::Tree;
+        }
+        if req.mode == ObserveMode::Text {
+            // 拒绝后先呈现当前可见状态，避免整页离屏内容再次送进模型。
+            req.include_offscreen = false;
+        }
+        req.since_frame = (req.mode == ObserveMode::Tree).then_some(req_frame);
         let deadline = observation_deadline();
         let state = self.state.lock().await.clone();
         let fresh = async {
@@ -662,7 +694,12 @@ impl AiChannel {
         // 焦点动作须与调用方看到的焦点比较，内部复核帧只供执行端使用。
         // Point 则先校验存储帧号，先刷新会让请求帧过期。
         let seen_state = if focus_targeted {
-            let presented = self.presented.lock().await.clone();
+            let presented = self
+                .presented
+                .lock()
+                .await
+                .as_ref()
+                .map(|presented| Arc::clone(&presented.frame));
             let current_frame = presented.as_ref().map(|frame| frame.obs.frame_id);
             if current_frame != Some(req.frame_id) {
                 return ActionResult::Rejected {
@@ -2308,14 +2345,16 @@ mod tests {
                 assert!(o.frame_id > f1, "旧观察帧需要重新采集");
                 assert!(!text.is_empty());
             }
-            ObserveOut::Delta(..) => panic!("请求帧不在历史池，应回整帧"),
+            ObserveOut::Text(..) | ObserveOut::Delta(..) => {
+                panic!("请求帧不在历史池，应回结构化整帧")
+            }
         }
         // 帧过期（>500ms）→ 重采出更新的帧
         tokio::time::sleep(std::time::Duration::from_millis(600)).await;
         let (_, fresh) = ch.act_with_fresh(click_point(f1 + 100, 10.0, 10.0)).await;
         match fresh.unwrap().unwrap() {
             ObserveOut::Full(o, _, _) => assert!(o.frame_id > f1, "过期应重采"),
-            ObserveOut::Delta(..) => panic!("应回整帧"),
+            ObserveOut::Text(..) | ObserveOut::Delta(..) => panic!("应回结构化整帧"),
         }
         // 请求帧在历史池且已不是最新 → 回增量
         let (cur, _) = ch.observe().await.unwrap();
@@ -2325,7 +2364,7 @@ mod tests {
                 assert_eq!(d.base_frame, f1);
                 assert!(d.frame_id >= cur.frame_id);
             }
-            ObserveOut::Full(..) => panic!("请求帧在历史池，应回增量"),
+            ObserveOut::Full(..) | ObserveOut::Text(..) => panic!("请求帧在历史池，应回增量"),
         }
         // 成功动作不附带
         let (cur, _) = ch.observe().await.unwrap();
@@ -2356,7 +2395,7 @@ mod tests {
                     assert!(d.upserts.is_empty() && d.removed.is_empty());
                     obs = obs.apply_delta(&d).expect("空增量应能应用");
                 }
-                ObserveOut::Full(..) => panic!("没变应回空增量"),
+                ObserveOut::Full(..) | ObserveOut::Text(..) => panic!("没变应回空增量"),
             }
         }
         let (mut full, _) = ch.observe().await.unwrap();

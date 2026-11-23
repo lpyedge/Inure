@@ -1,7 +1,6 @@
 //! AI 通道核心：把当前标签页及子帧会话的无障碍树拼成一帧 rig-proto Observation。
 //!
-//! 蓝图（G1 定调）：ab 式全量紧凑快照（不过滤视口）、稳定且不复用的元素 id、
-//! 跨进程 iframe 坐标合成、确定性剪枝、渲染前脱敏。本模块只做"观察"，
+//! 快照使用稳定且不复用的元素 id，处理子帧归属、视口投影和渲染前脱敏。
 //! 动作在 ai.rs。
 
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -45,6 +44,7 @@ pub type LocateMap = HashMap<String, (String, i64)>;
 struct SessionData {
     session: String,
     nodes: Vec<Value>,
+    local_frames: Vec<(i64, Vec<Value>)>,
     dom: crate::browser::DomMap,
     root_frame: String,
     offset: (f32, f32),
@@ -231,7 +231,7 @@ pub async fn build_observation(
     let mut sessions: Vec<SessionData> = Vec::new();
     let t_axdom = std::time::Instant::now();
     for sid in session_ids {
-        let nodes = match browser.ax_tree(&sid).await {
+        let nodes = match browser.ax_tree(&sid, None).await {
             Ok(nodes) => nodes,
             Err(e) => {
                 if sid == main {
@@ -252,8 +252,8 @@ pub async fn build_observation(
         }
         let placed = sid == main;
         // 密码等敏感状态来自 DOM，AX 节点未经这一步不能对外输出。
-        let dom = match browser.dom_map(&sid).await {
-            Ok(dom) => dom,
+        let (mut dom, frames) = match browser.dom_map_with_local_frames(&sid).await {
+            Ok(mapping) => mapping,
             Err(_) if placed => {
                 return Err("main frame DOM mapping failed; cannot confirm redaction".into())
             }
@@ -264,6 +264,51 @@ pub async fn build_observation(
                 continue;
             }
         };
+        let mut candidates = Vec::new();
+        for frame in frames {
+            let child_nodes = match browser.ax_tree(&sid, Some(&frame.id)).await {
+                Ok(nodes) if nodes.is_empty() => continue,
+                Ok(nodes) => nodes,
+                Err(e) => {
+                    warnings.push(format!(
+                        "AX collection failed for frame {} ({e}); skipped",
+                        frame.id
+                    ));
+                    continue;
+                }
+            };
+            candidates.push((frame, child_nodes));
+        }
+        let mut local_frames = Vec::new();
+        if !candidates.is_empty() {
+            match browser.dom_map_with_local_frames(&sid).await {
+                Ok((latest_dom, current_frames)) => {
+                    dom = latest_dom;
+                    for (frame, nodes) in candidates {
+                        // 子帧 AX 在初始 DOM 后采集。重新读取属性，确认仍是同一文档，
+                        // 且每个有 DOM 对应物的节点都有当前脱敏所需的属性。
+                        let backend =
+                            |node: &Value| node.get("backendDOMNodeId").and_then(Value::as_i64);
+                        if current_frames.contains(&frame)
+                            && nodes.first().and_then(backend) == Some(frame.document)
+                            && nodes
+                                .iter()
+                                .filter_map(backend)
+                                .all(|id| dom.contains_key(&id))
+                        {
+                            local_frames.push((frame.owner, nodes));
+                        } else {
+                            warnings.push(format!(
+                                "DOM mapping changed for frame {}; cannot confirm redaction; skipped",
+                                frame.id
+                            ));
+                        }
+                    }
+                }
+                Err(_) => warnings
+                    .push("Could not confirm DOM attributes for local frames; skipped".into()),
+            }
+        }
         let root_frame = if placed {
             String::new()
         } else {
@@ -281,6 +326,7 @@ pub async fn build_observation(
         sessions.push(SessionData {
             session: sid,
             nodes,
+            local_frames,
             dom,
             root_frame,
             offset: (0.0, 0.0),
@@ -336,7 +382,7 @@ pub async fn build_observation(
     let mut locate: LocateMap = HashMap::new();
     let mut roots_by_session: HashMap<String, Vec<Element>> = HashMap::new();
     for sd in &sessions {
-        let roots = build_tree(browser, ids, sd, vw, vh, &mut locate).await;
+        let roots = build_tree(browser, ids, sd, &sd.nodes, vw, vh, &mut locate).await;
         roots_by_session.insert(sd.session.clone(), roots);
     }
 
@@ -358,9 +404,7 @@ pub async fn build_observation(
         }
     }
 
-    // 组装：主会话根为顶层；子会话根嫁接进宿主 iframe 元素（只嫁接一次，
-    // 此前的实现同时又把子根追加到顶层，造成整棵子树出现两遍）；
-    // 找不到宿主或宿主元素不在树中的，退回顶层追加，保证内容不丢。
+    // 子帧嫁接到宿主。跨进程帧保留原有的顶层回退。
     let mut top: Vec<Element> = roots_by_session.remove(main).unwrap_or_default();
     let mut graft: HashMap<(String, i64), Vec<Element>> = HashMap::new();
     for (sid, roots) in roots_by_session {
@@ -370,14 +414,24 @@ pub async fn build_observation(
             top.extend(roots);
         }
     }
+    for sd in &sessions {
+        for (owner, nodes) in &sd.local_frames {
+            let key = (sd.session.clone(), *owner);
+            if let std::collections::hash_map::Entry::Vacant(entry) = graft.entry(key) {
+                let roots = build_tree(browser, ids, sd, nodes, vw, vh, &mut locate).await;
+                entry.insert(roots);
+            }
+        }
+    }
     if !graft.is_empty() {
-        let rev: HashMap<String, (String, i64)> = locate
-            .iter()
-            .map(|(id, sb)| (id.clone(), sb.clone()))
-            .collect();
-        graft_into(&mut top, &rev, &mut graft);
-        for (_, leftover) in graft {
-            top.extend(leftover);
+        graft_into(&mut top, &locate, &mut graft);
+        for host in host_of.values() {
+            if let Some(leftover) = graft.remove(host) {
+                top.extend(leftover);
+            }
+        }
+        if !graft.is_empty() {
+            graft_into(&mut top, &locate, &mut graft);
         }
     }
 
@@ -396,7 +450,16 @@ pub async fn build_observation(
             quads_calls: quads_n1.saturating_sub(quads_n0),
             quads_ms: (quads_us1.saturating_sub(quads_us0)) as f64 / 1000.0,
             ax_dom_ms,
-            nodes: sessions.iter().map(|s| s.nodes.len()).sum(),
+            nodes: sessions
+                .iter()
+                .map(|s| {
+                    s.nodes.len()
+                        + s.local_frames
+                            .iter()
+                            .map(|(_, nodes)| nodes.len())
+                            .sum::<usize>()
+                })
+                .sum(),
         });
     }
     Ok((obs, locate, warnings))
@@ -428,13 +491,13 @@ async fn build_tree(
     browser: &Browser,
     ids: &mut IdMap,
     sd: &SessionData,
+    nodes: &[Value],
     vw: f32,
     vh: f32,
     locate: &mut LocateMap,
 ) -> Vec<Element> {
     // AX 节点索引
-    let by_id: HashMap<String, &Value> = sd
-        .nodes
+    let by_id: HashMap<String, &Value> = nodes
         .iter()
         .filter_map(|n| {
             n.get("nodeId")
@@ -442,8 +505,7 @@ async fn build_tree(
                 .map(|s| (s.to_string(), n))
         })
         .collect();
-    let child_set: std::collections::HashSet<String> = sd
-        .nodes
+    let child_set: std::collections::HashSet<String> = nodes
         .iter()
         .flat_map(|n| {
             n.get("childIds")
@@ -455,7 +517,7 @@ async fn build_tree(
         .collect();
 
     let mut roots = Vec::new();
-    for n in &sd.nodes {
+    for n in nodes {
         let nid = n.get("nodeId").and_then(Value::as_str).unwrap_or("");
         if child_set.contains(nid) {
             continue; // 非根
@@ -659,12 +721,14 @@ pub fn render(obs: &Observation) -> String {
     out
 }
 
+const MAX_RENDERED_TEXT_CHARS: usize = 80;
+
 /// 模型视图的文本转义（GPT review R-10）：AX 的 name/value 是不可信的
 /// 页面内容，原样拼进引号行会被换行/引号伪造出相邻元素行。转义反斜杠、
 /// 引号与全部控制字符，并沿用 80 字符上限。
 fn esc(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
-    for c in s.chars().take(80) {
+    for c in s.chars().take(MAX_RENDERED_TEXT_CHARS) {
         match c {
             '\\' => out.push_str("\\\\"),
             '"' => out.push_str("\\\""),
@@ -727,8 +791,12 @@ pub fn count_elements(obs: &Observation) -> usize {
 pub fn strip_offscreen(elems: Vec<Element>) -> Vec<Element> {
     let mut out = Vec::with_capacity(elems.len());
     for mut e in elems {
-        let kids = strip_offscreen(std::mem::take(&mut e.children));
+        let mut kids = strip_offscreen(std::mem::take(&mut e.children));
         if e.has(ElementState::Offscreen) {
+            if e.role == "text" {
+                // 没有独立几何的行内排版片段随离屏正文一起过滤。
+                kids.retain(|child| child.role != "inlinetextbox" || child.bbox.is_some());
+            }
             out.extend(kids);
         } else {
             e.children = kids;
@@ -845,7 +913,10 @@ fn render_node(e: &Element, depth: usize, out: &mut String) {
     for s in &e.states {
         line.push_str(&format!(" ({s:?})"));
     }
-    if let Some(b) = &e.bbox {
+    if let Some(b) = e.bbox.filter(|_| {
+        e.is_interactable()
+            && (is_interactive_role(&e.role) || matches!(e.role.as_str(), "canvas" | "iframe"))
+    }) {
         line.push_str(&format!(
             " @[{:.0},{:.0},{:.0},{:.0}]",
             b.0[0], b.0[1], b.0[2], b.0[3]
@@ -854,8 +925,32 @@ fn render_node(e: &Element, depth: usize, out: &mut String) {
     out.push_str(&line);
     out.push('\n');
     for c in &e.children {
-        render_node(c, depth + 1, out);
+        if !repeats_rendered_name(c, e.name.as_deref()) {
+            render_node(c, depth + 1, out);
+        }
     }
+}
+
+/// 保留独有正文及长文字的排版片段，只折叠已经完整显示的重复文字。
+fn repeats_rendered_name(element: &Element, parent_name: Option<&str>) -> bool {
+    let Some(parent) =
+        parent_name.filter(|name| name.chars().nth(MAX_RENDERED_TEXT_CHARS).is_none())
+    else {
+        return false;
+    };
+    element.value.is_none()
+        && element.states.is_empty()
+        && element
+            .name
+            .as_deref()
+            .is_some_and(|name| match element.role.as_str() {
+                "text" => name == parent,
+                "inlinetextbox" => parent.contains(name),
+                _ => false,
+            })
+        && element.children.iter().all(|child| {
+            child.role == "inlinetextbox" && repeats_rendered_name(child, Some(parent))
+        })
 }
 
 #[cfg(test)]

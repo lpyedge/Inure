@@ -242,6 +242,14 @@ async fn edge_browser_end_to_end() {
         ("/form.html".to_string(), FORM_HTML.to_string()),
         ("/canvas.html".to_string(), CANVAS_HTML.to_string()),
         ("/iframe.html".to_string(), iframe_html(&origin_b)),
+        ("/local-frame.html".to_string(), iframe_html(&origin_a)),
+        (
+            "/local-nested.html".to_string(),
+            r#"<!doctype html><meta charset="utf-8">
+            <button onclick="document.querySelector('iframe').remove()">Remove local frame</button>
+            <iframe title="Local wrapper" src="/local-frame.html" width="650" height="320"></iframe>"#
+                .to_string(),
+        ),
     ];
     let bound = serve(listener_a, pages);
     assert_eq!(bound, port_a);
@@ -439,8 +447,88 @@ async fn edge_browser_end_to_end() {
     assert_eq!(image.get_pixel(x, y).0, [0, 0, 0, 255]);
     assert_ne!(image.get_pixel(5, 5).0, [0, 0, 0, 255]);
 
+    let local = act(
+        edge_port,
+        from_unseen_validation["observation"]["frame_id"]
+            .as_u64()
+            .unwrap(),
+        json!({"kind":"navigate","url":format!("{origin_a}/local-nested.html")}),
+    );
+    assert_eq!(local["result"], "done");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let local = loop {
+        let current = observe(edge_port);
+        if find_element(&current["observation"], "textbox", "姓名").is_some() {
+            break current;
+        }
+        assert!(Instant::now() < deadline, "应观察到同源子帧表单");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    let wrapper = find_element(&local["observation"], "iframe", "Local wrapper").unwrap();
+    let inner = find_element(
+        &json!({"elements":wrapper["children"]}),
+        "iframe",
+        "内层表单",
+    )
+    .unwrap()
+    .clone();
+    let elements = json!({"elements":inner["children"]});
+    let text = find_element(&elements, "textbox", "姓名").unwrap();
+    let submit = find_element(&elements, "button", "提交").unwrap();
+    assert!(find_element(&elements, "textbox", "子帧密码").unwrap()["value"].is_null());
+    assert!(!local.to_string().contains("SYNTHETIC-IFRAME"));
+    let frame = local["observation"]["frame_id"].as_u64().unwrap();
+    let typed = act(
+        edge_port,
+        frame,
+        json!({"kind":"type","target":{"by":"element","id":text["id"]},"text":"Orbit"}),
+    );
+    assert_eq!(typed["result"], "done", "{typed}");
+    let local = observe(edge_port);
+    let local_obs = &local["observation"];
+    assert_eq!(
+        find_element(local_obs, "textbox", "姓名").unwrap()["value"],
+        "Orbit"
+    );
+    let clicked = act(
+        edge_port,
+        local_obs["frame_id"].as_u64().unwrap(),
+        json!({"kind":"click","target":{"by":"element","id":submit["id"]}}),
+    );
+    assert_eq!(clicked["result"], "done", "{clicked}");
+    let local = observe(edge_port);
+    assert!(local["text"].as_str().unwrap().contains("点击次数：1"));
+    let local_obs = &local["observation"];
+    let secret = find_element(local_obs, "textbox", "子帧密码").unwrap();
+    let bbox = secret["bbox"].as_array().unwrap();
+    let x = ((bbox[0].as_f64().unwrap() + bbox[2].as_f64().unwrap()) / 2.0) as u32;
+    let y = ((bbox[1].as_f64().unwrap() + bbox[3].as_f64().unwrap()) / 2.0) as u32;
+    let (status, png) = http(edge_port, "GET", "/screenshot.png", None);
+    assert_eq!(status, 200);
+    let image = image::load_from_memory(&png).unwrap().to_rgba8();
+    assert_eq!(image.get_pixel(x, y).0, [0, 0, 0, 255]);
+
+    let local = observe(edge_port);
+    let local_obs = &local["observation"];
+    let local_frame = local_obs["frame_id"].as_u64().unwrap();
+    let remove = find_element(local_obs, "button", "Remove local frame").unwrap();
+    let removed = act(
+        edge_port,
+        local_frame,
+        json!({"kind":"click","target":{"by":"element","id":remove["id"]}}),
+    );
+    assert_eq!(removed["result"], "done", "{removed}");
+    let stale = act(
+        edge_port,
+        local_frame,
+        json!({"kind":"click","target":{"by":"element","id":submit["id"]}}),
+    );
+    assert_eq!(stale["result"], "rejected", "{stale}");
+    let local = observe(edge_port);
+    assert!(find_element(&local["observation"], "button", "提交").is_none());
+
     // ── 3. canvas 页 + 编号截圖 ──────────────────────────────
-    let frame5 = obs5["frame_id"].as_u64().unwrap();
+    let frame5 = local["observation"]["frame_id"].as_u64().unwrap();
     let r = act(
         edge_port,
         frame5,
@@ -578,7 +666,10 @@ async fn edge_click_requires_a_hit_on_the_requested_element() {
             onclick="statusText.textContent='Wrong click'">Cover</button>
         <div class="cover" style="position:absolute;left:265px;top:105px;width:185px;height:65px;background:white"></div>
         <button onclick="document.querySelectorAll('.cover').forEach(node=>node.remove())">Reveal</button>
-        <p id="statusText">Main ready</p>"#
+        <p id="statusText">Main ready</p>
+        <div style="height:1800px"></div>
+        <button style="position:absolute;left:20px;top:1050px"
+            onclick="this.textContent='Scrolled target clicked'">Scrolled target</button>"#
     );
     let inner = r#"<!doctype html><meta charset="utf-8">
         <button style="position:absolute;top:10px;left:20px;width:100px;height:40px"
@@ -637,6 +728,26 @@ async fn edge_click_requires_a_hit_on_the_requested_element() {
     let obs = observe(edge_port);
     let text = obs["text"].as_str().unwrap();
     assert!(text.contains("Main clicked") && text.contains("Inner clicked"));
+    assert!(find_element(&obs["observation"], "button", "Scrolled target").is_none());
+    let scrolled = act(
+        edge_port,
+        obs["observation"]["frame_id"].as_u64().unwrap(),
+        json!({"kind":"scroll","dx":0,"dy":900}),
+    );
+    assert_eq!(scrolled["result"], "done", "{scrolled}");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let obs = loop {
+        let obs = observe(edge_port);
+        if find_element(&obs["observation"], "button", "Scrolled target").is_some() {
+            break obs;
+        }
+        assert!(Instant::now() < deadline, "滚动后应观察到目标");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    let result = click(&obs, "Scrolled target");
+    assert_eq!(result["result"], "done", "{result}");
+    let obs = observe(edge_port);
+    assert!(find_element(&obs["observation"], "button", "Scrolled target clicked").is_some());
 }
 
 const TEXT_HTML: &str = r#"<!DOCTYPE html><html lang="zh"><head><meta charset="utf-8"><title>文本</title></head>
@@ -2596,9 +2707,9 @@ async fn edge_observe_unchanged_vs_changed() {
         wait_health(edge_port).await;
         let _ = &mut proc;
         // 等页面脚本的定时变化/滚动发生之前先取基线帧
-        let f = observe(edge_port)["observation"]["frame_id"]
-            .as_u64()
-            .unwrap();
+        let base: rig_proto::observation::Observation =
+            serde_json::from_value(observe(edge_port)["observation"].clone()).unwrap();
+        let f = base.frame_id;
         let before = unchanged_count(edge_port);
 
         // ① 页面还没变：采集候选帧并回空增量
@@ -2616,16 +2727,24 @@ async fn edge_observe_unchanged_vs_changed() {
 
         // ② 页面自己变了/滚动了（无人操作）：必须重新采集并带出变化
         tokio::time::sleep(Duration::from_millis(5500)).await;
-        let d = observe_since(edge_port, f);
-        assert!(
-            d["delta"]["frame_id"].as_u64().unwrap() > f,
-            "{page}: 页面已变，必须重新采集: {d}"
-        );
-        assert!(
-            !d["delta"]["upserts"].as_array().unwrap().is_empty()
-                || !d["delta"]["removed"].as_array().unwrap().is_empty(),
-            "{page}: 增量应带出变化: {d}"
-        );
+        let changed = observe_since(edge_port, f);
+        let mut applied = if let Some(delta) = changed.get("delta") {
+            let delta: rig_proto::observation::ObservationDelta =
+                serde_json::from_value(delta.clone()).unwrap();
+            assert!(
+                !delta.upserts.is_empty() || !delta.removed.is_empty(),
+                "{page}: 增量应带出变化: {changed}"
+            );
+            base.apply_delta(&delta).unwrap()
+        } else {
+            serde_json::from_value(changed["observation"].clone()).unwrap()
+        };
+        assert!(applied.frame_id > f, "{page}: 页面已变，必须重新采集");
+        assert_ne!(applied.elements, base.elements, "{page}: 应观察到页面变化");
+        let full: rig_proto::observation::Observation =
+            serde_json::from_value(observe(edge_port)["observation"].clone()).unwrap();
+        applied.frame_id = full.frame_id;
+        assert_eq!(applied, full, "{page}: 恢复后的视图应与完整观察一致");
     }
 
     // 無 CDP DOM 通知的 CSS 幾何變化仍須由候選觀察捕捉。
@@ -3923,6 +4042,45 @@ async fn edge_observe_modes_budget() {
     assert!(
         v["text"].as_str().unwrap_or("").contains("计数按钮"),
         "text 模式应带文本渲染: {v}"
+    );
+    let text = v["text"].as_str().unwrap();
+    let button = text
+        .lines()
+        .find(|line| line.trim_start().starts_with("- button \"计数按钮\""))
+        .unwrap();
+    let paragraph = text
+        .lines()
+        .find(|line| line.trim_start().starts_with("- text \"第 1 段"))
+        .unwrap();
+    assert!(button.contains("@[") && !paragraph.contains("@["));
+    assert_eq!(text.matches("计数按钮").count(), 1);
+    assert!(!text.contains("inlinetextbox"));
+    assert!(btn["bbox"].is_array());
+
+    let frame = text
+        .lines()
+        .next()
+        .unwrap()
+        .strip_prefix("# frame ")
+        .unwrap()
+        .parse::<u64>()
+        .unwrap();
+    let (st, denied) = http_json(
+        edge_port,
+        "POST",
+        "/act",
+        Some(json!({
+            "request_id":"text-out-of-bounds",
+            "frame_id":frame,
+            "action":{"kind":"click","target":{"by":"point","x":901,"y":0}}
+        })),
+    );
+    assert_eq!(st, 200);
+    assert_eq!(denied["result"]["reason"]["code"], "out_of_bounds");
+    assert!(denied.get("observation").is_none() && denied.get("delta").is_none());
+    assert!(
+        denied["text"].as_str().unwrap().contains("计数:0"),
+        "拒绝后应保留页面状态，且操作不生效: {denied}"
     );
 
     // budget：响应视图被裁、带裁剪说明；存储帧不动（随后点击仍成）

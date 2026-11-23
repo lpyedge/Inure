@@ -1006,22 +1006,21 @@ async fn observe(State(app): State<Arc<App>>, Json(req): Json<ObserveRequest>) -
     // include_offscreen 在 AiChannel 里作用于响应副本（见
     // observe_req）；since_frame 命中时回增量（delta 字段）。
     match app.ai.observe_req(&req).await {
+        Ok(ObserveOut::Text(text)) => Json(json!({"text": text})).into_response(),
         Ok(ObserveOut::Delta(delta, text)) => {
             Json(json!({"delta": delta, "text": text})).into_response()
         }
-        Ok(ObserveOut::Full(obs, text, image)) => match req.mode {
-            ObserveMode::Text => Json(json!({"text": text})).into_response(),
-            ObserveMode::Tree => Json(json!({"observation": obs, "text": text})).into_response(),
-            ObserveMode::TreeImage => {
-                use base64::Engine;
-                let b64 = image
-                    .as_deref()
-                    .map(|p| base64::engine::general_purpose::STANDARD.encode(p))
-                    .unwrap_or_default();
-                Json(json!({"observation": obs, "text": text, "image_png_base64": b64}))
-                    .into_response()
-            }
-        },
+        Ok(ObserveOut::Full(obs, text, image)) if req.mode == ObserveMode::TreeImage => {
+            use base64::Engine;
+            let b64 = image
+                .as_deref()
+                .map(|p| base64::engine::general_purpose::STANDARD.encode(p))
+                .unwrap_or_default();
+            Json(json!({"observation": obs, "text": text, "image_png_base64": b64})).into_response()
+        }
+        Ok(ObserveOut::Full(obs, text, _)) => {
+            Json(json!({"observation": obs, "text": text})).into_response()
+        }
         Err(e) => {
             let code = if e.starts_with("subtree ") {
                 StatusCode::BAD_REQUEST
@@ -1040,6 +1039,9 @@ async fn act(State(app): State<Arc<App>>, Json(req): Json<ActionRequest>) -> Res
     // 被拒（页面状态不符）时附带最新一帧，调用方不必再补一次 observe
     let (result, fresh) = app.ai.act_with_fresh(req).await;
     match fresh {
+        Ok(Some(ObserveOut::Text(text))) => {
+            Json(json!({"result": result, "text": text})).into_response()
+        }
         Ok(Some(ObserveOut::Delta(delta, text))) => {
             Json(json!({"result": result, "delta": delta, "text": text})).into_response()
         }
@@ -1645,6 +1647,10 @@ async fn mcp_call(app: &Arc<App>, params: &serde_json::Value) -> (serde_json::Va
                 }
             };
             match app.ai.observe_req(&oreq).await {
+                Ok(ObserveOut::Text(text)) => (
+                    json!({"content": [{"type": "text", "text": text}], "isError": false}),
+                    false,
+                ),
                 Ok(ObserveOut::Delta(delta, text)) => {
                     // 增量：摘要 + 增量本体 JSON 两个文本块
                     let content = vec![
@@ -1654,12 +1660,10 @@ async fn mcp_call(app: &Arc<App>, params: &serde_json::Value) -> (serde_json::Va
                     (json!({"content": content, "isError": false}), false)
                 }
                 Ok(ObserveOut::Full(obs, text, image)) => {
-                    let mut content = vec![json!({"type": "text", "text": text})];
-                    if oreq.mode != ObserveMode::Text {
-                        content.push(
-                            json!({"type": "text", "text": serde_json::to_string(&obs).unwrap_or_default()}),
-                        );
-                    }
+                    let mut content = vec![
+                        json!({"type": "text", "text": text}),
+                        json!({"type": "text", "text": serde_json::to_string(&obs).unwrap_or_default()}),
+                    ];
                     if let Some(png) = image {
                         use base64::Engine;
                         content.push(json!({
@@ -1705,6 +1709,9 @@ async fn mcp_call(app: &Arc<App>, params: &serde_json::Value) -> (serde_json::Va
                     }
                     // 被拒时附最新帧文本视图（第二个文本块）
                     match fresh {
+                        Ok(Some(ObserveOut::Text(text))) => {
+                            content.push(json!({"type": "text", "text": text}));
+                        }
                         Ok(Some(ObserveOut::Delta(delta, text))) => {
                             content.push(json!({"type": "text", "text": text}));
                             content.push(
