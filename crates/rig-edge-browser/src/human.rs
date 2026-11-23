@@ -115,16 +115,104 @@ impl Drop for CaptureLease {
 /// 帧泵运行中检查任务是否已退出的间隔。
 const PUMP_WATCH: std::time::Duration = std::time::Duration::from_secs(1);
 
+/// 管理循环的时间参数（生产用常量，测试用毫秒级）。
+struct CaptureTiming {
+    watch: std::time::Duration,
+    retry: fn(u32) -> std::time::Duration,
+}
+
+/// 整页采集的管理循环，与浏览器解耦（启动、善后都由调用方注入），便于做故障注入测试：
+/// 只有它启动、停止或更换整页采集；泵任务异常退出或启动失败时自己醒来重试。
+async fn supervise_capture<Start, StartFut, Stop, StopFut>(
+    mut request: watch::Receiver<CaptureDemand>,
+    timing: CaptureTiming,
+    alive: impl Fn() -> bool,
+    start: Start,
+    stop: Stop,
+) where
+    Start: Fn(ActivePage) -> StartFut,
+    StartFut: std::future::Future<Output = Result<tokio::task::JoinHandle<()>, String>>,
+    Stop: Fn(ActivePage) -> StopFut,
+    StopFut: std::future::Future<Output = ()>,
+{
+    let mut pump: Option<(ActivePage, tokio::task::JoinHandle<()>)> = None;
+    let mut start_failures: u32 = 0;
+    loop {
+        let demand = request.borrow_and_update().clone();
+        let wanted = demand.page.filter(|_| demand.consumers != 0);
+        if !alive() {
+            break;
+        }
+        if pump
+            .as_ref()
+            .is_some_and(|(page, task)| wanted.as_ref() != Some(page) || task.is_finished())
+        {
+            if let Some((page, task)) = pump.take() {
+                task.abort();
+                let _ = task.await;
+                stop(page).await;
+            }
+        }
+        if pump.is_none() {
+            if let Some(page) = wanted.clone() {
+                match start(page.clone()).await {
+                    Ok(task) => {
+                        start_failures = 0;
+                        pump = Some((page, task));
+                    }
+                    Err(e) => {
+                        start_failures = start_failures.saturating_add(1);
+                        eprintln!("failed to start full-page capture: {e}");
+                    }
+                }
+            } else {
+                start_failures = 0;
+            }
+        }
+        // 有泵：定期看它是否已退出；有需求却没泵（启动失败）：退避后重试；
+        // 无需求：只等需求变化。
+        let wake = capture_wake_after(
+            pump.is_some(),
+            wanted.is_some(),
+            start_failures,
+            timing.watch,
+            timing.retry,
+        );
+        match wake {
+            Some(after) => {
+                tokio::select! {
+                    changed = request.changed() => {
+                        if changed.is_err() {
+                            break;
+                        }
+                    }
+                    () = tokio::time::sleep(after) => {}
+                }
+            }
+            None => {
+                if request.changed().await.is_err() {
+                    break;
+                }
+            }
+        }
+    }
+    if let Some((_, task)) = pump {
+        task.abort();
+    }
+}
+
 /// 管理循环这一轮之后多久要自己醒来：有泵 → 定期看它是否已退出；
 /// 有需求却没泵（启动失败）→ 退避后重试；没需求 → 不用醒，只等需求变化。
 fn capture_wake_after(
     has_pump: bool,
     has_demand: bool,
     start_failures: u32,
+    watch: std::time::Duration,
+    retry: fn(u32) -> std::time::Duration,
 ) -> Option<std::time::Duration> {
     match (has_pump, has_demand) {
-        (true, _) => Some(PUMP_WATCH),
-        (false, true) => Some(capture_retry_delay(start_failures)),
+        (true, _) => Some(watch),
+        (false, true) => Some(retry(start_failures)),
         (false, false) => None,
     }
 }
@@ -600,74 +688,40 @@ impl HumanChannel {
     /// 需求不变时也会自己醒来：泵运行中每 `PUMP_WATCH` 看一次任务是否已退出，
     /// 启动失败后按有上限的指数退避重试，而不是一直等需求变化才有机会重启。
     pub fn manage_capture(self: &Arc<Self>) {
-        let mut request = self.capture.subscribe();
+        let request = self.capture.subscribe();
         let weak = Arc::downgrade(self);
-        tokio::spawn(async move {
-            let mut pump: Option<(ActivePage, tokio::task::JoinHandle<()>)> = None;
-            let mut start_failures: u32 = 0;
-            loop {
-                let demand = request.borrow_and_update().clone();
-                let wanted = demand.page.filter(|_| demand.consumers != 0);
-                let Some(human) = weak.upgrade() else {
-                    break;
-                };
-                if pump
-                    .as_ref()
-                    .is_some_and(|(page, task)| wanted.as_ref() != Some(page) || task.is_finished())
-                {
-                    if let Some((page, task)) = pump.take() {
-                        task.abort();
-                        let _ = task.await;
-                        human.clear_capture_cache().await;
-                        let _ = human
-                            .browser
-                            .cdp
-                            .call(Some(&page.session), "Page.stopScreencast", json!({}))
-                            .await;
-                    }
+        let (alive, start, stop) = (weak.clone(), weak.clone(), weak);
+        tokio::spawn(supervise_capture(
+            request,
+            CaptureTiming {
+                watch: PUMP_WATCH,
+                retry: capture_retry_delay,
+            },
+            move || alive.upgrade().is_some(),
+            move |page| {
+                let weak = start.clone();
+                async move {
+                    let human = weak
+                        .upgrade()
+                        .ok_or_else(|| "human channel is gone".to_string())?;
+                    human.start_frame_pump(page).await
                 }
-                if pump.is_none() {
-                    if let Some(page) = wanted.clone() {
-                        match human.start_frame_pump(page.clone()).await {
-                            Ok(task) => {
-                                start_failures = 0;
-                                pump = Some((page, task));
-                            }
-                            Err(e) => {
-                                start_failures = start_failures.saturating_add(1);
-                                eprintln!("failed to start full-page capture: {e}");
-                            }
-                        }
-                    } else {
-                        start_failures = 0;
-                    }
+            },
+            move |page| {
+                let weak = stop.clone();
+                async move {
+                    let Some(human) = weak.upgrade() else {
+                        return;
+                    };
+                    human.clear_capture_cache().await;
+                    let _ = human
+                        .browser
+                        .cdp
+                        .call(Some(&page.session), "Page.stopScreencast", json!({}))
+                        .await;
                 }
-                drop(human);
-                // 有泵：定期看它是否已退出；有需求却没泵（启动失败）：退避后重试；
-                // 无需求：只等需求变化。
-                let wake = capture_wake_after(pump.is_some(), wanted.is_some(), start_failures);
-                match wake {
-                    Some(after) => {
-                        tokio::select! {
-                            changed = request.changed() => {
-                                if changed.is_err() {
-                                    break;
-                                }
-                            }
-                            () = tokio::time::sleep(after) => {}
-                        }
-                    }
-                    None => {
-                        if request.changed().await.is_err() {
-                            break;
-                        }
-                    }
-                }
-            }
-            if let Some((_, task)) = pump {
-                task.abort();
-            }
-        });
+            },
+        ));
     }
 
     async fn clear_capture_cache(&self) {
@@ -2105,27 +2159,100 @@ mod tests {
     use super::*;
 
     /// 管理循环的唤醒决策：有泵定期看护、有需求没泵退避重试、没需求不醒。
-    /// （泵任务异常退出时，正是“有泵”分支的定期检查发现它已结束并重启；
-    /// 外部手段没法让泵任务异常退出，这一段只能靠分支单测覆盖，端到端注入未做。）
     #[test]
     fn capture_wake_decision_covers_all_three_states() {
-        assert_eq!(capture_wake_after(true, true, 0), Some(PUMP_WATCH));
+        let w = |p, d, n| capture_wake_after(p, d, n, PUMP_WATCH, capture_retry_delay);
+        assert_eq!(w(true, true, 0), Some(PUMP_WATCH));
         assert_eq!(
-            capture_wake_after(true, false, 0),
+            w(true, false, 0),
             Some(PUMP_WATCH),
             "需求撤了但泵还在：照样要醒来去停它"
         );
         assert_eq!(
-            capture_wake_after(false, true, 1),
+            w(false, true, 1),
             Some(capture_retry_delay(1)),
             "有需求没泵：退避重试"
         );
-        assert!(capture_wake_after(false, true, 5) > capture_wake_after(false, true, 1));
+        assert!(w(false, true, 5) > w(false, true, 1));
+        assert_eq!(w(false, false, 3), None, "没需求不应自己醒");
+    }
+
+    /// 故障注入（启动闭包与泵任务都是假的）：泵任务异常退出后，管理循环在需求没变的情况下
+    /// 自己发现并重启；启动连续失败时按退避重试，恢复后继续；需求撤销时停掉泵并善后；
+    /// 无需求时不重启。
+    #[tokio::test]
+    async fn supervisor_restarts_a_dead_pump_and_retries_failed_starts() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        let (tx, rx) = watch::channel(CaptureDemand::default());
+        let starts = Arc::new(AtomicU32::new(0));
+        let attempts = Arc::new(AtomicU32::new(0));
+        let stops = Arc::new(AtomicU32::new(0));
+        let (s2, a2, st2) = (starts.clone(), attempts.clone(), stops.clone());
+        let supervisor = tokio::spawn(supervise_capture(
+            rx,
+            CaptureTiming {
+                watch: std::time::Duration::from_millis(20),
+                retry: |_| std::time::Duration::from_millis(20),
+            },
+            || true,
+            move |_page| {
+                let (starts, attempts) = (s2.clone(), a2.clone());
+                async move {
+                    let n = attempts.fetch_add(1, Ordering::SeqCst) + 1;
+                    // 第 2、3 次尝试注入启动失败
+                    if n == 2 || n == 3 {
+                        return Err("injected start failure".to_string());
+                    }
+                    starts.fetch_add(1, Ordering::SeqCst);
+                    // 假泵：80ms 后自己退出（模拟异常退出）
+                    Ok(tokio::spawn(async {
+                        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+                    }))
+                }
+            },
+            move |_page| {
+                let stops = st2.clone();
+                async move {
+                    stops.fetch_add(1, Ordering::SeqCst);
+                }
+            },
+        ));
+        let wait_until = |what: &'static str, cond: Box<dyn Fn() -> bool>| async move {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while !cond() {
+                assert!(std::time::Instant::now() < deadline, "等不到：{what}");
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        };
+        // 需求出现（一个消费者 + 一个页面）→ 启动
+        tx.send_modify(|d| {
+            d.page = Some(ActivePage::for_test("s1", 1));
+            d.consumers = 1;
+        });
+        let s = starts.clone();
+        wait_until("首次启动", Box::new(move || s.load(Ordering::SeqCst) >= 1)).await;
+        // 需求一直没变：泵异常退出后应被发现并重启；中间还遇到两次启动失败，要靠退避重试
+        let (s, a) = (starts.clone(), attempts.clone());
+        wait_until(
+            "泵退出后重启（含两次启动失败的退避重试）",
+            Box::new(move || s.load(Ordering::SeqCst) >= 2 && a.load(Ordering::SeqCst) >= 4),
+        )
+        .await;
+        assert!(stops.load(Ordering::SeqCst) >= 1, "死掉的泵应被善后");
+        // 需求撤销：停掉并善后，之后不再启动
+        tx.send_modify(|d| d.consumers = 0);
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        let frozen = attempts.load(Ordering::SeqCst);
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         assert_eq!(
-            capture_wake_after(false, false, 3),
-            None,
-            "没需求不应自己醒"
+            attempts.load(Ordering::SeqCst),
+            frozen,
+            "没有需求时不应再启动泵"
         );
+        drop(tx);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), supervisor)
+            .await
+            .expect("通道关闭后管理循环应退出");
     }
 
     /// 整页采集启动失败后的重试等待：翻倍增长、有上限，且首次失败不会立即空转。

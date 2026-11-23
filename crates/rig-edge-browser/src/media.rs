@@ -87,6 +87,31 @@ pub fn hls_dir() -> std::path::PathBuf {
     std::env::temp_dir().join(format!("rig-edge-hls-{}", std::process::id()))
 }
 
+/// 停机时最多等合流线程这么久（Pulse 阻塞读时不让通道开关无限等线程退出）。
+const STOP_JOIN_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// 等合流线程退出（最多 `timeout`）；**退出了才**清掉它的输出目录，返回是否已清理。
+/// 线程超时仍没退出时它还在写这个目录：不删，留给 main 退出时整体清理，
+/// 下一次启动用新的代次目录，不会和它共用。
+async fn join_then_cleanup(
+    handle: std::thread::JoinHandle<()>,
+    dir: &Path,
+    timeout: Duration,
+) -> bool {
+    let joined = tokio::time::timeout(
+        timeout,
+        tokio::task::spawn_blocking(move || {
+            let _ = handle.join();
+        }),
+    )
+    .await
+    .is_ok();
+    if joined {
+        let _ = tokio::fs::remove_dir_all(dir).await;
+    }
+    joined
+}
+
 /// 每次启动管线用自己的代次目录：上一次的合流线程即使停机超时仍没退出，
 /// 也不会和新管线写同一个目录。整个 `hls_dir()` 由 main 在退出时清理。
 fn generation_dir() -> std::path::PathBuf {
@@ -188,20 +213,7 @@ impl MediaPipeline {
     async fn stop_pipeline(inner: PipelineInner) {
         inner.stop.store(true, Ordering::SeqCst);
         drop(inner._capture);
-        let handle = inner.handle;
-        // Pulse 阻塞读时不让通道开关无限等线程退出。
-        let joined = tokio::time::timeout(
-            Duration::from_secs(10),
-            tokio::task::spawn_blocking(move || {
-                let _ = handle.join();
-            }),
-        )
-        .await
-        .is_ok();
-        // 线程没退出就不删它还在写的目录，留给 main 退出时整体清理。
-        if joined {
-            let _ = tokio::fs::remove_dir_all(&inner.dir).await;
-        }
+        join_then_cleanup(inner.handle, &inner.dir, STOP_JOIN_TIMEOUT).await;
     }
 
     pub async fn apply_wanted(&self, av: bool) {
@@ -843,6 +855,30 @@ mod tests {
         assert!(single_rendition().is_err(), "非法值必须显式报错");
         std::env::remove_var("RIG_HLS_SINGLE");
         assert_eq!(offered_renditions(), vec!["hevc", "h264"]);
+    }
+
+    /// 故障注入（停机超时）：线程按时退出 → 目录被清掉；线程卡住超过超时 →
+    /// 目录原样保留（线程还在写它），随后的新代次目录与它互不相干。
+    #[tokio::test]
+    async fn stop_does_not_delete_the_directory_of_a_stuck_muxer_thread() {
+        let root = std::env::temp_dir().join(format!("rig-test-stop-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (quick, stuck) = (root.join("quick"), root.join("stuck"));
+        for d in [&quick, &stuck] {
+            std::fs::create_dir_all(d).unwrap();
+            std::fs::write(d.join("seg.m4s"), b"x").unwrap();
+        }
+        // 按时退出的线程
+        let handle = std::thread::spawn(|| {});
+        assert!(join_then_cleanup(handle, &quick, Duration::from_secs(2)).await);
+        assert!(!quick.exists(), "线程已退出，目录应被清掉");
+        // 卡住的线程（忽略停止信号，睡 600ms），超时只给 100ms
+        let handle = std::thread::spawn(|| std::thread::sleep(Duration::from_millis(600)));
+        assert!(!join_then_cleanup(handle, &stuck, Duration::from_millis(100)).await);
+        assert!(stuck.join("seg.m4s").exists(), "线程还在写，目录不得被删");
+        // 下一次启动的代次目录不会是被卡住的那个
+        assert_ne!(generation_dir(), generation_dir());
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// 每次启动用独立目录，且都在本进程的 HLS 根目录之下

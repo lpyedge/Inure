@@ -39,6 +39,17 @@ pub struct ActivePage {
     generation: u64,
 }
 
+impl ActivePage {
+    /// 测试里构造一个页面标识。
+    #[cfg(test)]
+    pub fn for_test(session: &str, generation: u64) -> Self {
+        Self {
+            session: session.to_string(),
+            generation,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ViewState {
     pub space: rig_proto::observation::Space,
