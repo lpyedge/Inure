@@ -6711,6 +6711,86 @@ async fn edge_recent_delivered_frame_stays_usable_when_target_unchanged() {
     assert_eq!(r["reason"]["code"], "stale_frame", "{r}");
 }
 
+/// 同一批里前一步让后一步的目标从 disabled 变为 enabled（取消勾选后输入框随之可用）：
+/// 目标还是同一个元素（角色、名称、位置没变），只是变得可用，后一步应被接受；
+/// 而目标若在批内被改名或移走，仍须被拒（见 edge_recent_delivered_frame_stays_usable_when_target_unchanged）。
+#[tokio::test]
+async fn edge_batch_step_may_target_element_enabled_by_previous_step() {
+    if std::env::var("RIG_EDGE_IT").is_err() {
+        eprintln!("跳过：未设置 RIG_EDGE_IT");
+        return;
+    }
+    let _serial = SERIAL.lock().await;
+    let page = r#"<!DOCTYPE html><meta charset="utf-8"><title>en</title>
+<body style="margin:0"><label style="position:absolute;left:20px;top:20px"><input type="checkbox" id="same" checked onchange="document.getElementById('city').disabled=this.checked"> Same as billing</label>
+<input id="city" aria-label="City" disabled style="position:absolute;left:20px;top:80px;width:200px"></body>"#;
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    serve(listener, vec![("/en.html".into(), page.to_string())]);
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let edge_port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let _proc = EdgeProc(
+        edge_command()
+            .args([
+                "--listen",
+                &format!("127.0.0.1:{edge_port}"),
+                "--token",
+                TEST_TOKEN,
+                "--url",
+                &format!("http://127.0.0.1:{port}/en.html"),
+                "--width",
+                "400",
+                "--height",
+                "300",
+            ])
+            .process_group(0)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("启动 rig-edge-browser"),
+    );
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Ok(mut s) = std::net::TcpStream::connect(("127.0.0.1", edge_port)) {
+            let _ = s.write_all(b"GET /health HTTP/1.0\r\n\r\n");
+            let mut b = String::new();
+            if s.read_to_string(&mut b).is_ok() && b.contains("\"ok\":true") {
+                break;
+            }
+        }
+        assert!(Instant::now() < deadline, "边缘程序未就绪");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+    // include_offscreen 不需要；两个元素都在视口内。观察时 City 是 disabled。
+    let o = observe(edge_port);
+    let f = o["observation"]["frame_id"].as_u64().unwrap();
+    let same = find_element(&o["observation"], "checkbox", "Same as billing").expect("checkbox")
+        ["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let city = find_element(&o["observation"], "textbox", "City").expect("City")["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let (st, v) = http_json(
+        edge_port,
+        "POST",
+        "/act",
+        Some(json!({"request_id": "en1", "frame_id": f, "actions": [
+            {"kind": "set_checked", "target": {"by": "element", "id": same}, "checked": false},
+            {"kind": "type", "target": {"by": "element", "id": city}, "text": "Tucson"}
+        ]})),
+    );
+    assert_eq!(st, 200, "{v}");
+    let results = v["result"]["results"].as_array().unwrap();
+    assert!(
+        results.len() == 2 && results.iter().all(|r| r["result"] == "done"),
+        "前一步启用的输入框应可在同一批里被填写: {v}"
+    );
+}
+
 /// Control+A 必须真的全选（无头 Chromium 的组合键需要带编辑命令才会触发全选），
 /// 随后 Backspace 清空输入框。
 #[tokio::test]

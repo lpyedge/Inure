@@ -880,6 +880,18 @@ pub enum ActionResult {
     },
 }
 
+/// 同一个元素只是从禁用变成了可用（角色、名称、位置、其他状态都没变）。
+/// 典型场景：同一批里前一步取消勾选，随后要填写的输入框随之启用。
+/// 元素还是调用方指的那一个，只是更可用了，这不是“目标变了”；反向（可用变禁用）不放行。
+fn became_enabled(before: &Element, after: &Element, tol_px: f32) -> bool {
+    if !before.has(ElementState::Disabled) || after.has(ElementState::Disabled) {
+        return false;
+    }
+    let mut before = before.clone();
+    before.states.retain(|s| *s != ElementState::Disabled);
+    element_unchanged(&before, after, tol_px)
+}
+
 /// 校验"引用元素"的动作目标是否仍然有效。
 ///
 /// 规则（默认的 ElementStable 策略）：
@@ -942,7 +954,7 @@ fn check_element(
     }
     let before = seen.find(id).ok_or_else(unknown)?;
     let after = now.ok_or_else(stale)?;
-    if !element_unchanged(before, after, tol_px) {
+    if !element_unchanged(before, after, tol_px) && !became_enabled(before, after, tol_px) {
         return Err(stale());
     }
     if ok(after) {
@@ -1217,6 +1229,37 @@ mod tests {
         let moved = off(5, 2600.0);
         assert!(matches!(
             check_element_scroll_target(3, Some(&seen), &moved, "e1", 2.0),
+            Err(RejectReason::StaleFrame { .. })
+        ));
+    }
+
+    #[test]
+    fn older_frame_accepts_target_that_became_enabled_but_not_the_reverse() {
+        let frame = |n, states: &[ElementState]| {
+            obs(
+                n,
+                vec![button("e1", "city", [0.0, 0.0, 10.0, 10.0]).with_states(states)],
+            )
+        };
+        // 禁用 → 可用：同一元素更可用了，放行
+        let seen = frame(3, &[Disabled]);
+        let cur = frame(5, &[]);
+        assert!(check_element_target(3, Some(&seen), &cur, "e1", 2.0).is_ok());
+        // 可用 → 禁用：目标不能再用，照旧被拒（不是陈旧就是不可交互）
+        let seen = frame(3, &[]);
+        let cur = frame(5, &[Disabled]);
+        assert!(check_element_target(3, Some(&seen), &cur, "e1", 2.0).is_err());
+        // 禁用 → 可用的同时位置也变了：仍是陈旧
+        let seen = frame(3, &[Disabled]);
+        let moved = obs(5, vec![button("e1", "city", [0.0, 300.0, 10.0, 310.0])]);
+        assert!(matches!(
+            check_element_target(3, Some(&seen), &moved, "e1", 2.0),
+            Err(RejectReason::StaleFrame { .. })
+        ));
+        // 禁用 → 可用的同时改名：仍是陈旧
+        let renamed = obs(5, vec![button("e1", "other", [0.0, 0.0, 10.0, 10.0])]);
+        assert!(matches!(
+            check_element_target(3, Some(&seen), &renamed, "e1", 2.0),
             Err(RejectReason::StaleFrame { .. })
         ));
     }
