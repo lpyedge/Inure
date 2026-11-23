@@ -321,8 +321,9 @@ libavutil/libswscale/libavdevice/libswresample 及其傳遞依賴。
   均 AAC 48kHz 128k。HLS fMP4：`hls_time 1`、列表 6 段、自動刪舊段；
   輸出於臨時目錄 `rig-edge-hls-<pid>/g<N>/{hevc,h264}/`：每次啟動管線用自己的代次目錄 `g<N>`，
   上一次合流線程停機超時仍未退出時不會與新管線共用目錄（線程沒退出就不刪它的目錄，退出時整體清理）。
-  合流線程連續 30 次寫包失敗（磁盤滿、目錄失效等）即放棄本次管線，原因經 `/health` 回報，
-  由下一次播放列表請求重啟；不再一邊宣稱運行中一邊不出片。
+  合流線程在 10 秒窗口內累計 3 次寫包錯誤（磁盤滿、目錄失效等）即放棄本次管線，原因經 `/health` 回報，
+  由下一次播放列表請求重啟；不再一邊宣稱運行中一邊不出片。（故障注入實測：目錄失效時錯誤只出現在切片邊界，
+  約每秒一次、與成功寫包交錯，所以按滑動窗口計，不按「連續失敗」計。）
 - **虛擬聲卡**：Linux 发布包提供 PulseAudio 执行档和模块。只有提供 HTTP 且自拉 Chromium 时，程序才启动私有 PulseAudio daemon、socket 与 `rigsink`；源码运行可显式指定 `--pulseaudio-dir` 或从 PATH 使用系统 PulseAudio。Windows/macOS 原生包不提供虚拟音频采集。纯 stdio 与挂靠模式不启动。PulseAudio 缺失或启动失败只禁用音频，视频不受影响；消费者不需安装 `pactl` 或 ffmpeg 命令行。
 
 ## 9. 人通道輸入與剪貼板

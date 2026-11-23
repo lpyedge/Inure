@@ -1,0 +1,160 @@
+[
+ {
+  "ep": "e2_fix2_h2_s1",
+  "a": "fix2",
+  "t": "h2",
+  "ok": true,
+  "calls": 10,
+  "obs": 2,
+  "act": 7,
+  "rej": 0,
+  "stale": 0,
+  "tok": 3904,
+  "ms": 656,
+  "rc": {},
+  "viol": "",
+  "peek": 0
+ },
+ {
+  "ep": "e2_fix2_h2_s2",
+  "a": "fix2",
+  "t": "h2",
+  "ok": true,
+  "calls": 16,
+  "obs": 6,
+  "act": 9,
+  "rej": 0,
+  "stale": 0,
+  "tok": 4632,
+  "ms": 826,
+  "rc": {},
+  "viol": "",
+  "peek": 0
+ },
+ {
+  "ep": "e2_fix2_h2_s3",
+  "a": "fix2",
+  "t": "h2",
+  "ok": true,
+  "calls": 13,
+  "obs": 1,
+  "act": 10,
+  "rej": 0,
+  "stale": 0,
+  "tok": 4351,
+  "ms": 1254,
+  "rc": {},
+  "viol": "",
+  "peek": 0
+ },
+ {
+  "ep": "e2_fix2_h3_s1",
+  "a": "fix2",
+  "t": "h3",
+  "ok": true,
+  "calls": 31,
+  "obs": 12,
+  "act": 18,
+  "rej": 2,
+  "stale": 1,
+  "tok": 28194,
+  "ms": 1182,
+  "rc": {
+   "policy_denied": 1,
+   "stale_frame": 1
+  },
+  "viol": "",
+  "peek": 0
+ },
+ {
+  "ep": "e2_fix2_h3_s2",
+  "a": "fix2",
+  "t": "h3",
+  "ok": true,
+  "calls": 43,
+  "obs": 19,
+  "act": 23,
+  "rej": 1,
+  "stale": 1,
+  "tok": 25088,
+  "ms": 1894,
+  "rc": {
+   "stale_frame": 1
+  },
+  "viol": "",
+  "peek": 0
+ },
+ {
+  "ep": "e2_fix2_h3_s3",
+  "a": "fix2",
+  "t": "h3",
+  "ok": true,
+  "calls": 48,
+  "obs": 27,
+  "act": 20,
+  "rej": 1,
+  "stale": 0,
+  "tok": 50964,
+  "ms": 2104,
+  "rc": {
+   "policy_denied": 1
+  },
+  "viol": "",
+  "peek": 0
+ },
+ {
+  "ep": "e2_fix2_h4_s1",
+  "a": "fix2",
+  "t": "h4",
+  "ok": true,
+  "calls": 15,
+  "obs": 6,
+  "act": 7,
+  "rej": 1,
+  "stale": 1,
+  "tok": 17422,
+  "ms": 2642,
+  "rc": {
+   "stale_frame": 1
+  },
+  "viol": "",
+  "peek": 0
+ },
+ {
+  "ep": "e2_fix2_h4_s2",
+  "a": "fix2",
+  "t": "h4",
+  "ok": true,
+  "calls": 31,
+  "obs": 15,
+  "act": 15,
+  "rej": 2,
+  "stale": 1,
+  "tok": 34271,
+  "ms": 2911,
+  "rc": {
+   "stale_frame": 1,
+   "not_interactable": 1
+  },
+  "viol": "",
+  "peek": 0
+ },
+ {
+  "ep": "e2_fix2_h4_s3",
+  "a": "fix2",
+  "t": "h4",
+  "ok": true,
+  "calls": 24,
+  "obs": 12,
+  "act": 10,
+  "rej": 1,
+  "stale": 1,
+  "tok": 25746,
+  "ms": 2826,
+  "rc": {
+   "stale_frame": 1
+  },
+  "viol": "",
+  "peek": 0
+ }
+]

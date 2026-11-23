@@ -7075,6 +7075,133 @@ fn edge_help_lists_flags_without_token_or_browser() {
     }
 }
 
+/// 故障注入：HLS 管线运行中输出目录被删（磁盘故障的一种），写包会持续失败。
+/// 管线必须放弃并经 /health 报告原因（不能一直宣称运行中），下一次播放列表请求
+/// 用新的代次目录重启并恢复出片（F05 写包错误、F04 目录隔离）。
+#[tokio::test]
+async fn edge_hls_pipeline_gives_up_on_write_failures_and_restarts_in_a_new_directory() {
+    if std::env::var("RIG_EDGE_IT").is_err() {
+        eprintln!("跳过：未设置 RIG_EDGE_IT");
+        return;
+    }
+    let _serial = SERIAL.lock().await;
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    serve(
+        listener,
+        vec![(
+            "/v.html".into(),
+            r#"<!DOCTYPE html><meta charset="utf-8"><title>v</title><body style="margin:0"><div style="width:300px;height:200px;background:#2a6">hls</div></body>"#.into(),
+        )],
+    );
+    let edge_port = free_port();
+    let edge = spawn_edge(&[
+        "--listen".into(),
+        format!("127.0.0.1:{edge_port}"),
+        "--url".into(),
+        format!("http://127.0.0.1:{port}/v.html"),
+        "--human".into(),
+        "--av".into(),
+        "--width".into(),
+        "900".into(),
+        "--height".into(),
+        "700".into(),
+    ]);
+    wait_health(edge_port).await;
+    let (_, login) = http_json(
+        edge_port,
+        "POST",
+        "/session",
+        Some(json!({"token": TEST_TOKEN})),
+    );
+    let key = login["stream_key"]
+        .as_str()
+        .expect("stream_key")
+        .to_string();
+    let playlist = |rend: &str| {
+        let (status, bytes) = http(
+            edge_port,
+            "GET",
+            &format!("/stream/{key}/{rend}/index.m3u8"),
+            None,
+        );
+        (status, String::from_utf8_lossy(&bytes).to_string())
+    };
+    let wait_playlist = |label: &'static str| {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        async move {
+            loop {
+                let (status, body) = playlist("h264");
+                if status == 200 && body.contains(".m4s") {
+                    return;
+                }
+                assert!(Instant::now() < deadline, "{label}: 播放列表未就绪: {body}");
+                tokio::time::sleep(Duration::from_millis(400)).await;
+            }
+        }
+    };
+    wait_playlist("首次启动").await;
+    let hls_root = std::env::temp_dir().join(format!("rig-edge-hls-{}", edge.0.id()));
+    let generations = || -> Vec<String> {
+        let mut v: Vec<String> = std::fs::read_dir(&hls_root)
+            .map(|d| {
+                d.flatten()
+                    .map(|e| e.file_name().to_string_lossy().to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
+        v.sort();
+        v
+    };
+    let first = generations();
+    assert_eq!(first.len(), 1, "应只有一个代次目录: {first:?}");
+    let (_, h) = http_json(edge_port, "GET", "/health", None);
+    assert_eq!(h["media"]["running"], true, "{h}");
+
+    // 注入：删掉正在写的输出目录。目录失效后读不到文件、播放需求不会续期，
+    // 12 秒空闲回收可能先于放弃判定把管线停掉（此时没有错误可报）：最多注入 3 次，
+    // 每次失败后用一次播放列表请求重启管线再来。
+    let mut current = first.clone();
+    let mut reason = String::new();
+    for attempt in 1..=3 {
+        std::fs::remove_dir_all(hls_root.join(&current[0])).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(14);
+        while Instant::now() < deadline {
+            let (_, h) = http_json(edge_port, "GET", "/health", None);
+            if h["media"]["running"] == false {
+                if let Some(e) = h["media"]["error"].as_str() {
+                    reason = e.to_string();
+                }
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+        if !reason.is_empty() {
+            break;
+        }
+        assert!(
+            attempt < 3,
+            "写包持续失败时应放弃管线并报告原因（3 次注入都被空闲回收抢先）"
+        );
+        wait_playlist("被回收后重启").await;
+        current = generations();
+        current.retain(|g| g != &first[0]);
+        assert!(!current.is_empty(), "重启应产生新的代次目录");
+    }
+    assert!(reason.contains("write failed"), "{reason}");
+
+    // 下一次播放列表请求用新目录重启并恢复出片，错误随之清除
+    wait_playlist("重启后").await;
+    let after = generations();
+    assert!(
+        after.iter().any(|g| !first.contains(g)),
+        "重启应使用新的代次目录: {first:?} -> {after:?}"
+    );
+    let (_, h) = http_json(edge_port, "GET", "/health", None);
+    assert_eq!(h["media"]["running"], true, "{h}");
+    assert!(h["media"]["error"].is_null(), "重启后错误应清除: {h}");
+}
+
 /// Control+A 必须真的全选（无头 Chromium 的组合键需要带编辑命令才会触发全选），
 /// 随后 Backspace 清空输入框。
 #[tokio::test]

@@ -34,30 +34,35 @@ struct PipelineInner {
     stop: Arc<AtomicBool>,
     handle: std::thread::JoinHandle<()>,
     last_request: tokio::time::Instant,
-    /// 合流线程因写包持续失败而主动退出时留下的原因（/health 如实回报）。
-    failure: Arc<std::sync::Mutex<Option<String>>>,
     _capture: CaptureLease,
 }
 
-/// 连续写包失败达到这个次数就放弃本次管线（10fps 下约 3 秒），
-/// 由下一次播放列表请求重启，而不是一直宣称运行中却不再出片。
-const MAX_WRITE_FAILURES: u32 = 30;
+/// 滑动窗口内写包错误达到这个次数就放弃本次管线，由下一次播放列表请求重启，
+/// 而不是一直宣称运行中却不再出片。故障注入实测：输出目录失效时错误只出现在切片边界
+/// （两路各约每 1.6 秒一次），中间的写包会成功，所以不能按“连续失败”计。
+const WRITE_ERROR_WINDOW: Duration = Duration::from_secs(10);
+const MAX_WRITE_ERRORS_IN_WINDOW: usize = 3;
 
-/// 写包健康度：连续失败计数，成功即清零。
+/// 写包健康度：记录窗口内的错误时刻。
 #[derive(Default)]
 struct WriteHealth {
-    consecutive: u32,
+    errors: std::collections::VecDeque<std::time::Instant>,
 }
 
 impl WriteHealth {
-    /// 记录一轮写包结果；连续失败达到上限返回 true（应放弃管线）。
-    fn note(&mut self, failed: bool) -> bool {
+    /// 记录一轮写包结果；窗口内错误数达到上限返回 true（应放弃管线）。
+    fn note(&mut self, failed: bool, now: std::time::Instant) -> bool {
         if failed {
-            self.consecutive += 1;
-        } else {
-            self.consecutive = 0;
+            self.errors.push_back(now);
         }
-        self.consecutive >= MAX_WRITE_FAILURES
+        while self
+            .errors
+            .front()
+            .is_some_and(|t| now.duration_since(*t) > WRITE_ERROR_WINDOW)
+        {
+            self.errors.pop_front();
+        }
+        self.errors.len() >= MAX_WRITE_ERRORS_IN_WINDOW
     }
 }
 
@@ -71,6 +76,10 @@ pub struct MediaPipeline {
     /// M03 最近一次启动失败的原因（成功即清）：/channels 与 /health
     /// 如实回报，不再吞掉 start() 错误
     last_error: std::sync::Mutex<Option<String>>,
+    /// 合流线程因写包持续失败而主动退出时留下的原因（/health 如实回报）。
+    /// 归 MediaPipeline 持有而不是归某一次管线：管线被空闲回收后原因仍在，
+    /// 直到下一次管线成功启动才清除。
+    write_failure: Arc<std::sync::Mutex<Option<String>>>,
 }
 
 /// HLS 分片的一次性临时目录（本进程专属；含屏幕画面，退出时由 main 清理）
@@ -93,6 +102,7 @@ impl MediaPipeline {
             pulse_server,
             wanted: AtomicBool::new(false),
             last_error: std::sync::Mutex::new(None),
+            write_failure: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -131,8 +141,11 @@ impl MediaPipeline {
         let thread_dir = dir.clone();
         let thread_stop = stop.clone();
         let pulse_server = self.pulse_server.clone();
-        let failure = Arc::new(std::sync::Mutex::new(None));
-        let thread_failure = failure.clone();
+        *self
+            .write_failure
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        let thread_failure = self.write_failure.clone();
         let handle = std::thread::Builder::new()
             .name("rig-media".into())
             .spawn(move || {
@@ -144,7 +157,6 @@ impl MediaPipeline {
             stop: stop.clone(),
             handle,
             last_request: tokio::time::Instant::now(),
-            failure,
             _capture: capture,
         });
 
@@ -210,11 +222,10 @@ impl MediaPipeline {
     pub async fn state_summary(&self) -> (bool, bool, Option<String>) {
         let running = self.running().await;
         let failure = self
-            .inner
+            .write_failure
             .lock()
-            .await
-            .as_ref()
-            .and_then(|inner| inner.failure.lock().ok().and_then(|f| f.clone()));
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
         let start_error = self
             .last_error
             .lock()
@@ -571,9 +582,10 @@ fn pipeline_main(
                 }
             }
         }
-        if mux.is_some() && health.note(write_error.is_some()) {
+        if mux.is_some() && health.note(write_error.is_some(), std::time::Instant::now()) {
             let reason = format!(
-                "HLS muxer write failed {MAX_WRITE_FAILURES} times in a row ({}); the pipeline stopped and restarts on the next playlist request",
+                "HLS muxer write failed {MAX_WRITE_ERRORS_IN_WINDOW} times within {}s ({}); the pipeline stopped and restarts on the next playlist request",
+                WRITE_ERROR_WINDOW.as_secs(),
                 write_error.map(|e| e.to_string()).unwrap_or_default()
             );
             eprintln!("[media] {reason}");
@@ -841,18 +853,28 @@ mod tests {
         assert!(a.starts_with(hls_dir()) && b.starts_with(hls_dir()));
     }
 
-    /// 连续写包失败达到上限才放弃管线，一次成功即清零
+    /// 写包错误只看滑动窗口：窗口内累计到上限才放弃；零星错误和成功交错都不能清零，
+    /// 窗口之外的旧错误不计。
     #[test]
-    fn write_health_gives_up_only_after_consecutive_failures() {
+    fn write_health_counts_errors_in_a_sliding_window() {
+        use std::time::{Duration as D, Instant};
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + D::from_millis(ms);
         let mut h = WriteHealth::default();
-        for _ in 0..MAX_WRITE_FAILURES - 1 {
-            assert!(!h.note(true), "未到上限不应放弃");
+        // 每秒一次错误，中间有成功（模拟切片边界才出错）：累计到上限放弃
+        for i in 0..MAX_WRITE_ERRORS_IN_WINDOW - 1 {
+            assert!(!h.note(true, at(i as u64 * 1000)), "未到上限不应放弃");
+            assert!(!h.note(false, at(i as u64 * 1000 + 500)), "成功不应清零");
         }
-        assert!(!h.note(false), "一次成功应清零");
-        for _ in 0..MAX_WRITE_FAILURES - 1 {
-            assert!(!h.note(true));
+        assert!(
+            h.note(true, at(MAX_WRITE_ERRORS_IN_WINDOW as u64 * 1000 - 1000)),
+            "窗口内累计到上限应放弃"
+        );
+        // 错误间隔很大（旧错误已滑出窗口）：永远凑不够
+        let mut h = WriteHealth::default();
+        for i in 0..20u64 {
+            assert!(!h.note(true, at(i * 12_000)), "窗口外的旧错误不应累计");
         }
-        assert!(h.note(true), "连续失败达到上限应放弃");
     }
 
     /// 单路构建只建一路编码器 + 一路输出目录（省一路编码）

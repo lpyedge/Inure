@@ -1,0 +1,15 @@
+<!DOCTYPE html><meta charset="utf-8"><title>churn</title>
+<body style="margin:0"><div id="box"></div>
+<script>
+let n = 0;
+setInterval(() => {
+  const box = document.getElementById('box');
+  box.textContent = '';
+  for (let i = 0; i < 300; i++) {
+    const b = document.createElement('button');
+    b.textContent = 'b' + (n++);
+    b.style.cssText = 'position:absolute;left:' + (i % 30) * 30 + 'px;top:' + Math.floor(i / 30) * 20 + 'px;width:28px;height:18px;font-size:8px';
+    box.appendChild(b);
+  }
+}, 250);
+</script></body>

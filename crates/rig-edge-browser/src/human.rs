@@ -115,6 +115,20 @@ impl Drop for CaptureLease {
 /// 帧泵运行中检查任务是否已退出的间隔。
 const PUMP_WATCH: std::time::Duration = std::time::Duration::from_secs(1);
 
+/// 管理循环这一轮之后多久要自己醒来：有泵 → 定期看它是否已退出；
+/// 有需求却没泵（启动失败）→ 退避后重试；没需求 → 不用醒，只等需求变化。
+fn capture_wake_after(
+    has_pump: bool,
+    has_demand: bool,
+    start_failures: u32,
+) -> Option<std::time::Duration> {
+    match (has_pump, has_demand) {
+        (true, _) => Some(PUMP_WATCH),
+        (false, true) => Some(capture_retry_delay(start_failures)),
+        (false, false) => None,
+    }
+}
+
 /// 整页采集启动失败后的重试等待：500ms 起翻倍，上限 30s，避免瞬时故障时空转。
 fn capture_retry_delay(failures: u32) -> std::time::Duration {
     let ms = 500u64.saturating_mul(1u64 << failures.saturating_sub(1).min(6));
@@ -631,11 +645,7 @@ impl HumanChannel {
                 drop(human);
                 // 有泵：定期看它是否已退出；有需求却没泵（启动失败）：退避后重试；
                 // 无需求：只等需求变化。
-                let wake = match (pump.is_some(), wanted.is_some()) {
-                    (true, _) => Some(PUMP_WATCH),
-                    (false, true) => Some(capture_retry_delay(start_failures)),
-                    (false, false) => None,
-                };
+                let wake = capture_wake_after(pump.is_some(), wanted.is_some(), start_failures);
                 match wake {
                     Some(after) => {
                         tokio::select! {
@@ -2093,6 +2103,30 @@ fn decode_jpeg_rgb(raw: &[u8]) -> Option<image::RgbImage> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 管理循环的唤醒决策：有泵定期看护、有需求没泵退避重试、没需求不醒。
+    /// （泵任务异常退出时，正是“有泵”分支的定期检查发现它已结束并重启；
+    /// 外部手段没法让泵任务异常退出，这一段只能靠分支单测覆盖，端到端注入未做。）
+    #[test]
+    fn capture_wake_decision_covers_all_three_states() {
+        assert_eq!(capture_wake_after(true, true, 0), Some(PUMP_WATCH));
+        assert_eq!(
+            capture_wake_after(true, false, 0),
+            Some(PUMP_WATCH),
+            "需求撤了但泵还在：照样要醒来去停它"
+        );
+        assert_eq!(
+            capture_wake_after(false, true, 1),
+            Some(capture_retry_delay(1)),
+            "有需求没泵：退避重试"
+        );
+        assert!(capture_wake_after(false, true, 5) > capture_wake_after(false, true, 1));
+        assert_eq!(
+            capture_wake_after(false, false, 3),
+            None,
+            "没需求不应自己醒"
+        );
+    }
 
     /// 整页采集启动失败后的重试等待：翻倍增长、有上限，且首次失败不会立即空转。
     #[test]
