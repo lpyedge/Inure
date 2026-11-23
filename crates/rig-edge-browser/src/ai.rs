@@ -10,15 +10,15 @@ use rig_proto::observation::{
     check_element_scroll_target, check_element_target, check_point_target, diff_observations,
     AbortReason, Action, ActionRequest, ActionResult, BBox, BatchActionRequest, BatchActionResult,
     ElementState, MouseButton, Observation, ObservationDelta, ObserveMode, ObserveRequest,
-    RejectReason, Target, MAX_BATCH_ACTIONS,
+    RejectReason, Target, TextLayout, MAX_BATCH_ACTIONS,
 };
 use tokio::sync::Mutex;
 
 use crate::browser::{ActivePage, Browser, ViewState};
 use crate::exec::{ExecControl, ExecHandle};
 use crate::snapshot::{
-    build_observation, count_elements, estimate_tokens, render, screenshot_masks, strip_offscreen,
-    trim_to_budget, IdMap, LocateMap,
+    build_observation, count_elements, estimate_tokens, render_with, screenshot_masks,
+    strip_offscreen, trim_to_budget, IdMap, LocateMap,
 };
 
 /// execute 的失败：被接管中断（R-03：动作中段检查点命中）与
@@ -67,6 +67,8 @@ struct Projection {
     include_offscreen: bool,
     subtree: Option<String>,
     budget_tokens: Option<u32>,
+    /// 文本排版也是客户端手里那份视图的一部分：不同排版的基帧不能互相作差分基准。
+    layout: TextLayout,
 }
 
 struct PresentedFrame {
@@ -474,6 +476,7 @@ impl AiChannel {
             include_offscreen: req.include_offscreen,
             subtree: req.subtree.clone(),
             budget_tokens: req.budget_tokens,
+            layout: req.layout,
         };
         let (view, note) = project(&frame.obs, &projection)?;
         let mut warnings = frame.warnings.clone();
@@ -560,7 +563,7 @@ impl AiChannel {
             self.note_presented(frame, req).await;
             return Ok(delta_out(delta, note.as_deref()));
         }
-        let mut text = render(&view);
+        let mut text = render_with(&view, req.layout);
         if let Some(note) = note {
             text.push_str(&format!("[{note}]\n"));
         }
@@ -588,7 +591,7 @@ impl AiChannel {
         if !recordable {
             return None;
         }
-        let cur = render(view);
+        let cur = render_with(view, req.layout);
         let mut history = self.history.lock().await;
         let delta = req.since_frame.and_then(|since| {
             history
@@ -606,7 +609,12 @@ impl AiChannel {
                             .root_navigated_since(base.mark, &frame.context.page.session)
                 })
                 .and_then(|base| {
-                    diff_rendered_text(base.obs.frame_id, &render(&base.obs), view.frame_id, &cur)
+                    diff_rendered_text(
+                        base.obs.frame_id,
+                        &render_with(&base.obs, req.layout),
+                        view.frame_id,
+                        &cur,
+                    )
                 })
         });
         if !history
@@ -702,6 +710,7 @@ impl AiChannel {
                 include_offscreen: false,
                 subtree: None,
                 budget_tokens: None,
+                layout: TextLayout::Tree,
             };
             let (view, _) = project(&frame.obs, &projection)?;
             self.capture_marked(&frame, &view, deadline).await

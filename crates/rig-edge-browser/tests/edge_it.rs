@@ -4191,6 +4191,26 @@ async fn edge_observe_modes_budget() {
         "text 模式不返回结构化增量: {v}"
     );
 
+    // layout=blocks：文本为语义块（无缩进树行），可操作元素带 id，默认 tree 排版不变
+    let (st, v) = observe_with(json!({"mode": "text", "layout": "blocks"}));
+    assert_eq!(st, 200, "blocks 排版观察: {v}");
+    let blocks = v["text"].as_str().unwrap();
+    assert!(blocks.starts_with("# frame "), "{blocks}");
+    assert!(
+        blocks.contains(&format!("[{btn_id}")) && blocks.contains("计数:"),
+        "blocks 文本应含按钮 id 与计数: {blocks}"
+    );
+    assert!(
+        !blocks.contains("- button"),
+        "blocks 不应有树形行: {blocks}"
+    );
+    let (st, v) = observe_with(json!({"mode": "text"}));
+    assert_eq!(st, 200);
+    assert!(
+        v["text"].as_str().unwrap().contains("- button"),
+        "默认排版仍是树: {v}"
+    );
+
     // scroll_into_view：视口外目标可被滚入视口；之后默认观察就带得到它，且可点击
     let (st, v) = observe_with(json!({"include_offscreen": true}));
     assert_eq!(st, 200);

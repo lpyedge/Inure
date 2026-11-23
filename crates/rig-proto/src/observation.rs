@@ -615,6 +615,18 @@ pub enum ObserveMode {
     TreeImage,
 }
 
+/// 文本视图的排版。只影响 `text` 字段的渲染，不影响结构化观察与动作校验。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TextLayout {
+    /// 元素树，一行一元素、缩进表层级（默认）。
+    #[default]
+    Tree,
+    /// 语义块：标题、表格（逐行 `|` 分列）、对话框/iframe 成块，可操作元素带 id；
+    /// 不含几何坐标（iframe/画布除外）。
+    Blocks,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ObserveRequest {
     #[serde(default)]
@@ -630,6 +642,13 @@ pub struct ObserveRequest {
     pub subtree: Option<String>,
     #[serde(default)]
     pub include_offscreen: bool,
+    /// 文本视图排版，默认 `tree`。
+    #[serde(default, skip_serializing_if = "is_default_layout")]
+    pub layout: TextLayout,
+}
+
+fn is_default_layout(layout: &TextLayout) -> bool {
+    *layout == TextLayout::Tree
 }
 
 // ───────────────────────────── Action ─────────────────────────────
