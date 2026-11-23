@@ -630,11 +630,13 @@ fn even_dims(w: u32, h: u32) -> (u32, u32) {
     (w & !1, h & !1)
 }
 
-fn crop_even(rgb: &image::RgbImage, w: u32, h: u32) -> image::RgbImage {
+/// 裁到偶数尺寸（yuv420 要求）。尺寸已经匹配时直接借用，不复制整帧：
+/// 10fps 下每帧省一次整图拷贝（1280x800 RGB24 约 2.9MiB/帧）。
+fn crop_even(rgb: &image::RgbImage, w: u32, h: u32) -> std::borrow::Cow<'_, image::RgbImage> {
     if rgb.width() == w && rgb.height() == h {
-        rgb.clone()
+        std::borrow::Cow::Borrowed(rgb)
     } else {
-        image::imageops::crop_imm(rgb, 0, 0, w, h).to_image()
+        std::borrow::Cow::Owned(image::imageops::crop_imm(rgb, 0, 0, w, h).to_image())
     }
 }
 
@@ -879,6 +881,24 @@ mod tests {
         // 下一次启动的代次目录不会是被卡住的那个
         assert_ne!(generation_dir(), generation_dir());
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 尺寸匹配时借用（不复制整帧）；奇数边才裁剪并复制。
+    #[test]
+    fn crop_even_borrows_when_the_size_already_matches() {
+        let img = image::RgbImage::from_pixel(8, 6, image::Rgb([1, 2, 3]));
+        let same = crop_even(&img, 8, 6);
+        assert!(
+            matches!(same, std::borrow::Cow::Borrowed(_)),
+            "同尺寸不应复制"
+        );
+        assert!(std::ptr::eq(&*same, &img));
+        let odd = image::RgbImage::from_pixel(9, 7, image::Rgb([4, 5, 6]));
+        let (w, h) = even_dims(odd.width(), odd.height());
+        let cropped = crop_even(&odd, w, h);
+        assert!(matches!(cropped, std::borrow::Cow::Owned(_)));
+        assert_eq!((cropped.width(), cropped.height()), (8, 6));
+        assert_eq!(cropped.get_pixel(3, 3).0, [4, 5, 6], "裁剪不改像素内容");
     }
 
     /// 每次启动用独立目录，且都在本进程的 HLS 根目录之下
