@@ -1374,7 +1374,7 @@ async fn edge_dom_mirror_does_not_carry_card_or_otp_values() {
 const DOM_SENSITIVE_SELECT_HTML: &str = r#"<!DOCTYPE html><html lang="zh"><head><meta charset="utf-8"><title>DOM 敏感下拉探针</title></head>
 <body><select id="m" autocomplete="cc-exp-month"><option value="a">MON-AAA</option><option value="b" selected>MON-SELECTED-SECRET</option></select>
 <script>
-setTimeout(() => { document.getElementById('m').value = 'a'; document.getElementById('m').dispatchEvent(new Event('input', {bubbles: true})); }, 1200);
+setTimeout(() => { const m = document.getElementById('m'); m.value = 'a'; m.dispatchEvent(new Event('input', {bubbles: true})); m.options[0].setAttribute('selected', ''); }, 1200);
 </script></body></html>"#;
 
 /// 敏感字段是下拉框（如 cc-exp-month）时，值被遮蔽还不够：已选中的选项状态
@@ -7042,6 +7042,17 @@ const DOM_IFRAME_CHURN_HTML: &str = r#"<!DOCTYPE html><html><head><meta charset=
     o.remove();
     await sleep(60);
   }
+  // 被监视的外层 iframe 反复导航（换 srcdoc），每次新文档里都带新的内层 iframe
+  const w = document.createElement('iframe');
+  w.srcdoc = '<p>w0</p><iframe srcdoc="<p>i0</p>"></iframe>';
+  document.getElementById('host').appendChild(w);
+  await sleep(500);
+  for (let i = 1; i <= 8; i++) {
+    w.srcdoc = '<p>w' + i + '</p><iframe srcdoc="<p>i' + i + '</p>"></iframe>';
+    await sleep(500);
+  }
+  w.remove();
+  await sleep(200);
   // 在被监视的 iframe 文档内部反复增删 iframe（那边的突变只触发整页重同步）
   const p = document.createElement('iframe');
   p.srcdoc = '<script>setInterval(() => { const f = document.createElement("iframe"); f.srcdoc = "x"; document.body.appendChild(f); setTimeout(() => f.remove(), 200); }, 350);<\/script>';
@@ -7315,7 +7326,13 @@ async fn edge_hidden_cross_site_iframe_does_not_raise_a_snapshot_warning() {
             ),
             (
                 "/tracker.html".into(),
-                r#"<!DOCTYPE html><meta charset="utf-8"><body><button>tracker</button></body>"#
+                format!(
+                    r#"<!DOCTYPE html><meta charset="utf-8"><body><button>tracker</button><iframe src="http://127.0.0.2:{port}/inner.html"></iframe></body>"#
+                ),
+            ),
+            (
+                "/inner.html".into(),
+                r#"<!DOCTYPE html><meta charset="utf-8"><body><button>inner</button></body>"#
                     .into(),
             ),
         ],

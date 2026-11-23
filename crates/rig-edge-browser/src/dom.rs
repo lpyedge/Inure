@@ -205,6 +205,8 @@ const SCRIPT: &str = r##"(() => {
         S.watched.get(d)?.();
         S.watched.delete(d);
         S.watchedEl.delete(d);
+        // 导航后旧文档里嵌套的同源 iframe 也不会再被需要：一并解除
+        try { for (const inner of d.querySelectorAll('iframe')) unwatchFrame(inner); } catch (e) {}
         send({ kind: 'resync' });
       };
       S.watched.set(d, () => {

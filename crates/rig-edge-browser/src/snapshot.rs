@@ -429,10 +429,12 @@ pub async fn build_observation(
     // 广告与追踪器常见）：本来就不可见，静默跳过。只有连宿主都找不到（层级没传播完整）
     // 才告警，否则每次观察都带告警会让截图被拒、文本差分失效。
     for sd in sessions.iter().filter(|sd| !sd.placed) {
+        // 宿主可能本身就在另一个没定位的隐藏会话里（隐藏广告 iframe 再嵌别的跨站 iframe），
+        // 所以在全部会话里找，不只看已放置的。
         let host_known = !sd.root_frame.is_empty()
-            && sessions
-                .iter()
-                .any(|o| o.placed && frame_owner_backend(&o.dom, &sd.root_frame).is_some());
+            && sessions.iter().any(|o| {
+                o.session != sd.session && frame_owner_backend(&o.dom, &sd.root_frame).is_some()
+            });
         if !host_known {
             warnings.push(format!(
                 "Frame session {} could not be positioned; its elements are omitted",
