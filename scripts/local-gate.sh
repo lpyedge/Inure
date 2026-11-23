@@ -7,6 +7,14 @@ cd "$(dirname "$0")/.."
 
 step() { printf '\n=== %s ===\n' "$1"; }
 
+# 缺工具就明确报「未验证」并失败，不要让后面的步骤给出误导性的结果。
+for tool in cargo python3; do
+  command -v "$tool" >/dev/null 2>&1 || { echo "NOT VERIFIED: $tool is not installed, the gate cannot run" >&2; exit 127; }
+done
+if ! command -v chromium >/dev/null 2>&1 && ! command -v chrome >/dev/null 2>&1 && ! command -v google-chrome >/dev/null 2>&1 && [[ -z "${RIG_EDGE_TEST_CHROMIUM_DIR:-}" ]]; then
+  echo "warning: no Chromium on PATH and RIG_EDGE_TEST_CHROMIUM_DIR is unset; the browser integration tests will fail" >&2
+fi
+
 step "1/3 cargo fmt --all --check"
 cargo fmt --all --check
 

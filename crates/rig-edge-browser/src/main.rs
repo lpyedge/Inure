@@ -404,9 +404,53 @@ async fn shutdown_signal() {
         .expect("failed to register Ctrl+C handler");
 }
 
+const USAGE: &str = "\
+rig-edge-browser: control Chromium for AI agents and humans (CDP, MCP, HTTP, viewer)
+
+USAGE:
+    rig-edge-browser [OPTIONS]
+
+SERVING:
+    --listen <addr:port>       HTTP bind address (default 127.0.0.1:39871)
+    --token <secret>           Required when serving HTTP (or set RIG_EDGE_TOKEN)
+    --stdio                    Use MCP over stdio as the AI channel front end
+    --human                    Enable the human channel (viewer page)
+    --no-ai                    Start with the AI channel closed
+    --av                       Allow HLS playback (starts on the first playlist request)
+    --embed-origin <o[,o...]>  Origins allowed to embed the viewer (none by default)
+    --tls-cert <file> --tls-key <file>
+                               HTTPS (self-signed certificate is generated when missing)
+    --stun <host:port>         Repeatable; enables full ICE with srflx candidates
+
+BROWSER:
+    --url <url>                Page to open at start (its origin joins the navigate allowlist)
+    --allow-origin <origin>    Repeatable; extra origin allowed for navigate
+    --width <px> --height <px> Viewport size (default 1280x800)
+    --chromium-dir <path>      Last-resort Chromium directory when self-launching
+    --pulseaudio-dir <path>    Portable PulseAudio directory
+    --cdp-url <base>           Attach to an existing Chromium instead of launching one
+    --profile-dir <path>       Persistent Chromium user data directory
+    --cache-dir <path>         Disposable cache directory (uploads/ is the upload root)
+
+OTHER:
+    --check-media-runtime      Check that the FFmpeg encoders are available, then exit
+    -h, --help                 Print this help
+
+Without --stdio, a random token must be passed via --token or RIG_EDGE_TOKEN.
+See docs/05-编译部署与运行.md for details.
+";
+
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = std::env::args().collect();
+    if args
+        .iter()
+        .skip(1)
+        .any(|arg| arg == "--help" || arg == "-h")
+    {
+        print!("{USAGE}");
+        return;
+    }
     if args
         .get(1)
         .is_some_and(|arg| arg == "--check-media-runtime")

@@ -6965,6 +6965,38 @@ async fn edge_dom_mirror_releases_watchers_of_removed_iframes() {
     );
 }
 
+/// `--help` 不需要令牌也不需要浏览器：打印参数说明并以 0 退出；说明里列出全部参数。
+#[test]
+fn edge_help_lists_flags_without_token_or_browser() {
+    let out = edge_command().arg("--help").output().expect("运行 --help");
+    assert!(out.status.success(), "--help 应以 0 退出: {:?}", out.status);
+    let text = String::from_utf8_lossy(&out.stdout);
+    for flag in [
+        "--listen",
+        "--token",
+        "--stdio",
+        "--human",
+        "--no-ai",
+        "--av",
+        "--embed-origin",
+        "--tls-cert",
+        "--tls-key",
+        "--stun",
+        "--url",
+        "--allow-origin",
+        "--width",
+        "--chromium-dir",
+        "--pulseaudio-dir",
+        "--cdp-url",
+        "--profile-dir",
+        "--cache-dir",
+        "--check-media-runtime",
+        "--help",
+    ] {
+        assert!(text.contains(flag), "--help 应列出 {flag}: {text}");
+    }
+}
+
 /// Control+A 必须真的全选（无头 Chromium 的组合键需要带编辑命令才会触发全选），
 /// 随后 Backspace 清空输入框。
 #[tokio::test]

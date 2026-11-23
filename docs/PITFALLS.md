@@ -442,3 +442,14 @@
 - **症状**：`entanglement.gopherwoodstudios.com` 加载完成后，`/screenshot.png` 与 `tree_image` 连续报 “The page, viewport or sensitive regions changed during the screenshot”，模型在 canvas 游戏里看不到棋盘。
 - **根因**：截图校验要求截图期间没有结构变化事件（防“敏感元素短暂出现又恢复”）；游戏每帧改 DOM 文本/属性，事件不断，永远过不了。
 - **解法（用户批准）**：前后两次敏感区域核对都为空（整页没有敏感区域）时，只核对页面身份与根导航；有敏感区域的页面维持严格口径。回归测试 `edge_screenshot_allows_animated_page_only_without_sensitive_fields`（含密码框的动画页仍被拒）。残余风险见 [08](08-安全模型.md)。
+
+## 拒绝回包与帧号、批量校验、测试里的随机性（2026-11-24）
+
+- **`stale_frame` 的 `current_frame` 比随包文本的 `# frame N` 小 1**：拒绝后附带的新观察又把存储帧推进一步，回包里的 `current_frame` 是推进之前算的。照 `current_frame` 重发的调用方会被再拒一次，h3 报销台里一局连续 6 次 `set_checked` 被拒就是这样来的。解法：附带状态成功后，把 `current_frame` 改成实际交付的那一帧。回归测试 `edge_stale_reject_current_frame_matches_attached_frame`。**教训：回包里的两个帧号必须来自同一次交付，否则调用方照任何一个重发都有一半概率错。**
+- **旧帧校验只认“存储帧”，调用方连续观察两次再用第一次的帧也被拒**：校验基准只有 `self.state` 一帧。现在请求帧不是存储帧时，从最近 8 个已交付的观察里取同一帧作比较基准；历史里存的是投影后的视图，目标不在其中时必须退回原行为（否则陈旧会被误报成 `unknown_element`）。`edge_recent_delivered_frame_stays_usable_when_target_unchanged`。
+- **同一批里前一步让后一步的目标从禁用变可用被判陈旧**：向导里取消勾选“Same as billing”后再填城市，城市输入框 disabled→enabled，状态集合变了。目标仍是同一元素（角色、名称、位置没变），放行；反向、位置或名字也变仍拒。反过来，日历的“下个月”按钮会随月份行数改变位置，同一批里连点要被拒，这是对的，不要放宽。
+- **测试里 `request_id` 固定会命中幂等缓存**：`edge_it.rs` 的 `act()` 辅助函数 `request_id` 恒为 `"t"`，同帧同动作的第二次调用会被当成重发返回上一次的结果，写“目标变了必须被拒”这类断言时会被缓存吞掉。需要多次同类调用的测试自己带唯一 `request_id`。
+- **OOPIF 偏移传播固定 4 轮，会话顺序随机**：子会话的原点要靠宿主 iframe 的位置逐层推，旧代码最多 4 轮，嵌套更深且枚举顺序不利时最深层停在 (0,0) 偏移，元素坐标悄悄错位。要用 10 层（每层不同站点：`127.0.0.1`、`localhost`、`127.0.0.2`…）才复现，并且只是约 4/10 的概率，所以回归测试看的是修复前后的失败率而不是单次。同一棵树里 6 层时旧代码从不失败，**别拿浅层夹具当证据**。
+- **进程级环境变量的单测必须串行**：`media::tests` 里两个测试改 `RIG_HLS_SINGLE`，并行会互踩，表现为偶发 `failed to create the muxer: No such file or directory`。用测试锁串行化。
+- **删除 iframe 不保证触发 `load`**：DOM 镜像按 Document 强引用监视同源 iframe，只在 `load` 或 `stop` 时解除；SPA 反复增删 iframe 会让监视表只增不减。在 `dropSubtree` 里解除，并暴露 `__rigDom.watchedCount()` 供测试读取。回归测试 `edge_dom_mirror_releases_watchers_of_removed_iframes`（修复前残留 30/30）。
+- **只忽略错误的 `let _ = ...write_interleaved(...)` 会让管线“宣称运行中却不出片”**：磁盘满或目录失效时写包持续失败。现在连续失败 30 次就放弃管线并经 `/health` 报告原因，下一次播放列表请求重启。

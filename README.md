@@ -35,6 +35,8 @@ RIG_EDGE_TOKEN="$TOKEN" target/release/rig-edge-browser --listen 127.0.0.1:39871
 target/release/rig-edge-browser --stdio --url https://example.com
 ```
 
+查看全部命令行参数：`rig-edge-browser --help`（参数详解见 [docs/05 §2](docs/05-编译部署与运行.md)）。
+
 ## 文档
 
 项目说明与专题设计见 [文档地图](docs/README.md)。构建、测试、发布与运行脚本见 [部署与脚本](docs/05-编译部署与运行.md)，开发约束见 [CLAUDE.md](CLAUDE.md) 与 [AGENTS.md](AGENTS.md)。

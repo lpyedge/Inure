@@ -46,7 +46,7 @@ RIG 的**瀏覽器邊緣程序**：一個 Rust 二進位，與目標 Chromium �
 |---|---|
 | `cdp.rs` | 手寫 CDP 客戶端：WebSocket 幀、flatten 多會話（`Target.attachToTarget {flatten:true}`）、請求/事件多路複用 |
 | `browser.rs` | Chromium 生命週期：自拉起（launch）或掛靠（attach）；頁面會話管理、截圖、鍵鼠原語、剪貼板授權 |
-| `snapshot.rs` | AX 快照引擎：全量樹遍歷、OOPIF 子幀掛接與坐標合成、ignored 透傳、generic 殼剪枝、穩定 id 分配、密碼子樹脫敏 |
+| `snapshot.rs` | AX 快照引擎：全量樹遍歷、OOPIF 子幀掛接與坐標合成（偏移傳播至多 `sessions.len()` 輪；仍未定位的子會話不輸出元素並告警，不給錯位坐標）、ignored 透傳、generic 殼剪枝、穩定 id 分配、密碼子樹脫敏 |
 | `ai.rs` | AI 通道：observe（生成快照幀）/ act（陳舊校驗後執行 Action）/ 編號截圖 |
 | `human.rs` | 人通道：按需求啟停 CDP screencast、輸入事件注入、文本/圖片剪貼板橋 |
 | `pulse.rs` | 啟動和管理自有 PulseAudio daemon、私有 socket/運行目錄與 `rigsink`；失敗只影響音頻 |
@@ -108,6 +108,8 @@ platform/arch——版本取 product 的真實完整版本，UA 串裡的是約�
 | `--cdp-url <base>` | — | 掛靠模式：現成 Chromium 的 DevTools HTTP 基位址（見 §3） |
 | `--chromium-dir <path>` | 自動發現 | 自拉起模式的最后回退目录；Linux/macOS 识别 `chrome`/`chromium`，Windows 识别 `.exe` 版本；macOS 支持 Chrome for Testing、Google Chrome 和 Chromium 应用包。发布包顺序为包旁 `chromium/` → PATH → Windows/macOS 默认安装位置 → 此参数；源码运行从 PATH 和平台位置开始。 |
 | `--install-deps [--with-chromium] [--deps-base-url HTTPS_URL]` | — | 发布启动器的独立安装/更新命令，下载并部署后退出，不启动服务。按 target 与媒体 ABI 下载索引和 full 归档，校验 SHA-256，并用本地核心程序检查媒体编码器后替换运行库；`--with-chromium` 同时安装便携浏览器 |
+| `--check-media-runtime` | — | 檢查 FFmpeg 的 libx264、libx265、aac 編碼器可用，可用打印 `FFmpeg runtime ready` 退出 0，缺任一項退出 1（`scripts/release.sh` 打包後自檢）；不需要令牌 |
+| `-h` / `--help` | — | 打印參數說明後退出，不需要令牌 |
 | `--pulseaudio-dir <path>` | 啟動器提供 | 指定 PulseAudio 解包目錄；發布入口使用包內目錄，源碼運行可從 PATH 啟動系統 PulseAudio |
 | `--width` / `--height` | 1280 / 800 | 瀏覽器視口尺寸 |
 | `--allow-origin <origin>` | — | 追加允許 Navigate 的 origin（可重複給多次） |
@@ -317,7 +319,10 @@ libavutil/libswscale/libavdevice/libswresample 及其傳遞依賴。
 - 編碼：HEVC = libx265（veryfast、1.5Mbps、`hvc1` 標籤經 codecpar 寫入）；
   H.264 = libx264（veryfast、2.5Mbps）；關鍵幀間隔 20 幀（2 秒）；
   均 AAC 48kHz 128k。HLS fMP4：`hls_time 1`、列表 6 段、自動刪舊段；
-  輸出於臨時目錄 `rig-edge-hls-<pid>/{hevc,h264}/`，布局與舊管線一致。
+  輸出於臨時目錄 `rig-edge-hls-<pid>/g<N>/{hevc,h264}/`：每次啟動管線用自己的代次目錄 `g<N>`，
+  上一次合流線程停機超時仍未退出時不會與新管線共用目錄（線程沒退出就不刪它的目錄，退出時整體清理）。
+  合流線程連續 30 次寫包失敗（磁盤滿、目錄失效等）即放棄本次管線，原因經 `/health` 回報，
+  由下一次播放列表請求重啟；不再一邊宣稱運行中一邊不出片。
 - **虛擬聲卡**：Linux 发布包提供 PulseAudio 执行档和模块。只有提供 HTTP 且自拉 Chromium 时，程序才启动私有 PulseAudio daemon、socket 与 `rigsink`；源码运行可显式指定 `--pulseaudio-dir` 或从 PATH 使用系统 PulseAudio。Windows/macOS 原生包不提供虚拟音频采集。纯 stdio 与挂靠模式不启动。PulseAudio 缺失或启动失败只禁用音频，视频不受影响；消费者不需安装 `pactl` 或 ffmpeg 命令行。
 
 ## 9. 人通道輸入與剪貼板
@@ -396,6 +401,7 @@ toggle-human（人通道只許在此關閉，重開走 /channels，與舊
 **整頁幀需求**。WebSocket JPEG、RTC 視訊與 HLS 播放各自登記需求。第一個需求到達時，
 邊緣先訂閱 CDP 事件，再開啟當前分頁的 screencast。最後一個需求釋放時停止採集並清空幀槽。
 靜態頁缺少即時首幀時，邊緣補取 JPEG 並核對分頁、文件與視口後交付。
+幀泵由管理任務獨立看護：運行中每秒檢查任務是否已退出，啟動失敗按 500ms 起翻倍、30s 封頂退避重試，不必等需求變化才重啟。
 WebSocket 透傳原始 JPEG（8 字節頭 + JPEG）。只有編碼或貼圖需要 RGB 時才解碼，奇數邊裁至偶數。
 
 **幀分類（2026-11-20 補）**：screencast 在視頻播放頁會
@@ -628,7 +634,8 @@ URL 超過約 1.5MB 的 canvas 不捕獲。觀看端收到後把占位
 contentDocument 整棵放進節點的 `f` 字段（跨源讀不到、
 只有佔位）；每個同源內嵌文檔挂 MutationObserver，內部
 突變（1.5s 節流）與 iframe 導航都觸發整頁重同步，表單
-值走共享 id 註冊表的 val 旁路；嵌套深度上限 4。觀看端
+值走共享 id 註冊表的 val 旁路；嵌套深度上限 4。iframe 元素被移除時（不保證觸發 load）
+在 `dropSubtree` 裡解除對其文檔的監視，避免長開 SPA 反覆增刪 iframe 後監視表只增不減。觀看端
 建節點時不帶 src/srcdoc（不許鏡像真去加載源頁面），把
 `f` 樹建成該 iframe 自身文檔的根。邊界：DOM 模式的
 輸入轉發不進 iframe 內部（事件不跨文檔），iframe 內
