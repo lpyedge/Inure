@@ -32,6 +32,7 @@
 | [PERCEPTION.md](PERCEPTION.md) | 感知层设计：语义来源、`Observation`/`Action` 契约、动作校验、操作与呈现解耦 | 详细设计，持续维护 |
 | [PITFALLS.md](PITFALLS.md) | 常见故障的症状、根因、解法及探针方法 | 踩坑手册 |
 | [EVAL.md](EVAL.md) | 感知层评估方法与决策门 | 方法文档 |
+| [`eval/bench/`](../eval/bench/README.md) | 难题页评测台：RIG 对 agent-browser 的真实模型对照（页面、判分、包装器、批量运行与汇总脚本） | 可运行的评测工具 |
 | [SECURITY_DESIGN_2026-11-19.md](SECURITY_DESIGN_2026-11-19.md) | 快照会话隔离等安全整改设计 | 设计记录 |
 | [HARDENING_PLAN_2026-11-22.md](HARDENING_PLAN_2026-11-22.md) | 2026-11-22 安全整改计划与完成状态（认证重做、Upload 限目录等） | 整改记录 |
 | [DOM_SPIKE_2026-11-19.md](DOM_SPIKE_2026-11-19.md)、`EVAL_REPORT_*`、`P0_*`、`P1_*` | 当时的实测证据与结论 | **只读历史，不改写**（`CLAUDE.md`） |

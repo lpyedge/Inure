@@ -453,3 +453,8 @@
 - **进程级环境变量的单测必须串行**：`media::tests` 里两个测试改 `RIG_HLS_SINGLE`，并行会互踩，表现为偶发 `failed to create the muxer: No such file or directory`。用测试锁串行化。
 - **删除 iframe 不保证触发 `load`**：DOM 镜像按 Document 强引用监视同源 iframe，只在 `load` 或 `stop` 时解除；SPA 反复增删 iframe 会让监视表只增不减。在 `dropSubtree` 里解除，并暴露 `__rigDom.watchedCount()` 供测试读取。回归测试 `edge_dom_mirror_releases_watchers_of_removed_iframes`（修复前残留 30/30）。
 - **只忽略错误的 `let _ = ...write_interleaved(...)` 会让管线“宣称运行中却不出片”**：磁盘满或目录失效时写包持续失败。现在连续失败 30 次就放弃管线并经 `/health` 报告原因，下一次播放列表请求重启。
+- **元素 id 映射只增不减**：`IdMap` 只在会话消失时清理，页面里节点反复增删（含无障碍树生成的、每帧都换键的容器节点）会让映射一直涨。现在按采集轮次打戳，节点连续 8 轮没出现就回收；id 只增不复用，所以回收后同一节点再出现只会得到新 id，旧 id 的动作照旧被拒。别在“没出现”的判断里混进失败的采集轮次（失败不清扫）。
+- **refresh 票据集合无上限**：重复登录只增不减，单人工具里也不该无限涨。现在同时有效最多 32 张、超出时最早签发的作废；“无时限、用一次轮换一次”的机制不变。
+- **DOM 镜像的敏感判定比 AI 通道窄**：镜像只认 `type=password`，银行卡与一次性验证码字段（`autocomplete=cc-*` / `one-time-code`）的值会进镜像。两条通道现在用同一口径；两边都靠页面标注，没标注的字段谁也认不出来。
+- **自定义下拉的选项在 `layout=blocks` 里看不到**：blocks 只给原生 combobox 列选项；ARIA 的 listbox 选项要点击操作却没有 id。现在 listbox 的选项连同 id 一起列出。
+

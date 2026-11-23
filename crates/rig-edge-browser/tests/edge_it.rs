@@ -1293,6 +1293,84 @@ async fn edge_dom_mirror_does_not_carry_password_values() {
     }
 }
 
+const DOM_SENSITIVE_HTML: &str = r#"<!DOCTYPE html><html lang="zh"><head><meta charset="utf-8"><title>DOM 敏感字段探针</title></head>
+<body><input id="plain" type="text" value="PLAIN-OK">
+<input id="cc" type="text" autocomplete="cc-number" value="4111-CARD-SYNTH">
+<input id="otp" type="text" autocomplete="one-time-code" value="OTP-SYNTH-1">
+<script>
+setTimeout(() => {
+  for (const [id, v] of [['cc', 'LATE-CARD-9'], ['otp', 'LATE-OTP-9']]) {
+    const e = document.getElementById(id);
+    e.value = v;
+    e.dispatchEvent(new Event('input', {bubbles: true}));
+  }
+}, 1200);
+</script></body></html>"#;
+
+/// DOM 镜像与 AI 通道用同一套敏感判定：不只 `type=password`，
+/// 银行卡（`autocomplete=cc-*`）与一次性验证码（`one-time-code`）的值同样不得进镜像
+/// （快照与后续 val 增量都不行）；普通输入框的值照常镜像（防假通过）。
+#[tokio::test]
+async fn edge_dom_mirror_does_not_carry_card_or_otp_values() {
+    if std::env::var("RIG_EDGE_IT").is_err() {
+        eprintln!("跳过：未设置 RIG_EDGE_IT");
+        return;
+    }
+    let _serial = SERIAL.lock().await;
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    serve(
+        listener,
+        vec![("/sens.html".into(), DOM_SENSITIVE_HTML.into())],
+    );
+    let edge_port = free_port();
+    let _edge = spawn_edge(&[
+        "--listen".into(),
+        format!("127.0.0.1:{edge_port}"),
+        "--url".into(),
+        format!("http://127.0.0.1:{port}/sens.html"),
+        "--human".into(),
+        "--width".into(),
+        "900".into(),
+        "--height".into(),
+        "700".into(),
+    ]);
+    wait_health(edge_port).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    use futures_util::SinkExt;
+    let (mut ws, _) = ws_connect(format!("ws://127.0.0.1:{edge_port}/ws"))
+        .await
+        .expect("人通道 WS 应可连接");
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        json!({"type": "dom-start"}).to_string().into(),
+    ))
+    .await
+    .unwrap();
+    let mut all = String::new();
+    let deadline = Instant::now() + Duration::from_secs(4);
+    while Instant::now() < deadline {
+        if let Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Text(t)))) =
+            tokio::time::timeout(Duration::from_millis(500), ws.next()).await
+        {
+            all.push_str(&t);
+        }
+    }
+    assert!(all.contains("dom-snapshot"), "应收到 DOM 快照");
+    assert!(all.contains("PLAIN-OK"), "普通输入框的值应照常镜像");
+    for secret in [
+        "4111-CARD-SYNTH",
+        "OTP-SYNTH-1",
+        "LATE-CARD-9",
+        "LATE-OTP-9",
+    ] {
+        assert!(
+            !all.contains(secret),
+            "DOM 镜像不得携带敏感字段的值 {secret}"
+        );
+    }
+}
+
 const DOM_BIG_CANVAS_HTML: &str = r#"<!DOCTYPE html><html><head><meta charset="utf-8"><title>Big canvas</title></head>
 <body style="margin:0;background:#000">
 <canvas id="game" width="1280" height="400"></canvas>

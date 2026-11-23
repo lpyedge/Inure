@@ -1,0 +1,14 @@
+<!doctype html><meta charset="utf-8"><title>Settings</title><body style="font:14px sans-serif">
+<label>Region <select id="r"><option>East</option><option>West</option><option>North</option></select></label><br>
+<label><input type="checkbox" id="u"> Send updates</label><br><label>Note <input id="n" type="text"></label><br>
+<button id="sv">Save settings</button><p id="o"></p>
+<script>
+const arm = new URLSearchParams(parent.location.search).get('arm') || 'x';
+document.getElementById('sv').onclick = async () => {
+  const r = document.getElementById('r'), u = document.getElementById('u'), n = document.getElementById('n');
+  fetch('/event?arm=' + encodeURIComponent(arm) + '&v=' + encodeURIComponent('settings:' + r.value + '|' + u.checked + '|' + n.value), {method: 'POST'});
+  const res = await fetch('/code?arm=' + encodeURIComponent(arm));
+  const j = await res.json();
+  document.getElementById('o').textContent = 'Confirmation code: ' + j.code;
+};
+</script>

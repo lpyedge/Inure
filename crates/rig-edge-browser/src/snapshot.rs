@@ -17,22 +17,62 @@ use crate::cdp::CdpResult;
 /// 节点键：有 DOM 对应物的用 "b{backendNodeId}"（跨帧稳定）；
 /// 无障碍树生成的容器节点没有 backendNodeId，用 "n{nodeId}"（仅帧内有效，
 /// 这类节点多为待剪枝的壳，不可动作）。
+///
+/// 映射按“最近一次在哪一轮采集里出现”打戳：节点从页面里消失后，
+/// 超过 `IDMAP_KEEP_PASSES` 轮没再出现就清掉（长时间动态页面不会让映射无限增长）。
+/// id 只增不复用，所以清掉之后同一个节点再出现只会得到新 id，绝不会和别的元素撞号；
+/// 旧 id 的动作照旧被拒（帧里查不到）。
 #[derive(Default)]
 pub struct IdMap {
-    map: HashMap<String, HashMap<String, String>>,
+    map: HashMap<String, HashMap<String, IdEntry>>,
     next: u64,
+    pass: u64,
 }
+
+struct IdEntry {
+    id: String,
+    last_seen: u64,
+}
+
+/// 节点连续这么多轮采集没出现就从映射里回收。
+const IDMAP_KEEP_PASSES: u64 = 8;
 
 impl IdMap {
     pub fn id_for(&mut self, session: &str, key: &str) -> String {
+        let pass = self.pass;
         let session_map = self.map.entry(session.to_string()).or_default();
-        if let Some(id) = session_map.get(key) {
-            return id.clone();
+        if let Some(entry) = session_map.get_mut(key) {
+            entry.last_seen = pass;
+            return entry.id.clone();
         }
         self.next += 1;
         let id = format!("e{}", self.next);
-        session_map.insert(key.to_string(), id.clone());
+        session_map.insert(
+            key.to_string(),
+            IdEntry {
+                id: id.clone(),
+                last_seen: pass,
+            },
+        );
         id
+    }
+
+    /// 一轮采集开始。
+    fn begin_pass(&mut self) {
+        self.pass += 1;
+    }
+
+    /// 一轮采集成功结束：回收长时间没出现的节点。
+    fn sweep(&mut self) {
+        let pass = self.pass;
+        for session_map in self.map.values_mut() {
+            session_map.retain(|_, entry| entry.last_seen + IDMAP_KEEP_PASSES >= pass);
+        }
+    }
+
+    #[cfg(test)]
+    fn entries(&self) -> usize {
+        self.map.values().map(HashMap::len).sum()
     }
 
     fn retain_sessions(&mut self, mut is_attached: impl FnMut(&str) -> bool) {
@@ -221,6 +261,7 @@ pub async fn build_observation(
     let session_ids: Vec<String> = {
         let map = browser.sessions.lock().await;
         ids.retain_sessions(|session| map.contains_key(session));
+        ids.begin_pass();
         let scope = frame_scope(&map, main);
         map.iter()
             .filter(|(sid, info)| {
@@ -446,6 +487,7 @@ pub async fn build_observation(
         }
     }
 
+    ids.sweep();
     let mut obs = Observation::new(frame_id, ObservationSource::Cdp, space);
     obs.elements = top;
     scrub(&mut obs.elements);
@@ -810,7 +852,14 @@ fn blocks_label(e: &Element) -> String {
     s.push_str(&format!(" [{}]", blocks_tag(e)));
     if e.role == "combobox" {
         let mut opts = Vec::new();
-        collect_options(e, &mut opts);
+        collect_options(e, &mut opts, false);
+        if !opts.is_empty() {
+            s.push_str(&format!(" {{{}}}", opts.join(", ")));
+        }
+    } else if e.role == "listbox" {
+        // 自定义下拉的选项靠点击操作，必须带 id
+        let mut opts = Vec::new();
+        collect_options(e, &mut opts, true);
         if !opts.is_empty() {
             s.push_str(&format!(" {{{}}}", opts.join(", ")));
         }
@@ -818,16 +867,19 @@ fn blocks_label(e: &Element) -> String {
     s.trim_start().to_string()
 }
 
-fn collect_options(e: &Element, out: &mut Vec<String>) {
+fn collect_options(e: &Element, out: &mut Vec<String>, with_id: bool) {
     for c in &e.children {
         if c.role == "option" {
             let mut o = blocks_text(c.name.as_deref().unwrap_or(""));
             if c.has(ElementState::Selected) {
                 o.push('*');
             }
+            if with_id {
+                o.push_str(&format!(" [{}]", c.id));
+            }
             out.push(o);
         }
-        collect_options(c, out);
+        collect_options(c, out, with_id);
     }
 }
 
@@ -1277,6 +1329,35 @@ mod tests {
         assert_eq!(text, expected);
     }
 
+    /// 自定义 combobox 的下拉（role=listbox）选项要列出来，并带 id：
+    /// 这些选项要靠点击而不是 `select`，没有 id 就没法操作。
+    #[test]
+    fn blocks_layout_lists_custom_listbox_options_with_ids() {
+        let mut chosen = node("e21", "option", "Travel - Local", vec![]);
+        chosen.states = vec![ElementState::Selected];
+        let obs = doc(vec![node(
+            "e1",
+            "document",
+            "",
+            vec![
+                node("e20", "combobox", "Category", vec![]),
+                node(
+                    "e30",
+                    "listbox",
+                    "Categories",
+                    vec![node("e31", "option", "Travel [e999]", vec![]), chosen],
+                ),
+            ],
+        )]);
+        let text = render_blocks(&obs);
+        assert!(
+            text.contains(
+                "Categories [e30 listbox] {Travel \\[e999\\] [e31], Travel - Local* [e21]}"
+            ),
+            "{text}"
+        );
+    }
+
     #[test]
     fn blocks_layout_neutralizes_page_text_that_forges_structure() {
         let obs = doc(vec![node(
@@ -1491,6 +1572,41 @@ mod tests {
         assert!(top[0].value.is_none());
         assert!(top[0].name.is_none());
         assert!(top[0].children.is_empty());
+    }
+
+    #[test]
+    fn id_map_reclaims_nodes_that_stayed_gone_but_never_reuses_ids() {
+        let mut m = IdMap::default();
+        m.begin_pass();
+        let kept = m.id_for("s1", "b1");
+        let gone = m.id_for("s1", "b2");
+        m.sweep();
+        // 之后每一轮都只看到 b1；b2 从页面消失
+        for _ in 0..IDMAP_KEEP_PASSES + 3 {
+            m.begin_pass();
+            assert_eq!(m.id_for("s1", "b1"), kept, "一直在的节点 id 必须稳定");
+            m.sweep();
+        }
+        assert_eq!(m.entries(), 1, "长时间没出现的节点应被回收");
+        // 它再出现：得到新 id，不能复用旧号，也不能和 b1 撞号
+        m.begin_pass();
+        let back = m.id_for("s1", "b2");
+        assert_ne!(back, gone);
+        assert_ne!(back, kept);
+    }
+
+    #[test]
+    fn id_map_keeps_nodes_that_were_only_briefly_absent() {
+        let mut m = IdMap::default();
+        m.begin_pass();
+        let id = m.id_for("s1", "b7");
+        m.sweep();
+        for _ in 0..IDMAP_KEEP_PASSES {
+            m.begin_pass();
+            m.sweep();
+        }
+        m.begin_pass();
+        assert_eq!(m.id_for("s1", "b7"), id, "短暂缺席不应换 id");
     }
 
     #[test]

@@ -8,3 +8,15 @@ __pycache__/
 *.pyc
 .pytest_cache/
 .temp/
+
+# eval/bench 运行产物（评测台的数据、日志、浏览器 profile 都在这里生成）
+eval/bench/eps/
+eval/bench/events/
+eval/bench/logs/
+eval/bench/prompts/
+eval/bench/expected/
+eval/bench/profiles/
+eval/bench/site/data/
+eval/bench/pids_*.json
+eval/bench/server.pid
+eval/bench/report_*.json

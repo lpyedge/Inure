@@ -15,11 +15,14 @@ if ! command -v chromium >/dev/null 2>&1 && ! command -v chrome >/dev/null 2>&1 
   echo "warning: no Chromium on PATH and RIG_EDGE_TEST_CHROMIUM_DIR is unset; the browser integration tests will fail" >&2
 fi
 
-step "1/3 cargo fmt --all --check"
+step "1/4 docs/code consistency (scripts/check-docs.sh)"
+scripts/check-docs.sh
+
+step "2/4 cargo fmt --all --check"
 cargo fmt --all --check
 
-step "2/3 cargo clippy --all-targets -- -D warnings"
+step "3/4 cargo clippy --all-targets -- -D warnings"
 cargo clippy --all-targets -- -D warnings
 
-step "3/3 Rust tests (including Chromium integration) and Python self-tests"
+step "4/4 Rust tests (including Chromium integration) and Python self-tests"
 scripts/test.sh all

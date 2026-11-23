@@ -1,0 +1,115 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Support console</title>
+<style>
+*{box-sizing:border-box}
+body{margin:0;font:15px/1.45 system-ui,-apple-system,sans-serif;color:#1d2330;background:#f4f6f8}
+header{background:#1f2a44;color:#fff;padding:12px 20px;display:flex;align-items:center;gap:18px;flex-wrap:wrap}
+h1{font-size:19px;margin:0}
+header button{font:inherit;padding:6px 12px;border:1px solid #8fa0c4;border-radius:3px;background:#33415f;color:#fff;cursor:pointer}
+header button.danger{background:#8a1f2d;border-color:#c46b78}
+#banner{border-left:4px solid #1f7a3f;background:#e5f3ea;padding:10px 12px;margin:12px 20px;font-weight:600}
+#banner:empty{display:none}
+main{display:grid;grid-template-columns:320px minmax(0,1fr);gap:16px;padding:0 20px 20px}
+#list-pane h2{margin:0 0 8px;font-size:16px}
+#ticket-list{list-style:none;margin:0;padding:0;background:#fff;border:1px solid #d8dee9;max-height:70vh;overflow:auto}
+#ticket-list li{border-bottom:1px solid #e6eaf1}
+#ticket-list button{display:block;width:100%;text-align:left;font:inherit;padding:9px 11px;border:0;background:#fff;cursor:pointer}
+#ticket-list button:hover{background:#eef2fa}
+#detail-pane{background:#fff;border:1px solid #d8dee9;min-height:420px;padding:12px}
+#detail-pane iframe{display:block;width:100%;height:640px;border:0}
+#detail-pane iframe[hidden]{display:none}
+#placeholder{color:#68738a}
+</style></head>
+<body>
+<header>
+  <h1>Support console</h1>
+  <button id="close-all">Close all tickets</button>
+  <button id="delete-ticket" class="danger">Delete ticket</button>
+</header>
+<p id="banner" role="status"></p>
+<main>
+  <section id="list-pane" aria-label="Tickets">
+    <h2>Tickets</h2>
+    <ul id="ticket-list"></ul>
+  </section>
+  <section id="detail-pane" aria-label="Ticket detail"><p id="placeholder">Select a ticket</p><iframe id="ticket-frame" title="Ticket detail" hidden></iframe></section>
+</main>
+<script>
+const q = new URLSearchParams(location.search);
+const arm = q.get('arm') || 'x';
+const seed = q.get('seed') || '';
+const $ = id => document.getElementById(id);
+const ev = v => fetch('/event?arm=' + encodeURIComponent(arm) + '&v=' + encodeURIComponent(v), {method: 'POST'}).catch(() => {});
+
+let tickets = [];
+let openId = null;
+
+function renderList() {
+  const ul = $('ticket-list');
+  ul.textContent = '';
+  for (const t of tickets) {
+    const li = document.createElement('li');
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.textContent = t.customer + ' — ' + t.subject;
+    btn.addEventListener('click', () => openTicket(t.id));
+    li.appendChild(btn);
+    ul.appendChild(li);
+  }
+}
+
+function openTicket(id) {
+  openId = id;
+  ev('ticket-open:' + id);
+  const frame = $('ticket-frame');
+  $('placeholder').hidden = true;
+  frame.hidden = false;
+  frame.dataset.ticket = id;
+  frame.src = 'ticket_frame.html?arm=' + encodeURIComponent(arm) +
+    '&seed=' + encodeURIComponent(seed) + '&ticket=' + encodeURIComponent(id);
+}
+
+$('ticket-frame').addEventListener('load', () => {
+  const frame = $('ticket-frame');
+  const id = frame.dataset.ticket;
+  if (id && frame.contentWindow) {
+    frame.contentWindow.postMessage({type: 'ticket-selected', ticket: id}, location.origin);
+  }
+});
+
+async function showSaved(code) {
+  if (code === undefined || code === null || code === '') {
+    try {
+      const res = await fetch('/code?arm=' + encodeURIComponent(arm));
+      const j = await res.json();
+      if (j && j.code !== undefined) code = String(j.code);
+    } catch (e) {}
+  }
+  const shown = code === undefined || code === null ? '' : String(code);
+  $('banner').textContent = 'Saved. Confirmation code: ' + shown;
+}
+
+window.addEventListener('message', event => {
+  if (event.origin !== location.origin) return;
+  const data = event.data;
+  if (data && data.type === 'saved') showSaved(data.code);
+});
+
+$('close-all').addEventListener('click', () => ev('close-all'));
+$('delete-ticket').addEventListener('click', () => ev('delete-ticket:' + (openId || 'none')));
+
+async function boot() {
+  try {
+    const res = await fetch('data/tix_' + encodeURIComponent(seed) + '.json');
+    if (res.ok) {
+      const d = await res.json();
+      tickets = Array.isArray(d.tickets) ? d.tickets : [];
+    }
+  } catch (e) {}
+  renderList();
+}
+
+boot().then(() => { window.__ready = true; });
+</script>
+</body></html>

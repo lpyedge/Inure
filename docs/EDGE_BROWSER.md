@@ -528,7 +528,7 @@ offer 同時攜帶 host 與 srflx 候選；全 ICE 與真瀏覽器連通
 
 ### 9.2 DOM 鏡像通道（Phase 2 原型，LIU 2026-11-19 立項；已實現）
 
-> **密碼值不進鏡像**（2026-11-22）：序列化器對 `type=password` 的輸入框不發 `value` 屬性與值；`val` 增量與 `value` 屬性變化同樣不帶，非空時僅發定長佔位（不洩露長度）。測試 `edge_dom_mirror_does_not_carry_password_values`。
+> **敏感值不進鏡像**（2026-11-22 起；2026-11-24 與 AI 通道對齊）：序列化器對 `type=password`、以及 `autocomplete` 含 `cc-*` 或 `one-time-code` 的字段不發 `value` 屬性與值；`val` 增量與 `value` 屬性變化同樣不帶，非空時僅發定長佔位（不洩露長度）。測試 `edge_dom_mirror_does_not_carry_password_values`、`edge_dom_mirror_does_not_carry_card_or_otp_values`。
 
 Spike 數據（`docs/DOM_SPIKE_2026-11-19.md`）支持人通道改
 混合分層：普通頁面走 DOM 鏡像、頁內媒體區域走視頻子流、

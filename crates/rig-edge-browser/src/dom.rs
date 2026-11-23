@@ -38,9 +38,20 @@ const SCRIPT: &str = r##"(() => {
   // 镜像文档的源是观看页，相对/根相对路径若留到镜像端解析会落到
   // 观看端源上（实测 YouTube 的 /s/player/*.css 被请求到边缘地址
   // 吃 401）。data:/blob:/# 等非网络引用原样保留。
-  // 密码框的值永不进镜像（快照、val 增量、value 属性变化都不带）；
+  // 敏感字段（密码、银行卡、一次性验证码）的值永不进镜像（快照、val 增量、value 属性变化都不带）；
   // 非空时只发定长占位，不泄露真实长度
-  function isPw(n) { return n && n.tagName === 'INPUT' && String(n.type).toLowerCase() === 'password'; }
+  // 敏感判定与 AI 通道（snapshot.rs::sensitive_state）同一口径：password 输入框，
+  // 以及 autocomplete 含 cc-*（银行卡）或 one-time-code（一次性验证码）的字段。
+  function isPw(n) {
+    if (!n || n.nodeType !== 1) return false;
+    const t = n.tagName;
+    if (t === 'INPUT' && String(n.type).toLowerCase() === 'password') return true;
+    if (t === 'INPUT' || t === 'TEXTAREA' || t === 'SELECT') {
+      const ac = String(n.getAttribute('autocomplete') || '').toLowerCase();
+      return ac.includes('cc-') || ac.includes('one-time-code');
+    }
+    return false;
+  }
   function pwMask(v) { return v ? '\u2022\u2022\u2022\u2022\u2022\u2022' : ''; }
   function absUrl(v) {
     if (!v || /^(data:|blob:|javascript:|mailto:|tel:|#)/i.test(v)) return v;

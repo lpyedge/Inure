@@ -8,11 +8,15 @@
 //! - `stream_key`：HLS 的 `<video src>` 无法带请求头，媒体路径用这把
 //!   只读、仅限 /stream 的随机钥匙；认证过的 viewer 才拿得到。
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 const ACCESS_TTL: Duration = Duration::from_secs(15 * 60);
+
+/// 同时有效的 refresh 票据上限（单人受信工具，几个标签页/设备足够）。
+/// 超出时最早签发的那张作废，不改变“无时限、用一次轮换一次”的续期机制。
+const MAX_ACTIVE_REFRESH: usize = 32;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TokenPair {
@@ -31,7 +35,8 @@ pub struct Auth {
 #[derive(Default)]
 struct State {
     access: HashMap<String, Instant>,
-    refresh: HashSet<String>,
+    /// 按签发先后排列，队首最早。
+    refresh: VecDeque<String>,
 }
 
 fn random_token() -> String {
@@ -82,7 +87,10 @@ impl Auth {
         let now = Instant::now();
         st.access.retain(|_, exp| *exp > now);
         st.access.insert(pair.access.clone(), now + self.access_ttl);
-        st.refresh.insert(pair.refresh.clone());
+        while st.refresh.len() >= MAX_ACTIVE_REFRESH {
+            st.refresh.pop_front();
+        }
+        st.refresh.push_back(pair.refresh.clone());
         pair
     }
 
@@ -99,9 +107,8 @@ impl Auth {
     /// 真假双方必有一方失效而可被察觉
     pub fn refresh(&self, refresh: &str) -> Option<TokenPair> {
         let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        if !st.refresh.remove(refresh) {
-            return None;
-        }
+        let pos = st.refresh.iter().position(|r| ct_eq(r, refresh))?;
+        st.refresh.remove(pos);
         Some(self.issue(&mut st))
     }
 
@@ -144,6 +151,22 @@ mod tests {
             "新 refresh 可继续续期（无时限）"
         );
         assert!(a.refresh("garbage").is_none());
+    }
+
+    #[test]
+    fn active_refresh_tokens_are_bounded_and_oldest_is_evicted() {
+        let a = Auth::new("m".into());
+        let first = a.login("m").unwrap();
+        let mut last = first.clone();
+        for _ in 0..MAX_ACTIVE_REFRESH + 4 {
+            last = a.login("m").unwrap();
+        }
+        assert!(
+            a.state.lock().unwrap().refresh.len() <= MAX_ACTIVE_REFRESH,
+            "活动 refresh 数量必须有上限"
+        );
+        assert!(a.refresh(&first.refresh).is_none(), "最早的 refresh 被挤掉");
+        assert!(a.refresh(&last.refresh).is_some(), "最近的 refresh 仍有效");
     }
 
     #[test]

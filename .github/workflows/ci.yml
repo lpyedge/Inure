@@ -25,6 +25,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libavcodec-dev libavformat-dev libavutil-dev libswscale-dev libavdevice-dev pkg-config libclang-dev clang cmake
       - uses: Swatinem/rust-cache@v2
+      - name: 文档与代码一致性（脚本引用、命令行参数）
+        run: bash scripts/check-docs.sh
       - name: fmt
         run: cargo fmt --all --check
       - name: clippy
