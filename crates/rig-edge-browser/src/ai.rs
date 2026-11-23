@@ -761,10 +761,17 @@ impl AiChannel {
             return (result, Ok(None));
         }
         let prior = self.presented.lock().await;
+        // 沿用客户端最近用的视图（模式、排版、预算）：即使请求帧号已对不上最近交付的帧，
+        // 也不退回默认的结构化整树；对不上时去掉 subtree（该元素可能已不存在）。
         let mut req = prior
             .as_ref()
-            .filter(|prior| prior.frame.obs.frame_id == req_frame)
-            .map(|prior| prior.request.clone())
+            .map(|prior| {
+                let mut r = prior.request.clone();
+                if prior.frame.obs.frame_id != req_frame {
+                    r.subtree = None;
+                }
+                r
+            })
             .unwrap_or_default();
         drop(prior);
         if req.mode == ObserveMode::TreeImage {
@@ -2604,6 +2611,48 @@ mod tests {
         match ch.act(click_point(0, 10.0, 10.0)).await {
             ActionResult::Rejected { .. } => {}
             other => panic!("CDP 不可用时动作应干净拒绝，实际: {other:?}"),
+        }
+    }
+
+    /// 请求帧号对不上最近交付的观察（批量里前一步已让页面变化、或帧已被替换）时，
+    /// 被拒回包仍沿用客户端最近用的视图（文本 + 排版），而不是退回默认的结构化整树
+    /// （长页面一次可达上万 token，见 2026-11-23 难题基准）。
+    #[tokio::test]
+    async fn rejected_unknown_frame_reuses_last_presented_view() {
+        let (_browser, ch) = attach_fake(usize::MAX).await;
+        let req = ObserveRequest {
+            mode: ObserveMode::Text,
+            layout: TextLayout::Blocks,
+            ..ObserveRequest::default()
+        };
+        let ObserveOut::Text(first) = ch.observe_req(&req).await.expect("首帧文本观察")
+        else {
+            panic!("text 模式应回文本");
+        };
+        let f1: u64 = first
+            .lines()
+            .next()
+            .and_then(|l| l.split_whitespace().nth(2))
+            .and_then(|n| n.parse().ok())
+            .expect("首行 # frame N");
+        let (r, fresh) = ch.act_with_fresh(click_point(f1 + 100, 10.0, 10.0)).await;
+        assert!(
+            matches!(
+                r,
+                ActionResult::Rejected {
+                    reason: RejectReason::StaleFrame { .. }
+                }
+            ),
+            "实际: {r:?}"
+        );
+        match fresh.unwrap().expect("陈旧拒绝应附最新状态") {
+            ObserveOut::Text(text) => assert!(
+                !text.contains("\n  - "),
+                "应沿用 blocks 排版而不是缩进树: {text}"
+            ),
+            ObserveOut::Full(..) | ObserveOut::Delta(..) => {
+                panic!("客户端一直用 text，拒绝回包不应退回结构化整树")
+            }
         }
     }
 
