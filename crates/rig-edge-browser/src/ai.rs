@@ -866,29 +866,9 @@ impl AiChannel {
                 Ok(None),
             );
         }
-        // 批量代次：接管后整批永久停止，后续观察解闩也不复活剩余步骤
-        let Some(batch_h) = self.exec.begin_act().await else {
-            return (
-                BatchActionResult {
-                    results: vec![ActionResult::Aborted {
-                        reason: AbortReason::UserTakeover,
-                    }],
-                    skipped: total - 1,
-                },
-                Ok(None),
-            );
-        };
         let mut results = Vec::with_capacity(total);
         let mut fresh = Ok(None);
         for (i, action) in req.actions.into_iter().enumerate() {
-            // 步骤间检查接管：已取消则不再执行剩余步骤
-            if i > 0 && self.exec.aborted(&batch_h).await {
-                results.push(ActionResult::Aborted {
-                    reason: AbortReason::UserTakeover,
-                });
-                fresh = Ok(None);
-                break;
-            }
             let step = ActionRequest {
                 request_id: format!("{}/{i}", req.request_id),
                 frame_id: req.frame_id,
@@ -903,8 +883,6 @@ impl AiChannel {
                 break;
             }
         }
-        // 批量句柄归还：在途计数清零，与单步句柄互不干扰
-        self.exec.end(batch_h).await;
         let skipped = total - results.len();
         // 全部 Done 才按需附文本；被拒/中断沿用上面的“附最新状态”。
         if skipped == 0
