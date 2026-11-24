@@ -2493,6 +2493,8 @@ mod tests {
         hit_backend: std::sync::atomic::AtomicI64,
         hit_after_scroll: std::sync::atomic::AtomicI64,
         dom_failure_session: std::sync::Mutex<Option<&'static str>>,
+        // 接管注入钩子：指定方法第 N 次应答决定后、回帧前触发接管（默认 None，保持旧测试行为）
+        abort_after: std::sync::Mutex<Option<(String, usize, Arc<ExecControl>)>>,
     }
 
     impl FakeCdp {
@@ -2662,6 +2664,7 @@ mod tests {
             hit_backend: std::sync::atomic::AtomicI64::new(7),
             hit_after_scroll: std::sync::atomic::AtomicI64::new(0),
             dom_failure_session: std::sync::Mutex::new(None),
+            abort_after: std::sync::Mutex::new(None),
         });
         // WS 端
         let ws_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2705,6 +2708,35 @@ mod tests {
                             method,
                             v.get("sessionId").and_then(serde_json::Value::as_str),
                         );
+                        // 确定性接管注入：该方法的第 N 次应答已决定、回帧发送前同步接管
+                        let abort = {
+                            let guard = fake.abort_after.lock().unwrap();
+                            match guard.as_ref() {
+                                Some((name, nth, ctl)) if method == name.as_str() => {
+                                    let count = fake
+                                        .commands
+                                        .lock()
+                                        .unwrap()
+                                        .iter()
+                                        .filter(|c| *c == name)
+                                        .count();
+                                    if count == *nth {
+                                        Some(ctl.clone())
+                                    } else {
+                                        None
+                                    }
+                                }
+                                _ => None,
+                            }
+                        };
+                        if let Some(ctl) = abort {
+                            ctl.request_abort().await;
+                            // 模拟接管后另一个并发 observe 成功完成并解除闩锁：
+                            // 只靠闩锁挡不住批量继续，必须靠批量代次
+                            let oh = ctl.begin_observe().await;
+                            ctl.note_observed(&oh).await;
+                            ctl.end(oh).await;
+                        }
                         let resp = if is_err {
                             serde_json::json!({"id": id, "error": {"message": "injected failure"}})
                         } else {
@@ -3341,5 +3373,42 @@ mod tests {
         let frame = state.as_ref().unwrap();
         assert_eq!(frame.context.loader, "L2");
         assert_eq!(frame.obs.frame_id, obs.frame_id);
+    }
+
+    /// 接管落在全选与写入之间时替换输入必须中断且不发写入。
+    /// 通过的生产行：执行 Type 分支全选后、写入前的中断检查。
+    #[tokio::test]
+    async fn type_replace_stops_when_takeover_lands_between_select_all_and_insert() {
+        let (base, fake) = spawn_fake_cdp(usize::MAX, false, None).await;
+        let browser = Browser::attach(&base).await.expect("假 CDP 应能 attach");
+        let exec = Arc::new(ExecControl::default());
+        let ch = AiChannel::new(browser, vec![], exec.clone());
+        let (obs, _) = ch.observe().await.expect("首帧观察应建成");
+        // 全选是两次按键事件（按下/抬起），第 2 次即 Control+A 的抬起；
+        // 钩子在该次应答决定后、回帧前同步接管，写入前的检查必见已取消。
+        *fake.abort_after.lock().unwrap() =
+            Some(("Input.dispatchKeyEvent".to_string(), 2, exec.clone()));
+        let req = ActionRequest {
+            request_id: "takeover-type".to_string(),
+            frame_id: obs.frame_id,
+            lease: None,
+            action: Action::Type {
+                target: None,
+                text: "x".to_string(),
+                submit: false,
+                replace: true,
+            },
+        };
+        let result = ch.act(req).await;
+        assert!(
+            matches!(result, ActionResult::Aborted { .. }),
+            "全选后被接管应回 Aborted，实际: {result:?}"
+        );
+        let commands = fake.commands.lock().unwrap();
+        assert!(
+            !commands.iter().any(|m| m == "Input.insertText"),
+            "中断后不得发送写入，实际命令: {commands:?}"
+        );
+        // 通过的生产行：执行 Type 分支全选后、写入前的中断检查。
     }
 }
