@@ -7640,3 +7640,116 @@ async fn edge_set_checked_is_idempotent() {
     );
     let _ = (frame, id);
 }
+
+/// 并发续期单飞行回归：两次同时 401 只发一次刷新且不重载页面。
+#[tokio::test]
+async fn edge_viewer_auth_concurrent_renew_is_single_flight() {
+    if std::env::var("RIG_EDGE_IT").is_err() {
+        eprintln!("跳过：未设置 RIG_EDGE_IT");
+        return;
+    }
+    let _serial = SERIAL.lock().await;
+    // 桩脚本（在 auth.js 之前运行）：伪造会话与轮换逻辑并计数。
+    const STUB_JS: &str = r#"if (sessionStorage.getItem('reloaded')) { document.getElementById('r').textContent='RELOADED'; throw new Error('stop'); }
+var refreshCalls = 0;
+var validRefresh = 'r0';
+var n = 0;
+addEventListener('beforeunload', function() { try { sessionStorage.setItem('reloaded', '1'); } catch (e) {} });
+window.fetch = async function(url, opts) {
+  opts = opts || {};
+  var method = opts.method || 'GET';
+  if (url === '/session' && method === 'POST') {
+    return { ok: true, status: 200, json: async function() { return { access: 'a0', refresh: 'r0', stream_key: 'k', expires_in: 3600 }; } };
+  }
+  if (url === '/session/refresh' && method === 'POST') {
+    refreshCalls++;
+    await new Promise(function(r) { setTimeout(r, 20); });
+    var body = {};
+    try { body = JSON.parse(opts.body || '{}'); } catch (e) {}
+    if (body.refresh !== validRefresh) {
+      return { ok: false, status: 401, json: async function() { return {}; } };
+    }
+    n++;
+    validRefresh = 'r' + n;
+    var acc = 'a' + n;
+    var ref = validRefresh;
+    return { ok: true, status: 200, json: async function() { return { access: acc, refresh: ref, stream_key: 'k', expires_in: 3600 }; } };
+  }
+  var headers = opts.headers || {};
+  var auth = headers['Authorization'] || headers['authorization'];
+  if (auth === 'Bearer a1') {
+    return { ok: true, status: 200, json: async function() { return {}; } };
+  }
+  return { ok: false, status: 401, json: async function() { return {}; } };
+};"#;
+    // 驱动脚本（在 auth.js 之后运行）：登录后并发触发两次带票据请求。
+    const DRIVER_JS: &str = r#"(async function() {
+  var form = document.querySelector('#rigLogin form');
+  var input = document.querySelector('#rigLogin input');
+  input.value = 'tok';
+  form.dispatchEvent(new Event('submit', { cancelable: true }));
+  await new Promise(function(r) { setTimeout(r, 100); });
+  await Promise.all([window.__rigAuth.fetch('/x'), window.__rigAuth.fetch('/y')]);
+  document.getElementById('r').textContent = 'refreshCalls=' + refreshCalls + ' reloaded=' + (sessionStorage.getItem('reloaded') || 'no');
+})();"#;
+    //  harness 页面：桩脚本 + 真实 auth.js + 驱动脚本。
+    let renew_html = format!(
+        "<!DOCTYPE html><meta charset=utf-8><title>renew</title><body><p id=r>pending</p><script>{}</script><script>{}</script><script>{}</script></body>",
+        STUB_JS,
+        include_str!("../src/auth.js"),
+        DRIVER_JS
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    serve(listener, vec![("/renew.html".into(), renew_html)]);
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let edge_port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let _proc = EdgeProc(
+        edge_command()
+            .args([
+                "--listen",
+                &format!("127.0.0.1:{edge_port}"),
+                "--token",
+                TEST_TOKEN,
+                "--url",
+                &format!("http://127.0.0.1:{port}/renew.html"),
+                "--width",
+                "400",
+                "--height",
+                "300",
+            ])
+            .process_group(0)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("启动 rig-edge-browser"),
+    );
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Ok(mut s) = std::net::TcpStream::connect(("127.0.0.1", edge_port)) {
+            let _ = s.write_all(b"GET /health HTTP/1.0\r\n\r\n");
+            let mut b = String::new();
+            if s.read_to_string(&mut b).is_ok() && b.contains("\"ok\":true") {
+                break;
+            }
+        }
+        assert!(Instant::now() < deadline, "边缘程序未就绪");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+    // 轮询观察文本，最多约 10 秒，直到出现续期计数或重载标记。
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let text = loop {
+        let cur = observe(edge_port);
+        let t = cur["text"].as_str().unwrap_or("").to_string();
+        if t.contains("refreshCalls=") || t.contains("RELOADED") {
+            break t;
+        }
+        assert!(Instant::now() < deadline, "超时未见续期结果: {cur}");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    assert!(
+        text.contains("refreshCalls=1 reloaded=no"),
+        "并发续期应单飞行且无重载，实际: {text}"
+    );
+}
