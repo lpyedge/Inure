@@ -95,6 +95,12 @@ pub struct Browser {
 
 /// 仅在 Linux 读取实际 UID；无法读取时保留 Chromium 沙箱。
 #[cfg(target_os = "linux")]
+/// `RIG_CHROMIUM_NO_SANDBOX` 只有明确设为 `1` 才禁用沙箱：设成 `0`、空串或别的值都不算
+/// （这是安全开关，不能让“设了就生效”的直觉把沙箱关掉）。
+fn no_sandbox_requested(value: Option<&str>) -> bool {
+    value == Some("1")
+}
+
 fn running_as_root() -> bool {
     std::fs::read_to_string("/proc/self/status")
         .ok()
@@ -380,7 +386,9 @@ impl Browser {
         let mut argv: Vec<String> = vec!["--headless=new".to_string()];
         // 沙箱默认保留（GPT review R-05）：仅 root 运行（Chromium 在 root 下
         // 无法启用沙箱）或显式 RIG_CHROMIUM_NO_SANDBOX=1 时才禁用。
-        if running_as_root() || std::env::var("RIG_CHROMIUM_NO_SANDBOX").is_ok() {
+        if running_as_root()
+            || no_sandbox_requested(std::env::var("RIG_CHROMIUM_NO_SANDBOX").ok().as_deref())
+        {
             argv.push("--no-sandbox".to_string());
             argv.push("--disable-setuid-sandbox".to_string());
         }
@@ -1914,8 +1922,25 @@ fn collect_dom(node: &Value, map: &mut DomMap, frames: &mut Vec<LocalFrame>) {
 #[cfg(test)]
 mod chromium_lookup_tests {
     use super::{
-        chromium_in_dir, find_on_path, is_executable, path_chromium_names, resolve_chromium,
+        chromium_in_dir, find_on_path, is_executable, no_sandbox_requested, path_chromium_names,
+        resolve_chromium,
     };
+
+    /// 沙箱开关只认明确的 `1`：`0`、空串、`false` 等都不能把沙箱关掉。
+    #[test]
+    fn no_sandbox_switch_only_accepts_an_explicit_one() {
+        assert!(no_sandbox_requested(Some("1")));
+        for v in [
+            None,
+            Some(""),
+            Some("0"),
+            Some("false"),
+            Some("yes"),
+            Some(" 1"),
+        ] {
+            assert!(!no_sandbox_requested(v), "{v:?} 不应关闭沙箱");
+        }
+    }
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
