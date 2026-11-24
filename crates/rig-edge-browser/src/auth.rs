@@ -18,6 +18,10 @@ const ACCESS_TTL: Duration = Duration::from_secs(15 * 60);
 /// 超出时最早签发的那张作废，不改变“无时限、用一次轮换一次”的续期机制。
 const MAX_ACTIVE_REFRESH: usize = 32;
 
+/// 同时有效的 access 票据上限，避免长期运行堆积过多有效票据。
+/// 超出时最早过期的那张先被挤掉。
+const MAX_ACTIVE_ACCESS: usize = 64;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TokenPair {
     pub access: String,
@@ -86,6 +90,19 @@ impl Auth {
         };
         let now = Instant::now();
         st.access.retain(|_, exp| *exp > now);
+        // 达到上限时先挤掉最早过期的那张
+        while st.access.len() >= MAX_ACTIVE_ACCESS {
+            if let Some(oldest) = st
+                .access
+                .iter()
+                .min_by_key(|(_, exp)| **exp)
+                .map(|(k, _)| k.clone())
+            {
+                st.access.remove(&oldest);
+            } else {
+                break;
+            }
+        }
         st.access.insert(pair.access.clone(), now + self.access_ttl);
         while st.refresh.len() >= MAX_ACTIVE_REFRESH {
             st.refresh.pop_front();
@@ -167,6 +184,24 @@ mod tests {
         );
         assert!(a.refresh(&first.refresh).is_none(), "最早的 refresh 被挤掉");
         assert!(a.refresh(&last.refresh).is_some(), "最近的 refresh 仍有效");
+    }
+
+    #[test]
+    fn active_access_tokens_are_bounded_and_soonest_expiring_is_evicted() {
+        let a = Auth::with_ttl("m".into(), Duration::from_secs(3600));
+        let first = a.login("m").unwrap();
+        // 停一下让首张票据的过期时刻严格早于后续票据
+        std::thread::sleep(Duration::from_millis(2));
+        let mut last = first.clone();
+        for _ in 0..MAX_ACTIVE_ACCESS + 4 {
+            last = a.login("m").unwrap();
+        }
+        assert!(
+            a.state.lock().unwrap().access.len() <= MAX_ACTIVE_ACCESS,
+            "活动 access 数量必须有上限"
+        );
+        assert!(!a.check_access(&first.access), "最早过期的 access 被挤掉");
+        assert!(a.check_access(&last.access), "最近的 access 仍有效");
     }
 
     #[test]
