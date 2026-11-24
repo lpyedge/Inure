@@ -4,7 +4,8 @@
 #   2. rig-edge-browser 源码里的每个 --flag 都要在 docs/05 的参数表里出现；
 #   3. rig-edge-browser --help 的用法文本要列出全部源码参数（由集成测试保证，这里只查源码侧）；
 #   4. 文档里用反引号点名的 edge_* 集成测试必须在 tests/edge_it.rs 里真实存在；
-#   5. markdown 的相对链接指向的文件和锚点必须存在。
+#   5. markdown 的相对链接指向的文件和锚点必须存在；
+#   6. 当前文档里用反引号点名的 crates/ scripts/ eval/ docs/ 文件路径必须存在。
 # 用法：scripts/check-docs.sh    有问题时打印并以 1 退出。
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -66,6 +67,27 @@ for f in files:
             bad.append(f"{f}: {link} (anchor missing)")
 for b in bad:
     print("BROKEN LINK:", b)
+sys.exit(1 if bad else 0)
+PY
+
+echo "== 当前文档里用反引号点名的仓库文件路径是否存在（历史证据文档、plan/ 和已删除的 HANDOFF 不查）"
+python3 - <<'PY' || fail=1
+import glob, os, re, sys
+hist = re.compile(r"2026-11-1\d|EVAL_REPORT|P0_|P1_")
+pat = re.compile(r"`((?:crates|scripts|eval|docs|tests|\.github)/[A-Za-z0-9_./\-]+\.[A-Za-z0-9]+)`")
+files = glob.glob("docs/*.md") + ["README.md", "CLAUDE.md", "AGENTS.md", "eval/bench/README.md"]
+bad = set()
+for f in files:
+    if hist.search(f):
+        continue
+    for m in pat.finditer(open(f, encoding="utf-8").read()):
+        p = m.group(1).rstrip(".")
+        if "HANDOFF" in p:
+            continue
+        if not os.path.exists(p) and not glob.glob(p):
+            bad.add((f, p))
+for f, p in sorted(bad):
+    print(f"MISSING PATH: {f}: {p}")
 sys.exit(1 if bad else 0)
 PY
 

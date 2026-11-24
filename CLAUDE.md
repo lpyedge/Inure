@@ -32,7 +32,7 @@
 
 - 新增依赖前确认许可证为 MIT / Apache-2.0 / BSD 等宽松许可，并在 PR 中说明理由。
   AGPL、BSL 项目只读设计，不复制代码。
-- 错误处理：库代码 `thiserror`，二进制入口 `anyhow`。
+- 错误处理：没有统一的错误库，各 crate 沿用现有写法（`rig-eval` 用 `anyhow`，`rig-edge-browser` 用字符串错误，`rig-launcher` 用 `Box<dyn Error>`）；新增代码跟随所在 crate 的现有写法，数据路径上不要 `unwrap()`。引入 `thiserror` 或 `anyhow` 属于新增依赖，按上面的依赖规则先说明理由。
 - 注释和文档用中文，标识符用英文；**用户可见的界面与运行时提示（观看页、HTTP/MCP 报错、MCP 工具描述、启动与诊断输出、脚本输出）一律用英文**。
 
 ## 历史注记
