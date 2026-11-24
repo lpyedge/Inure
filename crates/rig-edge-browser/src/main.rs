@@ -45,7 +45,7 @@ mod pulse {
 mod rtc;
 mod snapshot;
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
@@ -90,6 +90,10 @@ struct App {
     human_error: std::sync::Mutex<Option<String>>,
     /// 直连鉴权（启动令牌换 access/refresh 票据，见 auth.rs）
     auth: auth::Auth,
+    /// 全部 WS 会话上限（已认证与待认证之和）
+    ws_total: Arc<Slots>,
+    /// 待首帧认证的 WS 会话上限（认证完成后释放，只占总数）
+    ws_unauth: Arc<Slots>,
     /// 允许内嵌观看页的宿主来源（--embed-origin，逗号分隔）；
     /// 空 = 禁止任何内嵌
     embed_origins: Vec<String>,
@@ -659,6 +663,8 @@ async fn main() {
         human_error: std::sync::Mutex::new(None),
         auth: auth::Auth::new(token.unwrap_or_default()),
         embed_origins,
+        ws_total: Slots::new(MAX_WS_TOTAL),
+        ws_unauth: Slots::new(MAX_WS_UNAUTH),
     });
     app.human.set_gate_display(ai_default, human_default).await;
     app.human.manage_capture();
@@ -1285,6 +1291,54 @@ async fn first_viewer_frame(
     (app.browser.active_page().await.as_ref() == Ok(&page)).then_some(frame)
 }
 
+/// WS 并发上限（总数 32，未认证 8；超限立即关连接）
+const MAX_WS_TOTAL: usize = 32;
+/// 待认证会话上限（首帧认证完成即释放，只计总数）
+const MAX_WS_UNAUTH: usize = 8;
+
+/// 计数槽位（上限内 CAS 占位，超限直接拒绝）
+struct Slots {
+    used: AtomicUsize,
+    max: usize,
+}
+
+/// 占位成功后的归还凭证（丢弃即释放）
+struct SlotGuard(Arc<Slots>);
+
+impl Slots {
+    /// 新建指定上限的槽位计数器
+    fn new(max: usize) -> Arc<Self> {
+        Arc::new(Self {
+            used: AtomicUsize::new(0),
+            max,
+        })
+    }
+
+    /// 上限内占一位（CAS 循环保证不超限）
+    fn try_acquire(self: &Arc<Self>) -> Option<SlotGuard> {
+        loop {
+            let cur = self.used.load(Ordering::SeqCst);
+            if cur >= self.max {
+                return None;
+            }
+            if self
+                .used
+                .compare_exchange(cur, cur + 1, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+            {
+                return Some(SlotGuard(self.clone()));
+            }
+        }
+    }
+}
+
+impl Drop for SlotGuard {
+    /// 释放占位
+    fn drop(&mut self) {
+        self.0.used.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 /// 首帧认证：3 秒内收到合法的 auth 帧才放行，其他一律拒绝
 async fn ws_first_frame_auth(
     auth: &auth::Auth,
@@ -1319,9 +1373,26 @@ async fn ws_session(
         return;
     }
     let (mut sink, mut stream) = socket.split();
-    if !pre_authed && !ws_first_frame_auth(&app.auth, &mut stream).await {
+    // 总数占位（超限立即关连接，守卫留到会话结束）
+    let Some(_total) = app.ws_total.try_acquire() else {
         let _ = sink.send(Message::Close(None)).await;
         return;
+    };
+    // 未预认证先占待认证位（认证完成即释放，只留总数位）
+    if !pre_authed {
+        let unauth = match app.ws_unauth.try_acquire() {
+            Some(g) => g,
+            None => {
+                let _ = sink.send(Message::Close(None)).await;
+                return;
+            }
+        };
+        let ok = ws_first_frame_auth(&app.auth, &mut stream).await;
+        drop(unauth);
+        if !ok {
+            let _ = sink.send(Message::Close(None)).await;
+            return;
+        }
     }
     // 订阅先于声明需求，让首帧可以直接接收。
     let mut frames = app.human.subscribe();
@@ -1988,5 +2059,38 @@ mod tests {
         assert!(s.release_dom());
         assert!(!s.release_dom());
         assert!(!s.release_dom());
+    }
+
+    /// 槽位不超过上限，释放后恰好多出一位
+    #[test]
+    fn slots_never_exceed_max_and_release_on_drop() {
+        let slots = super::Slots::new(2);
+        let g1 = slots.try_acquire().expect("first slot");
+        let g2 = slots.try_acquire().expect("second slot");
+        assert!(slots.try_acquire().is_none(), "no slot beyond max");
+        drop(g1);
+        let g3 = slots.try_acquire().expect("one slot after release");
+        assert!(slots.try_acquire().is_none(), "only one slot after release");
+        drop(g2);
+        drop(g3);
+    }
+
+    /// 64 并发下 8 上限恰好成功 8 个
+    #[test]
+    fn slots_are_bounded_under_concurrent_acquire() {
+        let slots = super::Slots::new(8);
+        let handles: Vec<_> = (0..64)
+            .map(|_| {
+                let s = slots.clone();
+                std::thread::spawn(move || s.try_acquire())
+            })
+            .collect();
+        // 守卫先全部收集再计数：中途丢弃会释放槽位，让晚启动的线程多占到位
+        let guards: Vec<_> = handles
+            .into_iter()
+            .map(|h| h.join().expect("thread joined"))
+            .collect();
+        let ok = guards.iter().filter(|g| g.is_some()).count();
+        assert_eq!(ok, 8, "exactly 8 concurrent acquires succeed");
     }
 }
