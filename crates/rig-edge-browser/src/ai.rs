@@ -308,6 +308,8 @@ pub struct AiChannel {
     /// 副作用；Aborted 是控制面瞬时结果不缓存（同 id 重试应
     /// 重新执行）。TTL 10 分钟、上限 256 条先进先出
     idem: Mutex<Vec<(String, std::time::Instant, ActionResult)>>,
+    /// 幂等键摘要器（进程内随机 SipHash，避免动作原文驻留内存）
+    idem_hasher: std::collections::hash_map::RandomState,
     /// 人机交互模型的执行状态（与人通道共享，见 exec.rs）
     exec: Arc<ExecControl>,
     /// 结构类通知用于识别根导航及判断校验帧是否可复用。
@@ -338,6 +340,7 @@ impl AiChannel {
             history: Mutex::new(Vec::new()),
             act_lock: Mutex::new(()),
             idem: Mutex::new(Vec::new()),
+            idem_hasher: std::collections::hash_map::RandomState::new(),
             exec,
             pending_label: Mutex::new(None),
             allowed_origins,
@@ -1014,10 +1017,13 @@ impl AiChannel {
             None
         } else {
             Some(format!(
-                "{}\u{1f}{}\u{1f}{}",
+                "{}\u{1f}{}\u{1f}{:016x}",
                 req.request_id.trim(),
                 req.frame_id,
-                serde_json::to_string(&req.action).unwrap_or_default()
+                std::hash::BuildHasher::hash_one(
+                    &self.idem_hasher,
+                    serde_json::to_string(&req.action).unwrap_or_default()
+                )
             ))
         };
         if let Some(k) = &key {
@@ -3410,5 +3416,78 @@ mod tests {
             "中断后不得发送写入，实际命令: {commands:?}"
         );
         // 通过的生产行：执行 Type 分支全选后、写入前的中断检查。
+    }
+
+    /// 幂等键不驻留输入原文：Type 动作执行后缓存键不得包含明文及其分片
+    #[tokio::test]
+    async fn idempotency_cache_does_not_retain_typed_text() {
+        let (_browser, ch) = attach_fake(usize::MAX).await;
+        let (obs, _) = ch.observe().await.expect("首帧观察应建成");
+        let req = ActionRequest {
+            request_id: "idem-secret-1".to_string(),
+            frame_id: obs.frame_id,
+            lease: None,
+            action: Action::Type {
+                target: None,
+                text: "SYNTHETIC-SECRET-TEXT".to_string(),
+                submit: false,
+                replace: false,
+            },
+        };
+        let r = ch.act(req).await;
+        assert!(matches!(r, ActionResult::Done { .. }), "实际: {r:?}");
+        let cache = ch.idem.lock().await;
+        assert_eq!(cache.len(), 1, "缓存应恰好一条");
+        for (k, _, _) in cache.iter() {
+            assert!(!k.contains("SYNTHETIC-SECRET-TEXT"), "键不得含明文: {k}");
+            for part in "SYNTHETIC-SECRET-TEXT".split('-') {
+                assert!(!k.contains(part), "键不得含明文分片 {part}: {k}");
+            }
+        }
+    }
+
+    /// 同 id 不同内容是新请求（都执行），同 id 同内容才是重试（不执行）
+    #[tokio::test]
+    async fn idempotency_same_id_different_text_is_not_a_retry() {
+        let (base, fake) = spawn_fake_cdp(usize::MAX, false, None).await;
+        let browser = Browser::attach(&base).await.expect("假 CDP 应能 attach");
+        let ch = AiChannel::new(browser, vec![], Arc::new(ExecControl::default()));
+        let (obs, _) = ch.observe().await.expect("首帧观察应建成");
+        let fid = obs.frame_id;
+        let mk = |text: &str| ActionRequest {
+            request_id: "idem-same-id".to_string(),
+            frame_id: fid,
+            lease: None,
+            action: Action::Type {
+                target: None,
+                text: text.to_string(),
+                submit: false,
+                replace: false,
+            },
+        };
+        let r1 = ch.act(mk("FIRST-TEXT-A")).await;
+        assert!(matches!(r1, ActionResult::Done { .. }), "实际: {r1:?}");
+        let r2 = ch.act(mk("SECOND-TEXT-B")).await;
+        assert!(matches!(r2, ActionResult::Done { .. }), "实际: {r2:?}");
+        let inserts = fake
+            .commands
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|m| *m == "Input.insertText")
+            .count();
+        assert_eq!(inserts, 2, "不同内容应各执行一次");
+        assert_eq!(ch.idem.lock().await.len(), 2, "缓存应有两条");
+        let r3 = ch.act(mk("FIRST-TEXT-A")).await;
+        assert!(matches!(r3, ActionResult::Done { .. }), "实际: {r3:?}");
+        let inserts = fake
+            .commands
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|m| *m == "Input.insertText")
+            .count();
+        assert_eq!(inserts, 2, "相同内容重试不得再写入");
+        assert_eq!(ch.idem.lock().await.len(), 2, "重试不得新增缓存条目");
     }
 }
