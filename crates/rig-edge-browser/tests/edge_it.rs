@@ -1297,6 +1297,7 @@ const DOM_SENSITIVE_HTML: &str = r#"<!DOCTYPE html><html lang="zh"><head><meta c
 <body><input id="plain" type="text" value="PLAIN-OK">
 <input id="cc" type="text" autocomplete="cc-number" value="4111-CARD-SYNTH">
 <input id="otp" type="text" autocomplete="one-time-code" value="OTP-SYNTH-1">
+<textarea id="ta" autocomplete="one-time-code">TA-SYNTH-1</textarea>
 <script>
 setTimeout(() => {
   for (const [id, v] of [['cc', 'LATE-CARD-9'], ['otp', 'LATE-OTP-9']]) {
@@ -1304,6 +1305,8 @@ setTimeout(() => {
     e.value = v;
     e.dispatchEvent(new Event('input', {bubbles: true}));
   }
+  document.getElementById('ta').textContent = 'TA-LATE-9';
+  document.getElementById('ta').firstChild.data = 'TA-LATE-10';
 }, 1200);
 </script></body></html>"#;
 
@@ -1363,6 +1366,9 @@ async fn edge_dom_mirror_does_not_carry_card_or_otp_values() {
         "OTP-SYNTH-1",
         "LATE-CARD-9",
         "LATE-OTP-9",
+        "TA-SYNTH-1",
+        "TA-LATE-9",
+        "TA-LATE-10",
     ] {
         assert!(
             !all.contains(secret),
@@ -7533,7 +7539,8 @@ async fn edge_set_checked_is_idempotent() {
     let _serial = SERIAL.lock().await;
     let page = r#"<!DOCTYPE html><meta charset="utf-8"><title>setchecked</title>
 <body style="margin:0"><label style="position:absolute;left:20px;top:20px"><input type="checkbox" id="c" checked> subscribe</label>
-<button id="b" style="position:absolute;left:20px;top:80px">plain</button></body>"#;
+<button id="b" style="position:absolute;left:20px;top:80px">plain</button>
+<label style="position:absolute;left:20px;top:140px"><input type="radio" name="g" id="r" checked> pick</label></body>"#;
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     serve(
@@ -7613,5 +7620,23 @@ async fn edge_set_checked_is_idempotent() {
         json!({"kind":"set_checked","target":{"by":"element","id":plain.1},"checked":true}),
     );
     assert_ne!(r["result"], "done", "非勾选类元素应被拒: {r}");
+    // 原生 radio 点击无法取消选中：set_checked(false) 不得报 done，状态仍为已选
+    let cur = observe(edge_port);
+    let rb = find_element(&cur["observation"], "radio", "pick").expect("radio");
+    let r = act(
+        edge_port,
+        cur["observation"]["frame_id"].as_u64().unwrap(),
+        json!({"kind":"set_checked","target":{"by":"element","id":rb["id"]},"checked":false}),
+    );
+    assert_ne!(r["result"], "done", "radio 无法取消选中，不得报 done: {r}");
+    let cur = observe(edge_port);
+    let rb = find_element(&cur["observation"], "radio", "pick").expect("radio");
+    assert!(
+        rb["states"]
+            .as_array()
+            .map(|a| a.iter().any(|s| s == "checked"))
+            .unwrap_or(false),
+        "radio 应仍为已选"
+    );
     let _ = (frame, id);
 }

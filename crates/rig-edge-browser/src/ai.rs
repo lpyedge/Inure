@@ -863,9 +863,29 @@ impl AiChannel {
                 Ok(None),
             );
         }
+        // 批量代次：接管后整批永久停止，后续观察解闩也不复活剩余步骤
+        let Some(batch_h) = self.exec.begin_act().await else {
+            return (
+                BatchActionResult {
+                    results: vec![ActionResult::Aborted {
+                        reason: AbortReason::UserTakeover,
+                    }],
+                    skipped: total - 1,
+                },
+                Ok(None),
+            );
+        };
         let mut results = Vec::with_capacity(total);
         let mut fresh = Ok(None);
         for (i, action) in req.actions.into_iter().enumerate() {
+            // 步骤间检查接管：已取消则不再执行剩余步骤
+            if i > 0 && self.exec.aborted(&batch_h).await {
+                results.push(ActionResult::Aborted {
+                    reason: AbortReason::UserTakeover,
+                });
+                fresh = Ok(None);
+                break;
+            }
             let step = ActionRequest {
                 request_id: format!("{}/{i}", req.request_id),
                 frame_id: req.frame_id,
@@ -880,6 +900,8 @@ impl AiChannel {
                 break;
             }
         }
+        // 批量句柄归还：在途计数清零，与单步句柄互不干扰
+        self.exec.end(batch_h).await;
         let skipped = total - results.len();
         // 全部 Done 才按需附文本；被拒/中断沿用上面的“附最新状态”。
         if skipped == 0
@@ -1515,6 +1537,8 @@ impl AiChannel {
                 if *replace {
                     self.press_key(&session, "Control+A", h).await?;
                 }
+                // 全选与写入之间可能发生人工接管，写入前再确认一次
+                self.live(h).await?;
                 self.browser
                     .insert_text(&session, text)
                     .await
@@ -1595,7 +1619,43 @@ impl AiChannel {
                 }
                 self.click_target(frame, target, MouseButton::Left, 1, h)
                     .await?;
-                Ok(None)
+                // 点击后重读目标选中态，未达预期即拒绝（调用方重新观察）。
+                tokio::time::sleep(Duration::from_millis(60)).await;
+                let failed = || {
+                    denied(format!(
+                        "SetChecked did not reach the requested state ({checked}); observe again"
+                    ))
+                };
+                let (session, backend) = match self.locate_session_backend(locate, id).await {
+                    Ok(v) => v,
+                    Err(_) => return Err(failed()),
+                };
+                let node = match self.browser.ax_node(&session, backend).await {
+                    Ok(Some(node)) => node,
+                    _ => return Err(failed()),
+                };
+                let attrs = match self.browser.dom_attrs(&session, backend).await {
+                    Ok(attrs) => attrs,
+                    Err(_) => return Err(failed()),
+                };
+                let quad = match self.browser.quads(&session, backend).await {
+                    Ok(q) => q,
+                    Err(_) => return Err(failed()),
+                };
+                let live = crate::snapshot::element_core(
+                    id.clone(),
+                    &node,
+                    Some(&attrs),
+                    quad,
+                    (0.0, 0.0),
+                    current.space.width,
+                    current.space.height,
+                );
+                if live.has(ElementState::Checked) == *checked {
+                    Ok(None)
+                } else {
+                    Err(failed())
+                }
             }
             Action::Select { target, values } => {
                 let Target::Element { id } = target else {

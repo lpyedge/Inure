@@ -58,6 +58,12 @@ const SCRIPT: &str = r##"(() => {
     const sel = n.closest ? n.closest('select') : null;
     return !!sel && isPw(sel);
   }
+  // textarea 的子文本节点就是它的值（defaultValue）：敏感 textarea 的子树整体不进镜像。
+  // 敏感 select 的选项文字不是值，照常镜像（只遮蔽选中状态，见 inSecretSelect）
+  function underPw(n) {
+    let e = n && n.nodeType === 3 ? n.parentElement : n;
+    return !!e && e.tagName === 'TEXTAREA' && isPw(e);
+  }
   function pwMask(v) { return v ? '\u2022\u2022\u2022\u2022\u2022\u2022' : ''; }
   function absUrl(v) {
     if (!v || /^(data:|blob:|javascript:|mailto:|tel:|#)/i.test(v)) return v;
@@ -160,6 +166,8 @@ const SCRIPT: &str = r##"(() => {
       }
       return out;
     }
+    // 敏感 textarea（一次性验证码等）的子文本就是它的值，不进镜像
+    if (underPw(node)) return out;
     for (const ch of node.childNodes) {
       const s = ser(ch);
       if (s) {
@@ -368,6 +376,8 @@ const SCRIPT: &str = r##"(() => {
         if (!S.hT) S.hT = setTimeout(() => { S.hT = 0; send({ kind: 'resync' }); }, 500);
         return;
       }
+      // 敏感子树内的结构与文本变化都不进镜像
+      if ((r.type === 'childList' || r.type === 'characterData') && underPw(r.target)) continue;
       if (r.type === 'childList') {
         for (const n of r.removedNodes) { const id = S.ids.get(n); if (id) S.queue.push({ o: 'rm', i: id }); dropSubtree(n); }
         for (const n of r.addedNodes) {

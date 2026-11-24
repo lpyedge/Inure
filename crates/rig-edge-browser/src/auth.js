@@ -22,14 +22,22 @@
     A.timer = setTimeout(renew, Math.max(10, p.expires_in - 60) * 1000);
   }
 
-  /* refresh 每次使用即轮换；401 = 边缘已重启（票据全部失效），回到输入页 */
-  async function renew() {
-    try {
-      apply(await post('/session/refresh', { refresh: A.refresh }));
-    } catch (e) {
-      if (e.status === 401) { location.reload(); return; }
-      A.timer = setTimeout(renew, 5000);
+  /* refresh 每次使用即轮换；401 = 边缘已重启（票据全部失效），回到输入页。
+     refresh 一次性：定时器与多个 401 重试并发时合并成一次续期，
+     否则后到的请求带着已作废的 refresh 得 401，误触发整页刷新 */
+  let renewing = null;
+  function renew() {
+    if (!renewing) {
+      renewing = (async () => {
+        try {
+          apply(await post('/session/refresh', { refresh: A.refresh }));
+        } catch (e) {
+          if (e.status === 401) { location.reload(); return; }
+          A.timer = setTimeout(renew, 5000);
+        }
+      })().finally(() => { renewing = null; });
     }
+    return renewing;
   }
 
   /* 带 access 头的 fetch；401 时续期后重试一次 */
