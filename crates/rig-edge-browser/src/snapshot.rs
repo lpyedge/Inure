@@ -382,6 +382,8 @@ pub async fn build_observation(
 
     // 帧偏移合成：子帧的原点 = 父帧中 iframe 元素包围盒的左上角（父帧全局坐标）。
     // 每一轮至少放置一层，所以最多 sessions.len() 轮；没有进展即退出。
+    // 几何查询本身失败（不同于“宿主没有包围盒”）的会话单独记下，后面要告警。
+    let mut geometry_failed: std::collections::HashSet<usize> = std::collections::HashSet::new();
     for _ in 0..sessions.len().max(1) {
         let mut progress = false;
         for i in 0..sessions.len() {
@@ -399,11 +401,13 @@ pub async fn build_observation(
                     // 批量几何表优先，未覆盖回落逐节点 quads（R-16）
                     let q = match sessions[j].geom.get(&backend) {
                         Some(g) => Some(*g),
-                        None => browser
-                            .quads(&sessions[j].session, backend)
-                            .await
-                            .ok()
-                            .flatten(),
+                        None => match browser.quads(&sessions[j].session, backend).await {
+                            Ok(q) => q,
+                            Err(_) => {
+                                geometry_failed.insert(i);
+                                None
+                            }
+                        },
                     };
                     if let Some(q) = q {
                         found = Some((sessions[j].offset.0 + q[0], sessions[j].offset.1 + q[1]));
@@ -428,16 +432,16 @@ pub async fn build_observation(
     // 宿主 iframe 在已放置会话的 DOM 里找得到、只是没有几何（display:none、零尺寸，
     // 广告与追踪器常见）：本来就不可见，静默跳过。只有连宿主都找不到（层级没传播完整）
     // 才告警，否则每次观察都带告警会让截图被拒、文本差分失效。
-    for sd in sessions.iter().filter(|sd| !sd.placed) {
+    for (i, sd) in sessions.iter().enumerate().filter(|(_, sd)| !sd.placed) {
         // 宿主可能本身就在另一个没定位的隐藏会话里（隐藏广告 iframe 再嵌别的跨站 iframe），
         // 所以在全部会话里找，不只看已放置的。
         let host_known = !sd.root_frame.is_empty()
             && sessions.iter().any(|o| {
                 o.session != sd.session && frame_owner_backend(&o.dom, &sd.root_frame).is_some()
             });
-        if !host_known {
+        if let Some(why) = unplaced_warning(host_known, geometry_failed.contains(&i)) {
             warnings.push(format!(
-                "Frame session {} could not be positioned; its elements are omitted",
+                "Frame session {} could not be positioned ({why}); its elements are omitted",
                 sd.session
             ));
         }
@@ -528,6 +532,17 @@ pub async fn build_observation(
         });
     }
     Ok((obs, locate, warnings))
+}
+
+/// 未定位的子会话要不要告警：宿主找得到且几何查询没出错（只是没有包围盒：隐藏、零尺寸）→ 不告警；
+/// 几何查询本身失败（宿主在 DOM 映射与几何调用之间被重渲染等）或连宿主都找不到 → 告警，
+/// 否则可见内容会无声缺失，AI 得不到“缺内容”的信号。
+fn unplaced_warning(host_known: bool, geometry_failed: bool) -> Option<&'static str> {
+    match (host_known, geometry_failed) {
+        (_, true) => Some("the host iframe geometry query failed"),
+        (false, false) => Some("the host iframe was not found"),
+        (true, false) => None,
+    }
 }
 
 fn frame_owner_backend(dom: &crate::browser::DomMap, frame_id: &str) -> Option<i64> {
@@ -1584,6 +1599,24 @@ mod tests {
         assert!(top[0].value.is_none());
         assert!(top[0].name.is_none());
         assert!(top[0].children.is_empty());
+    }
+
+    #[test]
+    fn unplaced_frames_warn_only_when_content_may_be_missing() {
+        assert_eq!(
+            unplaced_warning(true, false),
+            None,
+            "宿主隐藏/无包围盒：静默"
+        );
+        assert!(
+            unplaced_warning(true, true).is_some(),
+            "几何查询失败：必须告警"
+        );
+        assert!(unplaced_warning(false, true).is_some());
+        assert!(
+            unplaced_warning(false, false).is_some(),
+            "找不到宿主：必须告警"
+        );
     }
 
     #[test]

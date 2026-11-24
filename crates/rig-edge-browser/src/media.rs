@@ -836,6 +836,14 @@ fn audio_main(
 mod tests {
     use super::*;
 
+    /// 测试临时目录的守卫：断言失败（panic）时也要删，否则每次失败都在 /tmp 留一个 rig-test-*。
+    struct TempDirGuard(std::path::PathBuf);
+    impl Drop for TempDirGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
     /// 这两个测试都改进程级环境变量 RIG_HLS_SINGLE，必须串行。
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -868,6 +876,7 @@ mod tests {
     async fn stop_does_not_delete_the_directory_of_a_stuck_muxer_thread() {
         let root = std::env::temp_dir().join(format!("rig-test-stop-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
+        let _guard = TempDirGuard(root.clone());
         let (quick, stuck) = (root.join("quick"), root.join("stuck"));
         for d in [&quick, &stuck] {
             std::fs::create_dir_all(d).unwrap();
@@ -946,6 +955,7 @@ mod tests {
         std::env::set_var("RIG_HLS_SINGLE", "h264");
         let dir = std::env::temp_dir().join(format!("rig-test-single-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
+        let _guard = TempDirGuard(dir.clone());
         std::fs::create_dir_all(dir.join("h264")).unwrap();
         let m = Mux::build(&dir, 64, 48, None).expect("单路构建应成功");
         assert!(m.hevc.is_none(), "hevc 不应构建");

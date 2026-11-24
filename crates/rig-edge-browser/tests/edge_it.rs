@@ -1840,7 +1840,7 @@ async fn edge_stdio_mcp_and_attach() {
     // 配置目录每次唯一：固定目录会让上次残留的 Chromium 实例接管、
     // 新进程直接退出，调试端口永远不开（实测教训）
     let profile = format!("/tmp/rig-attach-it-{cdp_port}");
-    let mut chrome = EdgeProc(
+    let chrome = EdgeProc(
         Command::new(&exe)
             .args([
                 "--headless=new",
@@ -1885,9 +1885,15 @@ async fn edge_stdio_mcp_and_attach() {
     std::thread::sleep(Duration::from_millis(600));
     let alive = devtools_get(cdp_port, "/json/version").map(|(c, _)| c);
     assert_eq!(alive, Some(200), "边缘退出后挂靠的 Chromium 应存活");
-    let _ = chrome.0.kill();
-    let _ = chrome.0.wait();
+    // 整组杀掉（EdgeProc 的 Drop 杀进程组）：只 kill 主进程时，Chromium 的子进程还在往配置目录写，
+    // 紧接着的 remove_dir_all 会和它们竞争，目录被重建，每跑一次就在 /tmp 漏一个 rig-attach-it-*。
+    drop(chrome);
+    std::thread::sleep(Duration::from_millis(500));
     let _ = std::fs::remove_dir_all(&profile);
+    assert!(
+        !std::path::Path::new(&profile).exists(),
+        "挂靠测试的临时配置目录必须清干净: {profile}"
+    );
 }
 
 fn elem_value(obs: &Value, role: &str, name: &str) -> String {

@@ -14,7 +14,6 @@ for candidate in "$T"/{release,debug}/rig-edge-browser; do
     BIN="$candidate"
   fi
 done
-[ -n "$BIN" ] || { echo "Build first: scripts/build.sh" >&2; exit 1; }
 scheme=http
 for arg in "$@"; do
   case "$arg" in
@@ -22,6 +21,7 @@ for arg in "$@"; do
     --tls-cert) scheme=https ;;
   esac
 done
+[ -n "$BIN" ] || { echo "Build first: scripts/build.sh" >&2; exit 1; }
 PORT="${PORT:-39871}"
 TOKEN="${RIG_EDGE_TOKEN:-$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')}"
 echo "URL:    $scheme://127.0.0.1:$PORT/" >&2
