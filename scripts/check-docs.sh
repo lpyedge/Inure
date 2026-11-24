@@ -5,7 +5,8 @@
 #   3. rig-edge-browser --help 的用法文本要列出全部源码参数（由集成测试保证，这里只查源码侧）；
 #   4. 文档里用反引号点名的 edge_* 集成测试必须在 tests/edge_it.rs 里真实存在；
 #   5. markdown 的相对链接指向的文件和锚点必须存在；
-#   6. 当前文档里用反引号点名的 crates/ scripts/ eval/ docs/ 文件路径必须存在。
+#   6. 当前文档里用反引号点名的 crates/ scripts/ eval/ docs/ 文件路径必须存在；
+#   7. PITFALLS 里点名的代码标识符必须还在代码里（白名单：浏览器/系统 API 名与已知的历史改名）。
 # 用法：scripts/check-docs.sh    有问题时打印并以 1 退出。
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -89,6 +90,35 @@ for f in files:
 for f, p in sorted(bad):
     print(f"MISSING PATH: {f}: {p}")
 sys.exit(1 if bad else 0)
+PY
+
+echo "== PITFALLS 里点名的代码标识符是否还存在（浏览器/系统 API 名与已知的历史改名在白名单里）"
+python3 - <<'PY' || fail=1
+import re, subprocess, sys
+txt = re.sub(r"```.*?```", "", open("docs/PITFALLS.md", encoding="utf-8").read(), flags=re.S)
+ids = set()
+for c in re.findall(r"`([A-Za-z_][A-Za-z0-9_]*(?:::[A-Za-z_][A-Za-z0-9_]*)*(?:\(\))?)`", txt):
+    last = c.replace("()", "").split("::")[-1]
+    if ("_" in last or re.search(r"[a-z][A-Z]", last)) and len(last) >= 6 and not last.isupper():
+        ids.add(last)
+# 白名单：浏览器/系统 API 名，以及记录历史事件时的旧名字（后来改名，原文保留不改写）
+allow = {"AddrInUse", "WheelEvent", "captureStream", "loadTimes", "requestVideoFrameCallback",
+         "av_available", "jpeg_want"}
+files = subprocess.run("git ls-files 'crates/*' 'scripts/*' 'eval/*' '.github/*'", shell=True,
+                       capture_output=True, text=True).stdout.split()
+code = b""
+for f in files:
+    if f.endswith((".png", ".zip", ".gz", ".webp", ".jpg", ".jpeg")):
+        continue
+    try:
+        code += open(f, "rb").read()
+    except OSError:
+        pass
+code = code.decode("utf-8", errors="ignore")
+missing = sorted(i for i in ids if i not in code and i not in allow)
+for i in missing:
+    print("IDENTIFIER NOT IN CODE:", i, "(改名了？在 PITFALLS 原文旁注明现名，或加进 check-docs.sh 的白名单)")
+sys.exit(1 if missing else 0)
 PY
 
 if (( fail )); then echo "docs check FAILED"; exit 1; fi
