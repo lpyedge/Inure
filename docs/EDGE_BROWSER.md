@@ -117,6 +117,7 @@ platform/arch——版本取 product 的真實完整版本，UA 串裡的是約�
 | `--human` | — | 顯式給出時人通道預設開啟，不給則關閉 |
 | `--av` | — | 預設允許 HLS 播放，首個有效播放列表請求啟動合流 |
 | `--token <secret>` | 環境變數 `RIG_EDGE_TOKEN` | **對外提供 HTTP 時必設**（空值視同未設），由啟動程序隨機生成並傳入；見 §6 |
+| `--stun <host:port>` | — | 可重複。配了則 RTC 走完整 ICE 並採集 srflx 候選（跨子網直連）；不配走 ICE-lite + host 候選 |
 | `--embed-origin <origin[,…]>` | — | 允許內嵌觀看頁的宿主來源；未給則禁止任何內嵌（見 §6.1） |
 | `--tls-cert <path>` / `--tls-key <path>` | — | HTTPS 服務（須成對給）；檔案缺失時自動生成自簽名證書（SAN 含 localhost、127.0.0.1 與綁定 host），私鑰以 0600 原子建立落盤復用。**非回環監聽強制 TLS**（LIU 2026-11-20 裁定，整改第二期）：未給證書時自動生成自簽名（`~/.rig-edge/self-signed.{crt,key}`）並顯著提示——DOM 通道承載頁面欄位值，其安全性由傳輸加密保證（R-07 處置）；僅回環監聽可明文 |
 | `--stdio` | — | MCP stdio 前端模式（見 §7） |
@@ -141,7 +142,7 @@ platform/arch——版本取 product 的真實完整版本，UA 串裡的是約�
 | `/channels` | POST | 設通道開關，請求體同上形狀（部分欄位可省略） |
 | `/observe` | POST | AI 觀察：請求體為 rig-proto 的 `ObserveRequest`（可空 `{}`）。回應組成由 `mode` 定：`text` 只回 `{"text"}`；`tree`（默認）回 `{"text", "observation"}`；`tree_image` 再加 `"image_png_base64"`。`budget_tokens` 按預算裁剪**響應視圖**（存儲幀不動、被裁元素憑 id 仍可操作，裁剪說明附在 text 末尾）；`subtree` 只回某元素子樹（id 不存在回 400）。`include_offscreen` 默認 false：視口外元素不進響應視圖（存儲幀保留、帶 Offscreen 狀態），true 才帶。`since_frame` 使用客戶端最後套用的觀察幀。當 `mode=tree` 且分頁、文件、座標空間與輸出投影相容時，可回 `{"delta": ObservationDelta, "text"}`。基幀須在最近 8 個已輸出的結構化觀察內。無法重建目前視圖時回整幀。`mode=text` 且 `since_frame` 命中同樣相容的 text 基幀時，回行級差分文本：首行 `# frame N (delta from M)`，`~ 整行` 為變化（或其後新增行的錨點）、`+ 整行` 為新增、`- [id]` 為刪除；無變化回 `# frame N (unchanged since M)`；差分不小於完整文本 0.8 倍或無法重建時回完整文本 |
 | `/act` | POST | AI 動作：接受 `ActionRequest`，回 `{"result": ActionResult}`。頁面狀態類拒絕另附最新觀察及文字，或附無法取得最新狀態的說明 |
-| `/screenshot.png` | GET | 當前頁編號截圖（PNG；敏感元素區域黑塊遮罩） |
+| `/screenshot.png` | GET | 當前頁截圖（PNG，缺省不帶標註；`annotate=marks` 才畫編號，`clip=x,y,w,h` 只取一塊；敏感元素區域黑塊遮罩） |
 | `/ws` | GET→WS | 人通道：連上後 3 秒內首幀 `{type:auth,access}` 認證；下行 screencast 幀與狀態；上行輸入事件（見 §9） |
 | `/stream/{key}/{rend}/{name}` | GET | HLS 播放列表與分片；`{key}` 是登錄後下發的只讀路徑鑰匙。有效列表請求可啟動合流，12 秒沒有有效請求即回收 |
 
@@ -200,7 +201,7 @@ AI 操作全走 stdio；人要看畫面時加 `--human`，HTTP 觀看頁並行�
 |---|---|---|
 | `observe` | `ObserveRequest`（可省略；`mode`/`budget_tokens`/`subtree`，語義同 HTTP /observe） | text 內容塊：緊湊文本渲染（+ Observation JSON，`mode=text` 時不帶）；`mode=tree_image` 再加 image 內容塊（編號截圖） |
 | `act` | `ActionRequest` JSON（rig-proto） | `ActionResult` JSON 文本塊。頁面狀態類拒絕另附文字和 `Observation` 或 `ObservationDelta` JSON，如果無法採集則附診斷文字 |
-| `screenshot` | 無 | image 內容塊：base64 PNG（編號截圖，同 HTTP 的遮罩規則） |
+| `screenshot` | `{annotate?: "none"｜"marks", clip?: {x,y,width,height}}` | image 內容塊：base64 PNG（缺省不帶標註，同 HTTP 的遮罩規則）；帶 `clip` 時再附一個 text 塊 `{clip, scale}` |
 
 - **`request_id` 前端補全**：`ActionRequest.request_id` 是協議必填欄位，
   但 MCP 調用方已有 JSON-RPC `id` 標識本次呼叫——`act` 入參缺 `request_id`
@@ -761,8 +762,8 @@ HTTP act 點擊後 ghost 到達且落點在目標中心 40px 內。
 
 **校驗與錯誤**：目標元素須為 `<input type="file">`（否則拒絕
 `not_file_input`）；每個路徑須在上傳根目錄內（否則 `policy_denied`）、存在且為普通文件（`file_not_found`）；
-文件數 ≤ 20、單文件 ≤ 200 MiB（`file_too_large`）。三者是
-RejectReason 的正式代碼（非 PolicyDenied 文案）。`multiple` 屬性
+文件數 > 20 回 `policy_denied`，單文件 > 200 MiB 回 `file_too_large`。`not_file_input`、`file_not_found`、
+`file_too_large` 是 RejectReason 的正式代碼（非 PolicyDenied 文案）。`multiple` 屬性
 缺失且給多文件時只取第一個，並在 `ActionResult::Done` 的可選
 `note` 字段中註明（該字段為本動作配套加入協議，無附註時不出現
 在報文里、舊客戶端可正常解析）。
@@ -806,4 +807,4 @@ rig-proto 單元測試鎖定 upload/新拒絕碼/Done.note 的線格式。
 - 測試頁元素的 AX 名稱來自 `<label>` 文本（如「用戶名」），勿憑假設寫
   期望名。
 
-全倉提交門禁 `scripts/local-gate.sh` 依序運行 fmt、clippy 與 `scripts/test.sh all`。真 Chromium 集成測試需要完整 Chromium；音視頻測試另需 PulseAudio、`ffprobe` 與 `ffmpeg` 命令行。
+全倉提交門禁 `scripts/local-gate.sh` 依序運行文檔檢查（`scripts/check-docs.sh`）、fmt、clippy 與 `scripts/test.sh all`。真 Chromium 集成測試需要完整 Chromium；音視頻測試另需 PulseAudio、`ffprobe` 與 `ffmpeg` 命令行。

@@ -436,7 +436,7 @@ OTHER:
     --check-media-runtime      Check that the FFmpeg encoders are available, then exit
     -h, --help                 Print this help
 
-Without --stdio, a random token must be passed via --token or RIG_EDGE_TOKEN.
+Whenever HTTP is served (including --stdio --human), a random token must be passed via --token or RIG_EDGE_TOKEN.
 See docs/05-编译部署与运行.md for details.
 ";
 

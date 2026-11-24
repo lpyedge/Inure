@@ -11,7 +11,11 @@ step() { printf '\n=== %s ===\n' "$1"; }
 for tool in cargo python3; do
   command -v "$tool" >/dev/null 2>&1 || { echo "NOT VERIFIED: $tool is not installed, the gate cannot run" >&2; exit 127; }
 done
-if ! command -v chromium >/dev/null 2>&1 && ! command -v chrome >/dev/null 2>&1 && ! command -v google-chrome >/dev/null 2>&1 && [[ -z "${RIG_EDGE_TEST_CHROMIUM_DIR:-}" ]]; then
+have_chromium=0
+for name in chromium chromium-browser google-chrome google-chrome-stable; do   # 与边缘程序和测试查找的名字一致
+  command -v "$name" >/dev/null 2>&1 && have_chromium=1
+done
+if (( ! have_chromium )) && [[ -z "${RIG_EDGE_TEST_CHROMIUM_DIR:-}" ]]; then
   echo "warning: no Chromium on PATH and RIG_EDGE_TEST_CHROMIUM_DIR is unset; the browser integration tests will fail" >&2
 fi
 

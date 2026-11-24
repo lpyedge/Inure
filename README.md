@@ -46,7 +46,7 @@ target/release/rig-edge-browser --stdio --url https://example.com
 ```bash
 source scripts/local-env.sh  # 可选，将构建缓存重定向到 .temp/
 scripts/test.sh unit         # Rust 测试，跳过真 Chromium 用例
-scripts/local-gate.sh        # fmt、clippy、Rust（含真 Chromium）及 Python 自测
+scripts/local-gate.sh        # 文档检查、fmt、clippy、Rust（含真 Chromium）及 Python 自测
 ```
 
 ## 目录

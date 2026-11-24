@@ -98,8 +98,10 @@ SH
   AV_CODEC="$(PKG_CONFIG_LIBDIR="$MEDIA_LIB/pkgconfig" pkg-config --modversion libavcodec)"
   printf 'ubuntu-%s-ffmpeg-%s\n' "$VERSION_CODENAME" "${AV_CODEC%%.*}" > "$STAGE/runtime/abi.txt"
   getconf GNU_LIBC_VERSION > "$STAGE/runtime/build-libc.txt"
-else
+elif [[ "$TARGET" == windows-* ]]; then
   python scripts/release-desktop.py "$STAGE"
+else
+  python3 scripts/release-desktop.py "$STAGE"
 fi
 
 if [[ "$TARGET" == windows-* ]]; then
