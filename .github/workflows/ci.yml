@@ -35,3 +35,26 @@ jobs:
         run: cargo test --all
       - name: Python 评估工具自测（无第三方依赖）
         run: python3 -m unittest discover -s tests/eval_report -p 'test_*.py' -v
+
+  # 真实 Chromium 集成测试：check 任务里的 `cargo test --all` 不设 RIG_EDGE_IT，
+  # edge_it 会提前返回（视为通过），这里单独跑才是真通过。
+  # 两个依赖虚拟声卡（pulseaudio）的用例在无声卡的 runner 上不具备运行条件，先排除。
+  integration:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: 安装系统依赖（edge-browser 硬编/软编：libav*）
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libavcodec-dev libavformat-dev libavutil-dev libswscale-dev libavdevice-dev pkg-config libclang-dev clang cmake
+      - uses: Swatinem/rust-cache@v2
+      - name: Chromium 版本（runner 预装）
+        run: google-chrome --version
+      - name: 真 Chromium 集成测试
+        env:
+          RIG_EDGE_IT: "1"
+        run: >
+          cargo test -p rig-edge-browser --test edge_it -- --nocapture
+          --skip edge_av_and_image_clipboard
+          --skip edge_viewer_summary_viewport_and_rtc_audio_demand
